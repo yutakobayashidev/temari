@@ -10,10 +10,12 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
 use serde::Serialize;
 use temari_core::{
-    ApplySession, ApplyState, ClassificationBasis, ClassificationOptions, Config, FolderProposer,
-    FolderSet, LocalContentExtractor, OpenAiCompatibleModel, Plan, Proposal, ScanScope, UndoState,
-    apply_plan, build_plan, classify_files, preflight_apply, preflight_resume, preflight_undo,
-    resume_apply_session, scan_directory, select_representative_files, undo_session,
+    ApplySession, ApplyState, ClassificationBasis, ClassificationOptions, Config, ContentDecision,
+    ContentPolicy, FileCandidate, FolderProposer, FolderSet, LocalContentExtractor,
+    OpenAiCompatibleModel, Plan, Proposal, ScanScope, UndoState, apply_plan, build_plan,
+    classify_file_names, complete_classification, preflight_apply, preflight_resume,
+    preflight_undo, resume_apply_session, scan_directory, select_representative_files,
+    undo_session,
 };
 use tempfile::NamedTempFile;
 
@@ -162,6 +164,12 @@ enum ApprovalMode {
     Refuse,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlanningInteraction {
+    Primitive,
+    InteractiveOrganize,
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error:#}");
@@ -301,7 +309,13 @@ fn plan(cli: &Cli, source: &Path, folders_path: &Path, out: &Path) -> Result<()>
         );
     }
 
-    let plan = generate_plan(cli, &source, &folder_set, cli.verbose > 0)?;
+    let plan = generate_plan(
+        cli,
+        &source,
+        &folder_set,
+        cli.verbose > 0,
+        PlanningInteraction::Primitive,
+    )?;
     write_artifact(out, &plan)?;
     print_output_result(cli, out)
 }
@@ -311,6 +325,7 @@ fn generate_plan(
     source: &Path,
     folder_set: &FolderSet,
     show_progress: bool,
+    interaction: PlanningInteraction,
 ) -> Result<Plan> {
     let config = load_config(cli)?;
     let excluded: Vec<_> = folder_set
@@ -324,21 +339,39 @@ fn generate_plan(
         eprintln!("Classifying {} file name(s)...", files.len());
     }
     let model = OpenAiCompatibleModel::new(&config.model)?;
+    let name_pass = classify_file_names(
+        &files,
+        &folder_set.folders,
+        &model,
+        50,
+        std::time::Duration::from_millis(500),
+    )?;
+    let decision = {
+        let stdin = io::stdin();
+        let stderr = io::stderr();
+        resolve_content_decision(
+            &config,
+            name_pass.needs_content(),
+            interaction,
+            &mut stdin.lock(),
+            &mut stderr.lock(),
+        )?
+    };
     let extractor = LocalContentExtractor::new(config.privacy.extraction.clone());
-    let summary = classify_files(
+    let summary = complete_classification(
         source,
         &files,
         &folder_set.folders,
         &model,
         &extractor,
         ClassificationOptions {
-            content_policy: config.privacy.content,
+            content_decision: decision,
             max_content_chars: config.privacy.max_content_chars,
             max_content_file_bytes: config.privacy.max_content_file_bytes,
-            name_batch_size: 50,
             content_batch_size: 20,
             batch_delay: std::time::Duration::from_millis(500),
         },
+        name_pass,
     )?;
     if show_progress {
         eprintln!(
@@ -353,6 +386,80 @@ fn generate_plan(
         &folder_set.folders,
         summary.classifications,
     )?)
+}
+
+fn resolve_content_decision<R: BufRead, W: Write>(
+    config: &Config,
+    ambiguous: &[FileCandidate],
+    interaction: PlanningInteraction,
+    input: &mut R,
+    output: &mut W,
+) -> Result<ContentDecision> {
+    if ambiguous.is_empty() {
+        return Ok(ContentDecision::Fallback);
+    }
+    match config.privacy.content {
+        ContentPolicy::MetadataOnly => return Ok(ContentDecision::Fallback),
+        ContentPolicy::OnDemand => return Ok(ContentDecision::Extract),
+        ContentPolicy::Ask => {}
+    }
+    if interaction == PlanningInteraction::Primitive {
+        bail!(
+            "privacy.content = \"ask\" requires interactive organize when {} file(s) need content; set metadata_only to use local fallbacks or on_demand to permit bounded text",
+            ambiguous.len()
+        );
+    }
+
+    writeln!(output, "Content consent required for this run:")?;
+    writeln!(output, "  Model: {}", config.model.endpoint_origin()?)?;
+    writeln!(output, "  Ambiguous files ({}):", ambiguous.len())?;
+    for file in ambiguous {
+        writeln!(output, "    - {}", terminal_text(&file.source_path))?;
+    }
+    writeln!(
+        output,
+        "  Per file: read at most {} bytes; extract at most {} bytes; send at most {} characters",
+        config.privacy.max_content_file_bytes,
+        config.privacy.extraction.max_output_bytes,
+        config.privacy.max_content_chars
+    )?;
+    writeln!(
+        output,
+        "  Local OCR: {}",
+        if config.privacy.extraction.ocr.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    )?;
+    writeln!(
+        output,
+        "  Raw files are never uploaded. Only bounded extracted text is sent."
+    )?;
+    writeln!(
+        output,
+        "  Unsupported or failed extraction uses approved local fallbacks."
+    )?;
+    writeln!(
+        output,
+        "  Extracted text and consent are not logged or persisted."
+    )?;
+    write!(
+        output,
+        "Send bounded extracted text for these {} file(s) to {} for this run? [y/N] ",
+        ambiguous.len(),
+        config.model.endpoint_origin()?
+    )?;
+    output.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(
+        if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            ContentDecision::Extract
+        } else {
+            ContentDecision::Fallback
+        },
+    )
 }
 
 fn apply(cli: &Cli, plan_path: &Path, out: &Path, yes: bool) -> Result<()> {
@@ -541,7 +648,14 @@ fn organize(
     write_artifact(&folders_path, &folder_set)?;
 
     eprintln!("Stage 3/4: creating an exact read-only plan...");
-    let plan = generate_plan(cli, &source, &folder_set, true).with_context(|| {
+    let plan = generate_plan(
+        cli,
+        &source,
+        &folder_set,
+        true,
+        PlanningInteraction::InteractiveOrganize,
+    )
+    .with_context(|| {
         format!(
             "planning failed; artifacts remain in {}",
             run_directory.display()
@@ -886,9 +1000,45 @@ fn print_output_result(cli: &Cli, out: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use tempfile::tempdir;
 
     use super::*;
+
+    fn consent_config(policy: ContentPolicy) -> Config {
+        Config {
+            version: 4,
+            model: temari_core::ModelConfig {
+                base_url: "https://model.example.test/private/v1?token=hidden".into(),
+                name: "local".into(),
+                allowed_hosts: vec!["model.example.test".into()],
+                api_key_env: Some("PRIVATE_KEY".into()),
+            },
+            privacy: temari_core::PrivacyConfig {
+                content: policy,
+                max_content_chars: 20_000,
+                max_content_file_bytes: 10_485_760,
+                extraction: temari_core::ExtractionConfig {
+                    max_output_bytes: 1_048_576,
+                    max_archive_entries: 1024,
+                    max_expanded_bytes: 67_108_864,
+                    max_xml_events: 1_000_000,
+                    max_xml_depth: 256,
+                    timeout_seconds: 15,
+                    ocr: None,
+                },
+            },
+        }
+    }
+
+    fn ambiguous_file(path: &str) -> FileCandidate {
+        FileCandidate {
+            id: "f000001".into(),
+            source_path: path.into(),
+            extension: "txt".into(),
+        }
+    }
 
     #[test]
     fn approval_requires_both_terminals() {
@@ -949,5 +1099,104 @@ mod tests {
             0o700
         );
         assert!(create_run_directory(&source.path().join("run"), source.path()).is_err());
+    }
+
+    #[test]
+    fn ask_discloses_only_the_origin_and_uses_the_current_run_answer() {
+        let mut config = consent_config(ContentPolicy::Ask);
+        config.privacy.extraction.ocr = Some(temari_core::OcrConfig {
+            executable: "/private/bin/ocr".into(),
+            languages: vec!["eng".into()],
+            data_dir: None,
+        });
+        let mut output = Vec::new();
+
+        let decision = resolve_content_decision(
+            &config,
+            &[ambiguous_file("Receipts/invoice.txt")],
+            PlanningInteraction::InteractiveOrganize,
+            &mut Cursor::new(b"yes\n"),
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert_eq!(decision, ContentDecision::Extract);
+        assert!(output.contains("https://model.example.test"));
+        assert!(output.contains("Receipts/invoice.txt"));
+        assert!(output.contains("Local OCR: enabled"));
+        assert!(!output.contains("private/v1"));
+        assert!(!output.contains("token=hidden"));
+        assert!(!output.contains("PRIVATE_KEY"));
+        assert!(!output.contains("/private/bin/ocr"));
+    }
+
+    #[test]
+    fn ask_defaults_to_fallback_and_primitive_plan_never_prompts() {
+        let config = consent_config(ContentPolicy::Ask);
+        let files = [ambiguous_file("invoice.txt")];
+        let mut interactive_output = Vec::new();
+        let declined = resolve_content_decision(
+            &config,
+            &files,
+            PlanningInteraction::InteractiveOrganize,
+            &mut Cursor::new(b"\n"),
+            &mut interactive_output,
+        )
+        .unwrap();
+        assert_eq!(declined, ContentDecision::Fallback);
+
+        let mut primitive_output = Vec::new();
+        let error = resolve_content_decision(
+            &config,
+            &files,
+            PlanningInteraction::Primitive,
+            &mut Cursor::new(b"yes\n"),
+            &mut primitive_output,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires interactive organize"));
+        assert!(primitive_output.is_empty());
+    }
+
+    #[test]
+    fn no_ambiguity_never_prompts_and_explicit_policies_are_unattended() {
+        let mut output = Vec::new();
+        assert_eq!(
+            resolve_content_decision(
+                &consent_config(ContentPolicy::Ask),
+                &[],
+                PlanningInteraction::InteractiveOrganize,
+                &mut Cursor::new(b"yes\n"),
+                &mut output,
+            )
+            .unwrap(),
+            ContentDecision::Fallback
+        );
+        assert!(output.is_empty());
+
+        assert_eq!(
+            resolve_content_decision(
+                &consent_config(ContentPolicy::OnDemand),
+                &[ambiguous_file("invoice.txt")],
+                PlanningInteraction::Primitive,
+                &mut Cursor::new(Vec::<u8>::new()),
+                &mut output,
+            )
+            .unwrap(),
+            ContentDecision::Extract
+        );
+        assert_eq!(
+            resolve_content_decision(
+                &consent_config(ContentPolicy::MetadataOnly),
+                &[ambiguous_file("invoice.txt")],
+                PlanningInteraction::Primitive,
+                &mut Cursor::new(Vec::<u8>::new()),
+                &mut output,
+            )
+            .unwrap(),
+            ContentDecision::Fallback
+        );
+        assert!(output.is_empty());
     }
 }

@@ -29,6 +29,7 @@ pub struct ModelConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrivacyConfig {
+    #[serde(default)]
     pub content: ContentPolicy,
     pub max_content_chars: usize,
     pub max_content_file_bytes: u64,
@@ -55,9 +56,11 @@ pub struct OcrConfig {
     pub data_dir: Option<PathBuf>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentPolicy {
+    #[default]
+    Ask,
     MetadataOnly,
     OnDemand,
 }
@@ -74,9 +77,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        if self.version != 3 {
+        if self.version != 4 {
             return Err(Error::InvalidConfig(format!(
-                "unsupported config version {}; expected 3",
+                "unsupported config version {}; expected 4",
                 self.version
             )));
         }
@@ -148,6 +151,13 @@ impl ExtractionConfig {
 }
 
 impl ModelConfig {
+    pub fn endpoint_origin(&self) -> Result<String, Error> {
+        self.validate_endpoint()?;
+        let url = Url::parse(&self.base_url)
+            .map_err(|error| Error::InvalidConfig(format!("invalid model.base_url: {error}")))?;
+        Ok(url.origin().ascii_serialization())
+    }
+
     pub(crate) fn validate_endpoint(&self) -> Result<(), Error> {
         let url = Url::parse(&self.base_url)
             .map_err(|error| Error::InvalidConfig(format!("invalid model.base_url: {error}")))?;
@@ -184,7 +194,7 @@ mod tests {
 
     fn config() -> Config {
         Config {
-            version: 3,
+            version: 4,
             model: ModelConfig {
                 base_url: "http://127.0.0.1:11434/v1".into(),
                 name: "local".into(),
@@ -211,6 +221,32 @@ mod tests {
     #[test]
     fn accepts_explicitly_allowed_model_host() {
         config().validate().unwrap();
+    }
+
+    #[test]
+    fn omitted_content_policy_defaults_to_ask() {
+        let text = toml::to_string(&config()).unwrap();
+        let text = text
+            .lines()
+            .filter(|line| !line.starts_with("content = "))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let parsed: Config = toml::from_str(&text).unwrap();
+
+        assert_eq!(parsed.privacy.content, ContentPolicy::Ask);
+        parsed.validate().unwrap();
+    }
+
+    #[test]
+    fn endpoint_origin_omits_path_and_query() {
+        let mut value = config();
+        value.model.base_url = "http://127.0.0.1:11434/private/v1?token=secret".into();
+
+        assert_eq!(
+            value.model.endpoint_origin().unwrap(),
+            "http://127.0.0.1:11434"
+        );
     }
 
     #[test]

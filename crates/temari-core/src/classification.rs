@@ -6,19 +6,36 @@ use std::{
 };
 
 use crate::{
-    ApprovedFolder, Classification, ClassificationBasis, Classifier, ContentCandidate,
-    ContentPolicy, Error, FallbackCategory, FileCandidate, NameClassification, NameDecision,
+    ApprovedFolder, Classification, ClassificationBasis, Classifier, ContentCandidate, Error,
+    FallbackCategory, FileCandidate, NameClassification, NameDecision,
     artifact::normalize_relative_path,
 };
 
 #[derive(Clone, Copy, Debug)]
 pub struct ClassificationOptions {
-    pub content_policy: ContentPolicy,
+    pub content_decision: ContentDecision,
     pub max_content_chars: usize,
     pub max_content_file_bytes: u64,
-    pub name_batch_size: usize,
     pub content_batch_size: usize,
     pub batch_delay: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentDecision {
+    Extract,
+    Fallback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamePass {
+    resolved: Vec<Classification>,
+    needs_content: Vec<FileCandidate>,
+}
+
+impl NamePass {
+    pub fn needs_content(&self) -> &[FileCandidate] {
+        &self.needs_content
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,15 +56,18 @@ pub trait ContentExtractor {
     ) -> Option<ContentCandidate>;
 }
 
-pub fn classify_files<C: Classifier, E: ContentExtractor>(
-    source: &Path,
+pub fn classify_file_names<C: Classifier>(
     files: &[FileCandidate],
     folders: &[ApprovedFolder],
     classifier: &C,
-    extractor: &E,
-    options: ClassificationOptions,
-) -> Result<ClassificationSummary, Error> {
-    validate_options(options)?;
+    batch_size: usize,
+    batch_delay: Duration,
+) -> Result<NamePass, Error> {
+    if batch_size == 0 {
+        return Err(Error::InvalidConfig(
+            "name classification batch size must be greater than zero".into(),
+        ));
+    }
     for file in files {
         if normalize_relative_path(&file.source_path).is_err() {
             return Err(Error::InvalidArtifact(format!(
@@ -57,11 +77,9 @@ pub fn classify_files<C: Classifier, E: ContentExtractor>(
         }
     }
     if files.is_empty() {
-        return Ok(ClassificationSummary {
-            classifications: Vec::new(),
-            by_name: 0,
-            by_content: 0,
-            by_fallback: 0,
+        return Ok(NamePass {
+            resolved: Vec::new(),
+            needs_content: Vec::new(),
         });
     }
     let model_folders: Vec<_> = folders
@@ -77,23 +95,48 @@ pub fn classify_files<C: Classifier, E: ContentExtractor>(
 
     let mut resolved = Vec::with_capacity(files.len());
     let mut needs_content = Vec::new();
-    for (index, batch) in files.chunks(options.name_batch_size).enumerate() {
+    for (index, batch) in files.chunks(batch_size).enumerate() {
         let decisions = classifier.classify_names(batch, &model_folders)?;
         let (mut direct, mut ambiguous) = validate_name_batch(batch, &model_folders, decisions)?;
         resolved.append(&mut direct);
         needs_content.append(&mut ambiguous);
-        delay_between_batches(
-            index,
-            files.len(),
-            options.name_batch_size,
-            options.batch_delay,
-        );
+        delay_between_batches(index, files.len(), batch_size, batch_delay);
     }
+    Ok(NamePass {
+        resolved,
+        needs_content,
+    })
+}
+
+pub fn complete_classification<C: Classifier, E: ContentExtractor>(
+    source: &Path,
+    files: &[FileCandidate],
+    folders: &[ApprovedFolder],
+    classifier: &C,
+    extractor: &E,
+    options: ClassificationOptions,
+    name_pass: NamePass,
+) -> Result<ClassificationSummary, Error> {
+    validate_options(options)?;
+    let model_folders: Vec<_> = folders
+        .iter()
+        .filter(|folder| folder.model_visible)
+        .cloned()
+        .collect();
+    if !files.is_empty() && model_folders.is_empty() {
+        return Err(Error::InvalidArtifact(
+            "folder set contains no model-visible destinations".into(),
+        ));
+    }
+    let NamePass {
+        mut resolved,
+        needs_content,
+    } = name_pass;
     let by_name = resolved.len();
 
     let mut extracted = Vec::new();
     let mut fallback_files = Vec::new();
-    if options.content_policy == ContentPolicy::OnDemand {
+    if options.content_decision == ContentDecision::Extract {
         for file in needs_content {
             match extractor.extract(
                 source,
@@ -271,8 +314,7 @@ fn validate_complete(
 }
 
 fn validate_options(options: ClassificationOptions) -> Result<(), Error> {
-    if options.name_batch_size == 0
-        || options.content_batch_size == 0
+    if options.content_batch_size == 0
         || options.max_content_chars == 0
         || options.max_content_file_bytes == 0
     {
@@ -323,6 +365,20 @@ mod tests {
 
     struct LocalOnlyClassifier {
         destination_id: String,
+    }
+
+    struct NeverExtractor;
+
+    impl ContentExtractor for NeverExtractor {
+        fn extract(
+            &self,
+            _source: &Path,
+            _file: &FileCandidate,
+            _max_chars: usize,
+            _max_file_bytes: u64,
+        ) -> Option<ContentCandidate> {
+            panic!("fallback completion must not invoke content extraction")
+        }
     }
 
     impl Classifier for LocalOnlyClassifier {
@@ -411,15 +467,28 @@ mod tests {
         .folders
     }
 
-    fn options(policy: ContentPolicy) -> ClassificationOptions {
+    fn options() -> ClassificationOptions {
         ClassificationOptions {
-            content_policy: policy,
+            content_decision: ContentDecision::Fallback,
             max_content_chars: 100,
             max_content_file_bytes: 1024,
-            name_batch_size: 50,
             content_batch_size: 20,
             batch_delay: Duration::ZERO,
         }
+    }
+
+    fn classify<C: Classifier, E: ContentExtractor>(
+        source: &Path,
+        files: &[FileCandidate],
+        folders: &[ApprovedFolder],
+        classifier: &C,
+        extractor: &E,
+        decision: ContentDecision,
+    ) -> Result<ClassificationSummary, Error> {
+        let pass = classify_file_names(files, folders, classifier, 50, Duration::ZERO)?;
+        let mut options = options();
+        options.content_decision = decision;
+        complete_classification(source, files, folders, classifier, extractor, options, pass)
     }
 
     fn extractor() -> LocalContentExtractor {
@@ -463,19 +532,20 @@ mod tests {
             content_calls: RefCell::new(Vec::new()),
         };
 
-        let result = classify_files(
+        let result = classify(
             source.path(),
             &files,
             &folders,
             &classifier,
             &extractor(),
-            options(ContentPolicy::OnDemand),
+            ContentDecision::Extract,
         )
         .unwrap();
 
         assert_eq!(result.by_name, 1);
         assert_eq!(result.by_content, 1);
         assert_eq!(result.by_fallback, 1);
+        assert_eq!(classifier.name_calls.borrow().as_slice(), &[3]);
         assert_eq!(
             classifier.content_calls.borrow().as_slice(),
             &[vec![String::from("f2")]]
@@ -509,13 +579,13 @@ mod tests {
             content_calls: RefCell::new(Vec::new()),
         };
 
-        let result = classify_files(
+        let result = classify(
             source.path(),
             &files,
             &folders,
             &classifier,
-            &extractor(),
-            options(ContentPolicy::MetadataOnly),
+            &NeverExtractor,
+            ContentDecision::Fallback,
         )
         .unwrap();
 
@@ -549,13 +619,13 @@ mod tests {
             content_calls: RefCell::new(Vec::new()),
         };
 
-        let result = classify_files(
+        let result = classify(
             source.path(),
             &files,
             &folders,
             &classifier,
             &extractor(),
-            options(ContentPolicy::MetadataOnly),
+            ContentDecision::Fallback,
         )
         .unwrap();
 
@@ -579,7 +649,7 @@ mod tests {
             .id
             .clone();
 
-        let error = classify_files(
+        let error = classify(
             source.path(),
             &files,
             &folders,
@@ -587,7 +657,7 @@ mod tests {
                 destination_id: fallback_id,
             },
             &extractor(),
-            options(ContentPolicy::MetadataOnly),
+            ContentDecision::Fallback,
         )
         .unwrap_err();
 
@@ -608,13 +678,13 @@ mod tests {
             content_calls: RefCell::new(Vec::new()),
         };
 
-        let error = classify_files(
+        let error = classify(
             source.path(),
             &files,
             &folders,
             &classifier,
             &extractor(),
-            options(ContentPolicy::OnDemand),
+            ContentDecision::Extract,
         )
         .unwrap_err();
 

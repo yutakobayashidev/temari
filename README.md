@@ -2,7 +2,7 @@
 
 `Temari` is a private, personal-use tool that plans and applies file organization with a local model or a model hosted on an explicitly trusted internal network.
 
-Proposal, approval, and planning are read-only. Filesystem changes require a separate confirmed `apply` command and produce a durable JSON journal that can be inspected or passed to `undo`. Content extraction is disabled by default; the explicit `on_demand` privacy policy sends bounded text only for ambiguous files. The application does not watch directories, use a state database, or send telemetry.
+Proposal, approval, and planning are read-only. Filesystem changes require a separate confirmed `apply` command and produce a durable JSON journal that can be inspected or passed to `undo`. The default `ask` privacy policy requests per-run consent only when names are ambiguous; only bounded extracted text is eligible to be sent. The application does not send telemetry.
 
 ## Trust boundaries
 
@@ -72,16 +72,16 @@ $ cargo run -p temari-cli -- approve downloads.proposal.json \
 
 To use an internal model, change `model.base_url` and add its hostname to `model.allowed_hosts`. The allowlist is enforced immediately before the request; it is not documentation-only configuration.
 
-To enable the automatic second pass, set the explicit privacy policy:
+The default interactive privacy policy is:
 
 ```toml
 [privacy]
-content = "on_demand"
+content = "ask"
 max_content_chars = 20000
 max_content_file_bytes = 10485760
 ```
 
-The name pass runs for every file. Only `needs_content` results use local extraction. Temari reads bounded UTF-8, PDF, DOCX, PPTX, XLSX, ODT, ODP, and ODS text on both supported platforms. Optional OCR supports common raster images through one explicitly configured local executable. Unsupported, failed, empty, oversized, timed-out, or metadata-only cases use an approved local extension fallback instead.
+The name pass runs once for every file. Only `needs_content` results reach the consent boundary. In interactive `organize`, `ask` displays the model origin, exact ambiguous paths, extraction limits, and OCR status; declining uses local fallbacks and continues. Primitive `plan` never prompts and requires `metadata_only` or `on_demand` if ambiguity occurs. Temari reads bounded UTF-8, PDF, DOCX, PPTX, XLSX, ODT, ODP, and ODS text on both platforms. Optional OCR supports common raster images through one explicitly configured local executable. Raw files are never uploaded, and extracted text and consent are never persisted.
 
 Document containers are parsed in memory without unpacking files. Archive expansion, entry count, XML events, XML depth, output bytes, output characters, and OCR runtime are bounded. OCR is disabled unless `[privacy.extraction.ocr]` is present; Temari invokes that executable directly with fixed arguments and never through a shell.
 
@@ -103,7 +103,7 @@ Commands:
 - Artifact paths go to stdout. Read-only commands accept `--out -` to emit artifact JSON. Apply and undo require persistent journal paths outside the organized source.
 - Diagnostics, progress, prompts, and errors go to stderr.
 - With a file output, `--json` emits a machine-readable result containing the output path.
-- `--no-input` prevents prompts. Approval additionally requires `--accept-all`; apply, undo, and resume require `--yes`.
+- `--no-input` prevents prompts. Approval additionally requires `--accept-all`; apply, undo, and resume require `--yes`. Primitive `plan` never prompts under any policy.
 - `resume` updates only an unfinished `running` journal; terminal sessions remain immutable. `organize` rejects non-interactive execution.
 - Exit code `0` means success, `1` means a runtime failure, and `2` means invalid arguments.
 
@@ -117,7 +117,7 @@ The workflow follows five explicit trust boundaries:
 4. `apply`: after confirmation, local code creates only required approved directories and performs validated moves while atomically updating an audit journal.
 5. `undo`: local code conservatively reverses recorded moves and removes only unchanged, empty directories created by that apply session.
 
-All five primitive stages, explicit crash resume, and the interactive `organize` orchestrator are implemented. Background monitoring remains future work. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification and privacy, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, and [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits.
+All five primitive stages, explicit crash resume, and the interactive `organize` orchestrator are implemented. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits, and [ADR 0009](docs/adr/0009-request-per-run-content-consent.md) for consent.
 
 Example schemas are available for a model-created [proposal](examples/proposal.example.json) and a locally approved [folder set](examples/folders.example.json). Their source paths are illustrative and must match the canonical source used by `plan`.
 

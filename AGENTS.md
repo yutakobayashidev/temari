@@ -6,7 +6,8 @@
 - Linux and macOS are required platforms. Keep reusable behavior in `temari-core`; keep presentation in adapters such as `temari-cli`.
 - Localhost is allowed by default. Every non-local model hostname must be explicitly allowlisted in configuration.
 - The model may select opaque destination IDs only. Never execute a model-generated filesystem path.
-- Name classification may request content only for ambiguous files. Send bounded locally extracted text only when `privacy.content = "on_demand"`; never send raw files or persist extracted text in workflow artifacts or logs.
+- Name classification may request content only for ambiguous files. Send bounded locally extracted text only under explicit `on_demand` policy or after per-run `ask` consent; never send raw files or persist extracted text in workflow artifacts or logs.
+- Treat `privacy.content = "ask"` as per-run consent. Prompt only in interactive `organize`, only after ambiguity is known, and before extraction. Primitive `plan` never prompts.
 - Keep document extraction cross-platform and bounded. Parse supported ZIP/XML containers without unpacking them. OCR must be explicitly configured, invoked directly with fixed arguments, time-limited, and treated as a local fallback on every failure.
 - Materialize deterministic extension fallbacks as approved destinations in `FolderSet`. Automatically added fallbacks are local-only; the model must never select an ID whose `model_visible` value is false.
 - Keep folder proposal, user approval, planning, and filesystem apply as separate stages. A proposal is untrusted data until local approval assigns an opaque ID and validates its relative path.

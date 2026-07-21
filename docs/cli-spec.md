@@ -42,7 +42,8 @@ temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PA
 
 - Read-only.
 - Classifies file names in batches of 50 into model-visible IDs from the supplied `FolderSet`.
-- A name result may request content. With `privacy.content = "on_demand"`, the core extracts bounded UTF-8, PDF, supported ZIP/XML document, or optional local OCR text and classifies those files in batches of 20. With `metadata_only`, no content is read or sent.
+- A name result may request content. The default `ask` policy pauses interactive `organize` after the validated name pass and before extraction. Approval is per run; refusal uses local fallbacks and continues. Primitive `plan` never prompts and stops before extraction when `ask` encounters ambiguity.
+- With `privacy.content = "on_demand"`, the core extracts bounded UTF-8, PDF, supported ZIP/XML document, or optional local OCR text and classifies those files in batches of 20. With `metadata_only`, no content is read or sent.
 - Document extraction supports DOCX, PPTX, XLSX, ODT, ODP, and ODS with archive, expansion, XML, byte, and character limits. Optional OCR supports common raster images through a fixed, direct, time-limited local executable invocation.
 - Uses deterministic approved fallback IDs when content is disabled, unsupported, oversized, empty, or cannot be extracted. Model and endpoint failures remain errors rather than silently falling back.
 - Rejects a `FolderSet` created for a different canonical source path.
@@ -86,6 +87,7 @@ temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PA
 - Offers approve, edit through `$VISUAL` or `$EDITOR`, or quit. Editing may change only folders and descriptions, not the source or sampling context.
 - Shows exact mkdir and collision-resolved move operations before a separate apply confirmation.
 - Keeps name, content, and fallback processing inside Stage 3 and reports their counts without adding another command boundary.
+- Under `ask`, discloses the model origin, exact sanitized ambiguous paths, extraction limits, and local OCR status, then asks once. It never displays credentials, endpoint paths or queries, executable paths, or extracted text.
 
 ## Global options and output
 
@@ -107,7 +109,7 @@ temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PA
 
 ## Configuration
 
-- Configuration version 3 requires `[privacy]` and `[privacy.extraction]` sections. `content = "metadata_only"` disables content extraction; `content = "on_demand"` enables it only for ambiguous files.
+- Configuration version 4 requires `[privacy]` and `[privacy.extraction]` sections. Omitted `content` defaults to `ask`; `metadata_only` disables extraction and `on_demand` explicitly permits bounded extraction for unattended planning.
 - `.temari.toml` contains model connectivity, endpoint allowlists, bounded extraction limits, optional OCR executable settings, and privacy policy only.
 - OCR is disabled when `[privacy.extraction.ocr]` is absent. Its executable and optional data directory must be absolute paths; language identifiers are validated tokens.
 - Approved destinations live in a `FolderSet`, not in application configuration.
@@ -143,3 +145,4 @@ $ temari approve downloads.proposal.json --accept-all --no-input --out downloads
 6. Reuse the same services from the GUI and add a state database only when monitoring requires it.
 7. Add automatic two-pass name/content classification and approved deterministic extension fallbacks. Completed.
 8. Add bounded cross-platform document extraction and optional local OCR. Completed.
+9. Add ambiguity-aware per-run content consent without making primitive commands interactive. Completed.

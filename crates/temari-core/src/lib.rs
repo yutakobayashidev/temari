@@ -18,7 +18,8 @@ pub use artifact::{
     ApprovedFolder, FallbackCategory, FolderProposal, FolderSet, Proposal, ScanScope,
 };
 pub use classification::{
-    ClassificationOptions, ClassificationSummary, ContentExtractor, classify_files,
+    ClassificationOptions, ClassificationSummary, ContentDecision, ContentExtractor, NamePass,
+    classify_file_names, complete_classification,
 };
 pub use config::{Config, ContentPolicy, ExtractionConfig, ModelConfig, OcrConfig, PrivacyConfig};
 pub use extraction::LocalContentExtractor;
