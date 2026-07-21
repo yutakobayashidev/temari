@@ -419,9 +419,11 @@ pub fn undo_session_with_lock(
     journal_path: &Path,
     lock: &SourceLock,
 ) -> Result<UndoSession, Error> {
-    lock.validate_source(&apply.source, &apply.source_identity)?;
+    lock.validate_recovery_source(&apply.source, &apply.source_identity)?;
     preflight_undo(apply, journal_path)?;
     let root = PathBuf::from(&apply.source);
+    let recorded_source_device = apply.source_identity.device;
+    let current_source_device = lock.identity().device;
     let mut undo = UndoSession {
         version: 2,
         apply_session_id: apply.id.clone(),
@@ -476,7 +478,13 @@ pub fn undo_session_with_lock(
             update_journal(journal_path, &undo)?;
             continue;
         }
-        match reconcile_move(&original, &destination, &apply_record.fingerprint)? {
+        match reconcile_move_for_recovery(
+            &original,
+            &destination,
+            &apply_record.fingerprint,
+            recorded_source_device,
+            current_source_device,
+        )? {
             ReconciledMove::AlreadyRestored => {
                 undo.moves[undo_index].outcome = UndoMoveOutcome::AlreadyRestored;
             }
@@ -542,7 +550,12 @@ pub fn undo_session_with_lock(
             Ok(metadata)
                 if metadata.file_type().is_dir()
                     && !metadata.file_type().is_symlink()
-                    && identity(&metadata) == *expected_identity =>
+                    && identity_matches_for_recovery(
+                        &identity(&metadata),
+                        expected_identity,
+                        recorded_source_device,
+                        current_source_device,
+                    ) =>
             {
                 if fs::read_dir(&path)
                     .map_err(|source| io_error("read", &path, source))?
@@ -624,7 +637,7 @@ pub fn preflight_undo(apply: &ApplySession, journal_path: &Path) -> Result<(), E
             "running apply session must be resumed before undo".into(),
         ));
     }
-    let root = verify_source(&apply.source, &apply.source_identity)?;
+    let root = verify_recovery_source(&apply.source, &apply.source_identity)?;
     validate_journal_target(journal_path, &root)
 }
 
@@ -901,6 +914,47 @@ fn verify_source(source: &str, expected: &FsIdentity) -> Result<PathBuf, Error> 
     Ok(canonical)
 }
 
+fn verify_recovery_source(source: &str, expected: &FsIdentity) -> Result<PathBuf, Error> {
+    let requested = Path::new(source);
+    let (canonical, actual) = canonical_directory(requested)?;
+    if canonical != requested || actual.inode != expected.inode {
+        return Err(Error::InvalidArtifact(
+            "source path or inode changed after apply".into(),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn identity_matches_for_recovery(
+    actual: &FsIdentity,
+    expected: &FsIdentity,
+    recorded_source_device: u64,
+    current_source_device: u64,
+) -> bool {
+    let expected_current_device = if expected.device == recorded_source_device {
+        current_source_device
+    } else {
+        expected.device
+    };
+    actual.device == expected_current_device && actual.inode == expected.inode
+}
+
+fn fingerprint_matches_for_recovery(
+    actual: &FileFingerprint,
+    expected: &FileFingerprint,
+    recorded_source_device: u64,
+    current_source_device: u64,
+) -> bool {
+    actual.size == expected.size
+        && actual.sha256 == expected.sha256
+        && identity_matches_for_recovery(
+            &actual.identity,
+            &expected.identity,
+            recorded_source_device,
+            current_source_device,
+        )
+}
+
 enum ReconciledMove {
     AtDestination,
     AlreadyRestored,
@@ -912,17 +966,49 @@ fn reconcile_move(
     destination: &Path,
     expected: &FileFingerprint,
 ) -> Result<ReconciledMove, Error> {
+    reconcile_move_for_recovery(
+        original,
+        destination,
+        expected,
+        expected.identity.device,
+        expected.identity.device,
+    )
+}
+
+fn reconcile_move_for_recovery(
+    original: &Path,
+    destination: &Path,
+    expected: &FileFingerprint,
+    recorded_source_device: u64,
+    current_source_device: u64,
+) -> Result<ReconciledMove, Error> {
     let original_exists = path_exists(original)?;
     let destination_exists = path_exists(destination)?;
     if !original_exists && destination_exists {
-        return Ok(if fingerprint(destination)? == *expected {
-            ReconciledMove::AtDestination
-        } else {
-            ReconciledMove::Conflict("destination file changed after apply".into())
-        });
+        let actual = fingerprint(destination)?;
+        return Ok(
+            if fingerprint_matches_for_recovery(
+                &actual,
+                expected,
+                recorded_source_device,
+                current_source_device,
+            ) {
+                ReconciledMove::AtDestination
+            } else {
+                ReconciledMove::Conflict("destination file changed after apply".into())
+            },
+        );
     }
-    if original_exists && !destination_exists && fingerprint(original)? == *expected {
-        return Ok(ReconciledMove::AlreadyRestored);
+    if original_exists && !destination_exists {
+        let actual = fingerprint(original)?;
+        if fingerprint_matches_for_recovery(
+            &actual,
+            expected,
+            recorded_source_device,
+            current_source_device,
+        ) {
+            return Ok(ReconciledMove::AlreadyRestored);
+        }
     }
     Ok(ReconciledMove::Conflict(
         "source and destination state is ambiguous; refusing to overwrite".into(),
@@ -1162,6 +1248,19 @@ mod tests {
         .unwrap()
     }
 
+    fn renumber_apply_devices(apply: &mut ApplySession) {
+        let recorded_device = apply.source_identity.device.wrapping_add(1);
+        apply.source_identity.device = recorded_device;
+        for record in &mut apply.moves {
+            record.fingerprint.identity.device = recorded_device;
+        }
+        for record in &mut apply.directories {
+            if let DirectoryOutcome::Created { identity } = &mut record.outcome {
+                identity.device = recorded_device;
+            }
+        }
+    }
+
     #[test]
     fn applies_and_undoes_moves_and_created_directories() {
         let root = tempdir().unwrap();
@@ -1185,6 +1284,96 @@ mod tests {
         assert!(root.path().join("report.txt").exists());
         assert!(!root.path().join("Documents").exists());
         assert_eq!(fs::read(&apply_path).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn undo_accepts_a_consistent_source_device_renumber() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        let plan = plan(root.path());
+        let mut apply = apply_plan(&plan, &journals.path().join("apply.json")).unwrap();
+        renumber_apply_devices(&mut apply);
+
+        let undo = undo_session(&apply, &journals.path().join("undo.json")).unwrap();
+
+        assert_eq!(undo.state, UndoState::Completed);
+        assert!(root.path().join("report.txt").exists());
+        assert!(!root.path().join("Documents").exists());
+    }
+
+    #[test]
+    fn recovery_rejects_an_identity_left_on_the_recorded_source_device() {
+        let expected = FsIdentity {
+            device: 38,
+            inode: 42,
+        };
+        let stale = expected.clone();
+
+        assert!(!identity_matches_for_recovery(&stale, &expected, 38, 37));
+        assert!(identity_matches_for_recovery(
+            &FsIdentity {
+                device: 37,
+                inode: 42,
+            },
+            &expected,
+            38,
+            37,
+        ));
+    }
+
+    #[test]
+    fn undo_recognizes_an_already_restored_file_after_device_renumber() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        let plan = plan(root.path());
+        let mut apply = apply_plan(&plan, &journals.path().join("apply.json")).unwrap();
+        renumber_apply_devices(&mut apply);
+        fs::rename(
+            root.path().join("Documents/Reports/report.txt"),
+            root.path().join("report.txt"),
+        )
+        .unwrap();
+
+        let undo = undo_session(&apply, &journals.path().join("undo.json")).unwrap();
+
+        assert_eq!(undo.state, UndoState::Completed);
+        assert_eq!(undo.moves[0].outcome, UndoMoveOutcome::AlreadyRestored);
+        assert!(!root.path().join("Documents").exists());
+    }
+
+    #[test]
+    fn undo_rejects_a_same_content_replacement_after_device_renumber() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        let plan = plan(root.path());
+        let mut apply = apply_plan(&plan, &journals.path().join("apply.json")).unwrap();
+        renumber_apply_devices(&mut apply);
+        let destination = root.path().join("Documents/Reports/report.txt");
+        fs::rename(&destination, root.path().join("original-inode.txt")).unwrap();
+        fs::write(&destination, b"report").unwrap();
+
+        let undo = undo_session(&apply, &journals.path().join("undo.json")).unwrap();
+
+        assert_eq!(undo.state, UndoState::PartialFailure);
+        assert!(matches!(
+            undo.moves[0].outcome,
+            UndoMoveOutcome::Conflict { .. }
+        ));
+        assert!(!root.path().join("report.txt").exists());
+    }
+
+    #[test]
+    fn undo_rejects_a_changed_source_inode_after_device_renumber() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        let plan = plan(root.path());
+        let mut apply = apply_plan(&plan, &journals.path().join("apply.json")).unwrap();
+        renumber_apply_devices(&mut apply);
+        apply.source_identity.inode = apply.source_identity.inode.wrapping_add(1);
+        let undo_path = journals.path().join("undo.json");
+
+        assert!(undo_session(&apply, &undo_path).is_err());
+        assert!(!undo_path.exists());
     }
 
     #[test]

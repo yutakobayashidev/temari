@@ -14,6 +14,7 @@ Proposal, approval, and planning are read-only. Filesystem changes require a sep
 - Plans contain local SHA-256, size, device, and inode fingerprints. These values and raw files are never sent to the model. Extracted text is neither logged nor persisted.
 - Apply revalidates the source root, fingerprints, real directory components, and unoccupied destinations before mutation. It never overwrites.
 - Apply, resume, and undo hold an exclusive advisory lock on the canonical source directory so competing writers fail before mutation.
+- Undo tolerates a consistent filesystem device-number change across reboot, while still requiring the same source inode and matching file hashes and inodes.
 - Undo restores only recorded moves whose identity and content still match, and removes only session-created directories that remain empty.
 - Every model endpoint hostname must appear in an explicit allowlist.
 - API keys are read from a configured environment variable and are never stored in the configuration file.

@@ -76,6 +76,7 @@ temari [global options] history list|show ...
 
 - Mutates the filesystem from a recorded `ApplySession` only.
 - Restores moves in reverse order when current state still matches the session.
+- Accepts a consistent source-filesystem device renumber after reboot, while still requiring matching source and entry inodes plus file sizes and hashes.
 - Removes only directories created by that session and only when they are empty.
 - Records success, skips, and failures instead of pretending rollback is atomic.
 - Writes a separate `UndoSession`; it never modifies the original apply journal.

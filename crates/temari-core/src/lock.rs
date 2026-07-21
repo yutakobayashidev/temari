@@ -59,6 +59,19 @@ impl SourceLock {
         }
         Ok(())
     }
+
+    pub(crate) fn validate_recovery_source(
+        &self,
+        source: &str,
+        identity: &FsIdentity,
+    ) -> Result<(), Error> {
+        if self.source != Path::new(source) || self.identity.inode != identity.inode {
+            return Err(Error::InvalidState(
+                "source lock does not belong to the requested recovery source".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for SourceLock {
