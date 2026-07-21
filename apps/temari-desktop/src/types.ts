@@ -31,3 +31,44 @@ export type FolderSet = {
   scope: { recursive_roots: string[] };
   folders: ApprovedFolder[];
 };
+
+export type ClassificationBasis = "name" | "content" | "extension_fallback" | "rule";
+
+export type FsIdentity = {
+  device: number;
+  inode: number;
+};
+
+export type FileFingerprint = {
+  identity: FsIdentity;
+  size: number;
+  sha256: string;
+};
+
+export type PlanEntry = {
+  file_id: string;
+  source_path: string;
+  source_fingerprint: FileFingerprint;
+  destination_id: string;
+  requested_destination: string;
+  destination_path: string;
+  reasoning: string | null;
+  classification_basis: ClassificationBasis;
+  rule_id: string | null;
+};
+
+export type Plan = {
+  version: number;
+  source: string;
+  source_identity: FsIdentity;
+  scope: { recursive_roots: string[] };
+  collision_policy: "rename";
+  folders: ApprovedFolder[];
+  directories: string[];
+  entries: PlanEntry[];
+};
+
+export type PlanPreview = {
+  plan: Plan;
+  sha256: string;
+};

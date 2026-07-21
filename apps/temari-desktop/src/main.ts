@@ -1,8 +1,8 @@
 import "./styles.css";
-import { approveStructure, chooseSource, proposeStructure, scanSource } from "./api";
-import type { FolderProposal, FolderSet, Proposal, ScanPreview } from "./types";
+import { approveStructure, chooseSource, previewPlan, proposeStructure, scanSource } from "./api";
+import type { ClassificationBasis, FolderProposal, FolderSet, PlanPreview, Proposal, ScanPreview } from "./types";
 
-type Stage = "source" | "scan" | "shape" | "approve";
+type Stage = "source" | "scan" | "shape" | "approve" | "plan";
 
 type AppState = {
   stage: Stage;
@@ -10,6 +10,7 @@ type AppState = {
   scan: ScanPreview | null;
   proposal: Proposal | null;
   approved: FolderSet | null;
+  planPreview: PlanPreview | null;
   busy: boolean;
   error: string | null;
   configPath: string;
@@ -21,6 +22,7 @@ const state: AppState = {
   scan: null,
   proposal: null,
   approved: null,
+  planPreview: null,
   busy: false,
   error: null,
   configPath: ".temari.toml",
@@ -46,7 +48,8 @@ app.innerHTML = `
         <li data-stage="scan"><span>2</span><div><strong>Scan</strong><small>Read names locally</small></div></li>
         <li data-stage="shape"><span>3</span><div><strong>Shape</strong><small>Review the structure</small></div></li>
         <li data-stage="approve"><span>4</span><div><strong>Approve</strong><small>Trust the destinations</small></div></li>
-        <li class="locked"><span>5</span><div><strong>Apply</strong><small>Not in this preview</small></div></li>
+        <li data-stage="plan"><span>5</span><div><strong>Plan</strong><small>Review every move</small></div></li>
+        <li class="locked"><span>6</span><div><strong>Apply</strong><small>Not in this preview</small></div></li>
       </ol>
       <div class="local-boundary">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 4.5 5.2v5.9c0 4.9 3.1 9.4 7.5 10.9 4.4-1.5 7.5-6 7.5-10.9V5.2L12 2Zm0 3.1 4.5 1.9v4.1c0 3.4-1.8 6.6-4.5 7.8-2.7-1.2-4.5-4.4-4.5-7.8V7L12 5.1Z"/></svg>
@@ -105,10 +108,18 @@ app.innerHTML = `
           <div class="editor-heading"><span>Destinations</span><button class="text-button" id="add-folder" type="button">+ Add folder</button></div>
           <div id="folder-fields"></div>
         </form>
+        <section class="plan-preview" id="plan-preview" aria-label="Move plan" hidden>
+          <div class="plan-summary" id="plan-summary"></div>
+          <div class="plan-entries" id="plan-entries"></div>
+          <details class="directory-details" id="directory-details">
+            <summary>Folders to create</summary>
+            <ul id="directory-list"></ul>
+          </details>
+        </section>
         <div class="status-message" id="status-message" role="status" aria-live="polite" hidden></div>
         <div class="review-actions">
           <button class="primary-action" id="main-action" type="button" disabled>Select a source</button>
-          <button class="apply-action" type="button" disabled title="Apply remains in the audited command-line workflow for this preview">
+          <button class="apply-action" id="apply-action" type="button" disabled title="Apply remains in the audited command-line workflow for this preview">
             <span>Apply moves</span><small>Locked in this preview</small>
           </button>
         </div>
@@ -143,7 +154,7 @@ function basename(path: string): string {
 
 function render(): void {
   document.querySelectorAll<HTMLElement>("[data-stage]").forEach((item) => {
-    const stages: Stage[] = ["source", "scan", "shape", "approve"];
+    const stages: Stage[] = ["source", "scan", "shape", "approve", "plan"];
     const itemStage = item.dataset.stage as Stage;
     item.classList.toggle("active", itemStage === state.stage);
     item.classList.toggle("complete", stages.indexOf(itemStage) < stages.indexOf(state.stage));
@@ -154,6 +165,7 @@ function render(): void {
     scan: ["Local inventory", "See the loose threads."],
     shape: ["Proposed structure", "Gather files into calm groups."],
     approve: ["Locally approved", "Your structure is ready."],
+    plan: ["Read-only plan", "Follow every thread before it moves."],
   };
   $("#stage-kicker").textContent = titles[state.stage][0];
   $("#workspace-title").textContent = titles[state.stage][1];
@@ -171,10 +183,57 @@ function render(): void {
 
   renderScan();
   renderEditor();
+  renderPlan();
   renderNodes();
   renderReviewText();
   renderAction();
   renderStatus();
+}
+
+function renderPlan(): void {
+  const preview = $("#plan-preview") as HTMLElement;
+  preview.hidden = state.planPreview === null;
+  if (!state.planPreview) return;
+
+  const { plan, sha256 } = state.planPreview;
+  const moveCount = plan.entries.length;
+  $("#plan-summary").innerHTML = `
+    <div><strong>${moveCount}</strong><span>Moves</span></div>
+    <div><strong>${plan.directories.length}</strong><span>New folders</span></div>
+    <div><strong>Safe</strong><span>Rename collisions</span></div>`;
+
+  const entries = $("#plan-entries");
+  if (moveCount === 0) {
+    entries.innerHTML = `<div class="plan-empty"><strong>No moves needed</strong><span>Every in-scope file is already inside an approved destination.</span></div>`;
+  } else {
+    entries.innerHTML = plan.entries
+      .map(
+        (entry) => `
+          <article class="plan-entry" data-destination-id="${escapeAttribute(entry.destination_id)}" tabindex="-1">
+            <div class="move-path source-move"><span>From</span><strong>${escapeHtml(entry.source_path)}</strong></div>
+            <span class="move-arrow" aria-hidden="true">↓</span>
+            <div class="move-path destination-move"><span>To</span><strong>${escapeHtml(entry.destination_path)}</strong></div>
+            <span class="basis-chip">${basisLabel(entry.classification_basis)}</span>
+          </article>`,
+      )
+      .join("");
+  }
+
+  const details = $("#directory-details") as HTMLDetailsElement;
+  details.hidden = plan.directories.length === 0;
+  details.querySelector("summary")!.textContent = `Folders to create (${plan.directories.length})`;
+  $("#directory-list").innerHTML = plan.directories.map((path) => `<li>${escapeHtml(path)}</li>`).join("");
+  details.title = `Plan ${sha256}`;
+}
+
+function basisLabel(basis: ClassificationBasis): string {
+  const labels: Record<ClassificationBasis, string> = {
+    name: "Name",
+    content: "Content",
+    extension_fallback: "Fallback",
+    rule: "Rule",
+  };
+  return labels[basis];
 }
 
 function renderScan(): void {
@@ -210,13 +269,21 @@ function renderEditor(): void {
 function renderNodes(): void {
   const nodes = $("#folder-nodes");
   const folders = state.proposal?.folders ?? [];
+  const approvedByPath = new Map(state.approved?.folders.map((folder) => [folder.path, folder.id]) ?? []);
+  const moveCounts = new Map<string, number>();
+  for (const entry of state.planPreview?.plan.entries ?? []) {
+    moveCounts.set(entry.destination_id, (moveCounts.get(entry.destination_id) ?? 0) + 1);
+  }
   nodes.innerHTML = folders
     .map((folder, index) => {
       const angle = -Math.PI / 2 + (index / Math.max(folders.length, 1)) * Math.PI * 2;
       const radius = folders.length > 6 ? 43 : 40;
       const x = 50 + Math.cos(angle) * radius;
       const y = 50 + Math.sin(angle) * radius;
-      return `<button class="folder-node" style="--x:${x}%;--y:${y}%;--delay:${index * 45}ms" data-focus-folder="${index}" type="button"><i aria-hidden="true"></i><span>${escapeHtml(folder.path)}</span></button>`;
+      const destinationId = approvedByPath.get(folder.path);
+      const count = destinationId ? moveCounts.get(destinationId) : undefined;
+      const badge = count === undefined ? "" : `<b aria-label="${count} moves">${count}</b>`;
+      return `<button class="folder-node" style="--x:${x}%;--y:${y}%;--delay:${index * 45}ms" data-focus-folder="${index}"${destinationId ? ` data-destination-id="${escapeAttribute(destinationId)}"` : ""} type="button"><i aria-hidden="true"></i><span>${escapeHtml(folder.path)}</span>${badge}</button>`;
     })
     .join("");
   $("#thread-stage").classList.toggle("has-proposal", folders.length > 0);
@@ -226,8 +293,18 @@ function renderReviewText(): void {
   const title = $("#review-title");
   const copy = $("#review-copy");
   if (state.approved) {
-    title.textContent = "Structure approved";
-    copy.textContent = `${state.approved.folders.length} trusted destinations now have local IDs. No folders or files were changed.`;
+    if (state.planPreview) {
+      if (state.planPreview.plan.entries.length === 0) {
+        title.textContent = "No moves needed";
+        copy.textContent = "Every in-scope file is already inside an approved destination.";
+      } else {
+        title.textContent = "Review every move";
+        copy.textContent = "This plan is read-only. Check each source and destination before files can change.";
+      }
+    } else {
+      title.textContent = "Destinations approved";
+      copy.textContent = "The trusted destinations are ready. Preview the exact file moves next.";
+    }
   } else if (state.proposal) {
     title.textContent = "Tune the proposal";
     copy.textContent = "Rename, regroup, or remove destinations. Approval validates paths and assigns local destination IDs.";
@@ -248,17 +325,25 @@ function renderAction(): void {
     source: state.source ? "Scan this folder" : "Select a source",
     scan: "Request a structure",
     shape: "Approve destinations",
-    approve: "Approved locally",
+    approve: "Preview moves",
+    plan: "Plan ready",
   };
   mainAction.textContent = labels[state.stage];
-  mainAction.disabled = state.busy || !state.source || state.approved !== null;
+  mainAction.disabled = state.busy || !state.source || state.stage === "plan";
+  const applyAction = $("#apply-action") as HTMLButtonElement;
+  const moveCount = state.planPreview?.plan.entries.length;
+  applyAction.querySelector("span")!.textContent = moveCount === undefined ? "Apply moves" : `Apply ${moveCount} moves`;
 }
 
 function renderStatus(): void {
   const status = $("#status-message") as HTMLElement;
   status.hidden = !state.error && !state.approved;
   status.classList.toggle("error", state.error !== null);
-  status.textContent = state.error ?? (state.approved ? "Approval complete. Apply remains locked in this preview." : "");
+  status.textContent = state.error ?? (state.planPreview
+    ? `Plan ready. ${state.planPreview.plan.entries.length} moves and ${state.planPreview.plan.directories.length} folders to create. Nothing changed on disk.`
+    : state.approved
+      ? "Destinations approved. Preview the moves before any files can change."
+      : "");
 }
 
 function escapeHtml(value: string): string {
@@ -277,7 +362,7 @@ async function selectSource(): Promise<void> {
   try {
     const source = await chooseSource();
     if (!source) return;
-    Object.assign(state, { stage: "source", source, scan: null, proposal: null, approved: null });
+    Object.assign(state, { stage: "source", source, scan: null, proposal: null, approved: null, planPreview: null });
   } catch (error) {
     state.error = formatError(error);
   } finally {
@@ -303,6 +388,9 @@ async function advance(): Promise<void> {
       syncFolderInputs();
       state.approved = await approveStructure(state.proposal);
       state.stage = "approve";
+    } else if (state.stage === "approve" && state.approved) {
+      state.planPreview = await previewPlan();
+      state.stage = "plan";
     }
   } catch (error) {
     state.error = formatError(error);
@@ -358,7 +446,11 @@ $("#folder-nodes").addEventListener("click", (event) => {
   const node = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-focus-folder]");
   if (!node) return;
   const index = Number(node.dataset.focusFolder);
-  document.querySelector<HTMLInputElement>(`.folder-field[data-folder-index="${index}"] input[name="path"]`)?.focus();
+  if (state.planPreview && node.dataset.destinationId) {
+    document.querySelector<HTMLElement>(`.plan-entry[data-destination-id="${CSS.escape(node.dataset.destinationId)}"]`)?.focus();
+  } else {
+    document.querySelector<HTMLInputElement>(`.folder-field[data-folder-index="${index}"] input[name="path"]`)?.focus();
+  }
 });
 
 render();

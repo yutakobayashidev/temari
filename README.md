@@ -66,14 +66,15 @@ $ cargo run -p temari-cli -- resume downloads.apply.json
 
 ## Desktop proof of concept
 
-`apps/temari-desktop` contains a Tauri 2 proof of concept for Linux and macOS. The native app uses `temari-core` to select and scan a source, request a folder proposal from the configured model, edit it, and approve it locally. It deliberately exposes no plan or apply command yet, so the preview cannot move files.
+`apps/temari-desktop` contains a Tauri 2 proof of concept for Linux and macOS. The native app uses `temari-core` to select and scan a source, request a folder proposal from the configured model, edit and approve it locally, then preview every exact source-to-destination move in a read-only Plan. It deliberately exposes no apply command, so the preview cannot move files.
 
 ```console
+$ nix develop
 $ corepack pnpm --dir apps/temari-desktop install
 $ corepack pnpm --dir apps/temari-desktop tauri dev
 ```
 
-The model configuration path is editable in the window and defaults to `.temari.toml`. Running `pnpm dev` without Tauri opens an explicitly simulated browser preview for UI development; it does not access the filesystem or model. See [the desktop POC notes](docs/desktop-poc.md) for its command boundary and verification steps.
+The model configuration path is editable in the window and defaults to `.temari.toml`. Plan preview repeats the scan against the backend-held approved destinations. Under `privacy.content = "ask"`, ambiguous files use local fallbacks because this POC has no content-consent screen; explicit `on_demand` retains bounded extraction. Running `pnpm dev` without Tauri opens an explicitly simulated browser preview for UI development; it does not access the filesystem or model. See [the desktop POC notes](docs/desktop-poc.md) for its command boundary and verification steps.
 
 ## Foreground monitoring
 
@@ -165,6 +166,7 @@ Example schemas are available for a model-created [proposal](examples/proposal.e
 ## Development
 
 ```console
+$ nix develop
 $ cargo fmt --all -- --check
 $ cargo clippy --workspace --all-targets -- -D warnings
 $ cargo test --workspace

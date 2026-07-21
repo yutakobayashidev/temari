@@ -11,14 +11,17 @@ The native flow is:
 3. Request a compact hierarchy from the model configured by the selected TOML path.
 4. Edit destination paths and descriptions in the review panel.
 5. Approve the edited destinations locally, preserving the source and scan scope recorded by the backend.
+6. Build and inspect a real, read-only Plan containing every exact source and collision-safe destination path.
 
-There is no desktop command for planning or applying moves. The disabled Apply control communicates that boundary. Filesystem mutation remains available only through the reviewed CLI artifacts until the desktop can present the exact Plan, confirmation, journal, recovery, and undo guarantees.
+There is no desktop command for applying moves. The disabled Apply control communicates that boundary. Filesystem mutation remains available only through the reviewed CLI artifacts until the desktop can present exact confirmation, journal, recovery, and undo guarantees.
 
 ## Trust boundary
 
 - The frontend cannot replace proposal provenance during approval. The backend retains the latest real `Proposal` and accepts only edited `FolderProposal` entries.
-- Scanning, proposal generation, and approval use existing `temari-core` types and validation.
-- Proposal generation receives file-name metadata only. Content extraction is outside this POC.
+- Plan preview accepts no source, configuration, folder set, classification, or destination path from the frontend. It uses the backend-held configuration and approved `FolderSet`.
+- Scanning, proposal generation, approval, name classification, bounded content classification, fallback routing, and Plan construction use existing `temari-core` types and validation.
+- Proposal generation receives file-name metadata only. During planning, explicit `on_demand` permits bounded extraction for ambiguous files. `ask` behaves as declined consent and uses local extension fallbacks because this POC does not yet include a content-consent screen.
+- The resulting Plan contains local fingerprints and collision-safe destination paths, but remains in memory and cannot be applied through desktop IPC.
 - Tauri capabilities grant the main window only core defaults and access to the native open dialog.
 - The content security policy allows packaged assets and Tauri IPC; no arbitrary remote page or script is enabled.
 - No telemetry, updater, browser shell, or direct filesystem API is included.
@@ -28,9 +31,12 @@ There is no desktop command for planning or applying moves. The disabled Apply c
 Install the pinned frontend dependencies and start the native application:
 
 ```console
+$ nix develop
 $ corepack pnpm --dir apps/temari-desktop install --frozen-lockfile
 $ corepack pnpm --dir apps/temari-desktop tauri dev
 ```
+
+The repository dev shell supplies Rust, pnpm, the Linux Tauri libraries, and the GTK 3 file-chooser schema. On macOS it omits Linux-only libraries and uses the system WebKit framework.
 
 The config field accepts an absolute path when the process working directory is uncertain. The file follows the same format as `examples/temari.example.toml`.
 

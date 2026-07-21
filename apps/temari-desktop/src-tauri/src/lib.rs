@@ -2,21 +2,42 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use temari_core::{
-    Config, FileCandidate, FolderProposal, FolderProposer, FolderSet, OpenAiCompatibleModel,
-    Proposal, ScanScope, scan_directory, select_representative_files,
+    ClassificationOptions, Classifier, Config, ContentDecision, ContentExtractor, ContentPolicy,
+    FileCandidate, FolderProposal, FolderProposer, FolderSet, LocalContentExtractor,
+    OpenAiCompatibleModel, Plan, Proposal, ScanScope, build_plan, classify_file_names,
+    complete_classification, scan_directory, select_representative_files,
 };
 
 const SCAN_PREVIEW_LIMIT: usize = 80;
 const PROPOSAL_SAMPLE_LIMIT: usize = 100;
 
+#[derive(Clone)]
+struct ProposalState {
+    proposal: Proposal,
+    config: Config,
+}
+
+#[derive(Clone)]
+struct ApprovedState {
+    folders: FolderSet,
+    config: Config,
+}
+
+#[derive(Default)]
+struct WorkflowState {
+    proposal: Option<ProposalState>,
+    approved: Option<ApprovedState>,
+}
+
 #[derive(Clone, Default)]
 struct AppState {
-    latest_proposal: Arc<Mutex<Option<Proposal>>>,
+    workflow: Arc<Mutex<WorkflowState>>,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +74,13 @@ struct ApproveRequest {
     folders: Vec<FolderProposal>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanPreview {
+    plan: Plan,
+    sha256: String,
+}
+
 #[tauri::command]
 fn scan_source(request: ScanRequest) -> Result<ScanPreview, String> {
     let source = canonical_source(&request.source)?;
@@ -87,14 +115,24 @@ async fn propose_structure(
         return Err("maximum folder count must be greater than zero".into());
     }
 
-    let proposal = tauri::async_runtime::spawn_blocking(move || generate_proposal(request))
+    {
+        let mut workflow = state
+            .workflow
+            .lock()
+            .map_err(|_| "workflow state is unavailable".to_owned())?;
+        workflow.proposal = None;
+        workflow.approved = None;
+    }
+
+    let proposal_state = tauri::async_runtime::spawn_blocking(move || generate_proposal(request))
         .await
         .map_err(|error| format!("folder proposal task failed: {error}"))??;
-    let mut latest = state
-        .latest_proposal
+    let proposal = proposal_state.proposal.clone();
+    let mut workflow = state
+        .workflow
         .lock()
-        .map_err(|_| "proposal state is unavailable".to_owned())?;
-    *latest = Some(proposal.clone());
+        .map_err(|_| "workflow state is unavailable".to_owned())?;
+    workflow.proposal = Some(proposal_state);
     Ok(proposal)
 }
 
@@ -103,17 +141,39 @@ fn approve_structure(
     request: ApproveRequest,
     state: State<'_, AppState>,
 ) -> Result<FolderSet, String> {
-    let mut proposal = state
-        .latest_proposal
+    let mut workflow = state
+        .workflow
         .lock()
-        .map_err(|_| "proposal state is unavailable".to_owned())?
+        .map_err(|_| "workflow state is unavailable".to_owned())?;
+    let proposal_state = workflow
+        .proposal
         .clone()
         .ok_or_else(|| "generate a proposal before approving it".to_owned())?;
+    let mut proposal = proposal_state.proposal;
     proposal.folders = request.folders;
-    proposal.approve().map_err(error_text)
+    let folders = proposal.approve().map_err(error_text)?;
+    workflow.approved = Some(ApprovedState {
+        folders: folders.clone(),
+        config: proposal_state.config,
+    });
+    Ok(folders)
 }
 
-fn generate_proposal(request: ProposeRequest) -> Result<Proposal, String> {
+#[tauri::command]
+async fn preview_plan(state: State<'_, AppState>) -> Result<PlanPreview, String> {
+    let approved = state
+        .workflow
+        .lock()
+        .map_err(|_| "workflow state is unavailable".to_owned())?
+        .approved
+        .clone()
+        .ok_or_else(|| "approve destinations before creating a plan".to_owned())?;
+    tauri::async_runtime::spawn_blocking(move || generate_plan(approved))
+        .await
+        .map_err(|error| format!("plan preview task failed: {error}"))?
+}
+
+fn generate_proposal(request: ProposeRequest) -> Result<ProposalState, String> {
     let config = Config::load(Path::new(&request.config_path)).map_err(error_text)?;
     let source = canonical_source(&request.source)?;
     let scope = ScanScope::new(request.recursive_roots).map_err(error_text)?;
@@ -127,13 +187,71 @@ fn generate_proposal(request: ProposeRequest) -> Result<Proposal, String> {
         .propose_folders(&sample, request.max_folders)
         .map_err(error_text)?;
 
-    Ok(Proposal {
-        version: 2,
-        source: path_to_string(&source)?,
-        scope,
-        files_considered: sample.len(),
-        folders,
+    Ok(ProposalState {
+        proposal: Proposal {
+            version: 2,
+            source: path_to_string(&source)?,
+            scope,
+            files_considered: sample.len(),
+            folders,
+        },
+        config,
     })
+}
+
+fn generate_plan(approved: ApprovedState) -> Result<PlanPreview, String> {
+    let model = OpenAiCompatibleModel::new(&approved.config.model).map_err(error_text)?;
+    let extractor = LocalContentExtractor::new(approved.config.privacy.extraction.clone());
+    generate_plan_with(&approved.folders, &approved.config, &model, &extractor)
+}
+
+fn generate_plan_with<C: Classifier, E: ContentExtractor>(
+    folders: &FolderSet,
+    config: &Config,
+    classifier: &C,
+    extractor: &E,
+) -> Result<PlanPreview, String> {
+    folders.validate().map_err(error_text)?;
+    let source = canonical_source(&folders.source)?;
+    let excluded: Vec<_> = folders
+        .folders
+        .iter()
+        .map(|folder| folder.path.clone())
+        .collect();
+    let files = scan_directory(&source, &folders.scope, &excluded).map_err(error_text)?;
+    let batch_delay = Duration::from_millis(500);
+    let name_pass = classify_file_names(&files, &folders.folders, classifier, 50, batch_delay)
+        .map_err(error_text)?;
+    let content_decision = match config.privacy.content {
+        ContentPolicy::OnDemand => ContentDecision::Extract,
+        ContentPolicy::Ask | ContentPolicy::MetadataOnly => ContentDecision::Fallback,
+    };
+    let summary = complete_classification(
+        &source,
+        &files,
+        &folders.folders,
+        classifier,
+        extractor,
+        ClassificationOptions {
+            content_decision,
+            max_content_chars: config.privacy.max_content_chars,
+            max_content_file_bytes: config.privacy.max_content_file_bytes,
+            content_batch_size: 20,
+            batch_delay,
+        },
+        name_pass,
+    )
+    .map_err(error_text)?;
+    let plan = build_plan(
+        &source,
+        &folders.scope,
+        &files,
+        &folders.folders,
+        summary.classifications,
+    )
+    .map_err(error_text)?;
+    let sha256 = plan.sha256().map_err(error_text)?;
+    Ok(PlanPreview { plan, sha256 })
 }
 
 fn canonical_source(source: &str) -> Result<PathBuf, String> {
@@ -160,10 +278,29 @@ fn error_text(error: temari_core::Error) -> String {
     error.to_string()
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![
+            scan_source,
+            propose_structure,
+            approve_structure,
+            preview_plan
+        ])
+        .run(tauri::generate_context!())
+        .expect("failed to run Temari desktop");
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
 
+    use temari_core::{
+        ApprovedFolder, Classification, ClassificationBasis, ContentCandidate, ExtractionConfig,
+        ModelConfig, NameClassification, NameDecision, PrivacyConfig,
+    };
     use tempfile::tempdir;
 
     use super::*;
@@ -202,18 +339,160 @@ mod tests {
 
         assert!(canonical_source(file.to_str().unwrap()).is_err());
     }
-}
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
-        .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![
-            scan_source,
-            propose_structure,
-            approve_structure
-        ])
-        .run(tauri::generate_context!())
-        .expect("failed to run Temari desktop");
+    struct NameClassifier {
+        destination_id: Option<String>,
+    }
+
+    impl Classifier for NameClassifier {
+        fn classify_names(
+            &self,
+            files: &[FileCandidate],
+            _folders: &[ApprovedFolder],
+        ) -> Result<Vec<NameClassification>, temari_core::Error> {
+            Ok(files
+                .iter()
+                .map(|file| NameClassification {
+                    file_id: file.id.clone(),
+                    decision: self.destination_id.as_ref().map_or(
+                        NameDecision::NeedsContent,
+                        |destination_id| NameDecision::Destination {
+                            destination_id: destination_id.clone(),
+                        },
+                    ),
+                    reasoning: None,
+                })
+                .collect())
+        }
+
+        fn classify_contents(
+            &self,
+            _files: &[ContentCandidate],
+            _folders: &[ApprovedFolder],
+        ) -> Result<Vec<Classification>, temari_core::Error> {
+            panic!("content classification must not run in these tests")
+        }
+    }
+
+    struct NeverExtract;
+
+    impl ContentExtractor for NeverExtract {
+        fn extract(
+            &self,
+            _source: &Path,
+            _file: &FileCandidate,
+            _max_chars: usize,
+            _max_file_bytes: u64,
+        ) -> Option<ContentCandidate> {
+            panic!("content extraction must not run in these tests")
+        }
+    }
+
+    fn test_config(content: ContentPolicy) -> Config {
+        Config {
+            version: 4,
+            model: ModelConfig {
+                base_url: "http://127.0.0.1:4000/v1".into(),
+                name: "test-model".into(),
+                allowed_hosts: Vec::new(),
+                api_key_env: None,
+            },
+            privacy: PrivacyConfig {
+                content,
+                max_content_chars: 1_000,
+                max_content_file_bytes: 10_000,
+                extraction: ExtractionConfig {
+                    max_output_bytes: 2_000,
+                    max_archive_entries: 10,
+                    max_expanded_bytes: 20_000,
+                    max_xml_events: 1_000,
+                    max_xml_depth: 20,
+                    timeout_seconds: 2,
+                    ocr: None,
+                },
+            },
+        }
+    }
+
+    fn approved_folders(source: &Path) -> FolderSet {
+        Proposal {
+            version: 2,
+            source: source.display().to_string(),
+            scope: ScanScope::default(),
+            files_considered: 1,
+            folders: vec![FolderProposal {
+                path: "Documents".into(),
+                description: "General documents".into(),
+            }],
+        }
+        .approve()
+        .unwrap()
+    }
+
+    #[test]
+    fn plan_preview_builds_a_real_plan_and_excludes_approved_destinations() {
+        let source = tempdir().unwrap();
+        std::fs::write(source.path().join("loose.txt"), "loose").unwrap();
+        std::fs::create_dir(source.path().join("Documents")).unwrap();
+        std::fs::write(
+            source.path().join("Documents/already.txt"),
+            "already sorted",
+        )
+        .unwrap();
+        let folders = approved_folders(source.path());
+        let destination_id = folders
+            .folders
+            .iter()
+            .find(|folder| folder.path == "Documents")
+            .unwrap()
+            .id
+            .clone();
+
+        let preview = generate_plan_with(
+            &folders,
+            &test_config(ContentPolicy::MetadataOnly),
+            &NameClassifier {
+                destination_id: Some(destination_id),
+            },
+            &NeverExtract,
+        )
+        .unwrap();
+
+        assert_eq!(preview.plan.version, 4);
+        assert_eq!(preview.plan.entries.len(), 1);
+        assert_eq!(preview.plan.entries[0].source_path, "loose.txt");
+        assert_eq!(
+            preview.plan.entries[0].destination_path,
+            "Documents/loose.txt"
+        );
+        assert_eq!(preview.sha256, preview.plan.sha256().unwrap());
+        assert!(source.path().join("loose.txt").exists());
+    }
+
+    #[test]
+    fn ask_policy_falls_back_without_reading_content() {
+        let source = tempdir().unwrap();
+        std::fs::write(source.path().join("ambiguous.pdf"), "private text").unwrap();
+        let folders = approved_folders(source.path());
+
+        let preview = generate_plan_with(
+            &folders,
+            &test_config(ContentPolicy::Ask),
+            &NameClassifier {
+                destination_id: None,
+            },
+            &NeverExtract,
+        )
+        .unwrap();
+
+        assert_eq!(preview.plan.entries.len(), 1);
+        assert_eq!(
+            preview.plan.entries[0].classification_basis,
+            ClassificationBasis::ExtensionFallback
+        );
+        assert_eq!(
+            preview.plan.entries[0].destination_path,
+            "Others/PDFs/ambiguous.pdf"
+        );
+    }
 }
