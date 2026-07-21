@@ -324,12 +324,13 @@ fn generate_plan(
         eprintln!("Classifying {} file name(s)...", files.len());
     }
     let model = OpenAiCompatibleModel::new(&config.model)?;
+    let extractor = LocalContentExtractor::new(config.privacy.extraction.clone());
     let summary = classify_files(
         source,
         &files,
         &folder_set.folders,
         &model,
-        &LocalContentExtractor,
+        &extractor,
         ClassificationOptions {
             content_policy: config.privacy.content,
             max_content_chars: config.privacy.max_content_chars,

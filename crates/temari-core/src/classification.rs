@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs,
     path::Path,
     thread,
     time::Duration,
@@ -9,7 +8,7 @@ use std::{
 use crate::{
     ApprovedFolder, Classification, ClassificationBasis, Classifier, ContentCandidate,
     ContentPolicy, Error, FallbackCategory, FileCandidate, NameClassification, NameDecision,
-    artifact::normalize_relative_path, filesystem::verify_existing_directory_chain,
+    artifact::normalize_relative_path,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -38,50 +37,6 @@ pub trait ContentExtractor {
         max_chars: usize,
         max_file_bytes: u64,
     ) -> Option<ContentCandidate>;
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LocalContentExtractor;
-
-impl ContentExtractor for LocalContentExtractor {
-    fn extract(
-        &self,
-        source: &Path,
-        file: &FileCandidate,
-        max_chars: usize,
-        max_file_bytes: u64,
-    ) -> Option<ContentCandidate> {
-        if normalize_relative_path(&file.source_path).is_err() {
-            return None;
-        }
-        let parent = Path::new(&file.source_path).parent()?;
-        if !parent.as_os_str().is_empty()
-            && verify_existing_directory_chain(source, parent.to_str()?).is_err()
-        {
-            return None;
-        }
-        let path = source.join(&file.source_path);
-        let metadata = fs::symlink_metadata(&path).ok()?;
-        if !metadata.file_type().is_file() || metadata.len() > max_file_bytes {
-            return None;
-        }
-        let text = if file.extension.eq_ignore_ascii_case("pdf") {
-            pdf_extract::extract_text(&path).ok()?
-        } else if is_direct_text_extension(&file.extension) {
-            fs::read_to_string(&path).ok()?
-        } else {
-            return None;
-        };
-        let content: String = text.chars().take(max_chars).collect();
-        if content.trim().is_empty() {
-            return None;
-        }
-        Some(ContentCandidate {
-            file_id: file.id.clone(),
-            source_path: file.source_path.clone(),
-            content,
-        })
-    }
 }
 
 pub fn classify_files<C: Classifier, E: ContentExtractor>(
@@ -334,31 +289,6 @@ fn delay_between_batches(index: usize, total: usize, size: usize, delay: Duratio
     }
 }
 
-fn is_direct_text_extension(extension: &str) -> bool {
-    matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "txt"
-            | "md"
-            | "csv"
-            | "json"
-            | "xml"
-            | "yaml"
-            | "yml"
-            | "toml"
-            | "html"
-            | "css"
-            | "js"
-            | "ts"
-            | "py"
-            | "rs"
-            | "swift"
-            | "java"
-            | "go"
-            | "rb"
-            | "sh"
-    )
-}
-
 fn fallback_category(extension: &str) -> FallbackCategory {
     match extension.to_ascii_lowercase().as_str() {
         "pdf" => FallbackCategory::Pdf,
@@ -384,7 +314,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{FolderProposal, Proposal};
+    use crate::{ExtractionConfig, FolderProposal, LocalContentExtractor, Proposal};
 
     struct FakeClassifier {
         name_calls: RefCell<Vec<usize>>,
@@ -492,6 +422,18 @@ mod tests {
         }
     }
 
+    fn extractor() -> LocalContentExtractor {
+        LocalContentExtractor::new(ExtractionConfig {
+            max_output_bytes: 1024,
+            max_archive_entries: 100,
+            max_expanded_bytes: 1024 * 1024,
+            max_xml_events: 10_000,
+            max_xml_depth: 64,
+            timeout_seconds: 1,
+            ocr: None,
+        })
+    }
+
     #[test]
     fn extracts_only_ambiguous_supported_files_and_falls_back_unsupported_files() {
         let source = tempdir().unwrap();
@@ -526,7 +468,7 @@ mod tests {
             &files,
             &folders,
             &classifier,
-            &LocalContentExtractor,
+            &extractor(),
             options(ContentPolicy::OnDemand),
         )
         .unwrap();
@@ -572,7 +514,7 @@ mod tests {
             &files,
             &folders,
             &classifier,
-            &LocalContentExtractor,
+            &extractor(),
             options(ContentPolicy::MetadataOnly),
         )
         .unwrap();
@@ -612,7 +554,7 @@ mod tests {
             &files,
             &folders,
             &classifier,
-            &LocalContentExtractor,
+            &extractor(),
             options(ContentPolicy::MetadataOnly),
         )
         .unwrap();
@@ -644,7 +586,7 @@ mod tests {
             &LocalOnlyClassifier {
                 destination_id: fallback_id,
             },
-            &LocalContentExtractor,
+            &extractor(),
             options(ContentPolicy::MetadataOnly),
         )
         .unwrap_err();
@@ -671,7 +613,7 @@ mod tests {
             &files,
             &folders,
             &classifier,
-            &LocalContentExtractor,
+            &extractor(),
             options(ContentPolicy::OnDemand),
         )
         .unwrap_err();

@@ -2,6 +2,7 @@ mod apply;
 mod artifact;
 mod classification;
 mod config;
+mod extraction;
 mod filesystem;
 mod model;
 mod plan;
@@ -17,10 +18,10 @@ pub use artifact::{
     ApprovedFolder, FallbackCategory, FolderProposal, FolderSet, Proposal, ScanScope,
 };
 pub use classification::{
-    ClassificationOptions, ClassificationSummary, ContentExtractor, LocalContentExtractor,
-    classify_files,
+    ClassificationOptions, ClassificationSummary, ContentExtractor, classify_files,
 };
-pub use config::{Config, ContentPolicy, ModelConfig, PrivacyConfig};
+pub use config::{Config, ContentPolicy, ExtractionConfig, ModelConfig, OcrConfig, PrivacyConfig};
+pub use extraction::LocalContentExtractor;
 pub use filesystem::{FileFingerprint, FsIdentity};
 pub use model::{
     Classification, ClassificationBasis, Classifier, ContentCandidate, FolderProposer,

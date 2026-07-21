@@ -81,7 +81,9 @@ max_content_chars = 20000
 max_content_file_bytes = 10485760
 ```
 
-The name pass runs for every file. Only `needs_content` results use local UTF-8 or PDF text extraction. Unsupported, failed, empty, oversized, or metadata-only cases use an approved local extension fallback instead.
+The name pass runs for every file. Only `needs_content` results use local extraction. Temari reads bounded UTF-8, PDF, DOCX, PPTX, XLSX, ODT, ODP, and ODS text on both supported platforms. Optional OCR supports common raster images through one explicitly configured local executable. Unsupported, failed, empty, oversized, timed-out, or metadata-only cases use an approved local extension fallback instead.
+
+Document containers are parsed in memory without unpacking files. Archive expansion, entry count, XML events, XML depth, output bytes, output characters, and OCR runtime are bounded. OCR is disabled unless `[privacy.extraction.ocr]` is present; Temari invokes that executable directly with fixed arguments and never through a shell.
 
 ## CLI
 
@@ -115,7 +117,7 @@ The workflow follows five explicit trust boundaries:
 4. `apply`: after confirmation, local code creates only required approved directories and performs validated moves while atomically updating an audit journal.
 5. `undo`: local code conservatively reverses recorded moves and removes only unchanged, empty directories created by that apply session.
 
-All five primitive stages, explicit crash resume, and the interactive `organize` orchestrator are implemented. Background monitoring remains future work. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification and privacy, and [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope.
+All five primitive stages, explicit crash resume, and the interactive `organize` orchestrator are implemented. Background monitoring remains future work. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification and privacy, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, and [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits.
 
 Example schemas are available for a model-created [proposal](examples/proposal.example.json) and a locally approved [folder set](examples/folders.example.json). Their source paths are illustrative and must match the canonical source used by `plan`.
 

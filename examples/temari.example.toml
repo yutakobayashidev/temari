@@ -1,4 +1,4 @@
-version = 2
+version = 3
 
 [model]
 base_url = "http://127.0.0.1:11434/v1"
@@ -11,3 +11,17 @@ allowed_hosts = ["127.0.0.1", "localhost", "::1"]
 content = "metadata_only"
 max_content_chars = 20000
 max_content_file_bytes = 10485760
+
+[privacy.extraction]
+max_output_bytes = 1048576
+max_archive_entries = 1024
+max_expanded_bytes = 67108864
+max_xml_events = 1000000
+max_xml_depth = 256
+timeout_seconds = 15
+
+# OCR is disabled when this table is absent. Enable it only with a trusted local executable.
+# [privacy.extraction.ocr]
+# executable = "/absolute/path/to/ocr-executable"
+# languages = ["eng", "jpn"]
+# data_dir = "/absolute/path/to/language-data"

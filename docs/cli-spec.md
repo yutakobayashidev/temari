@@ -42,7 +42,8 @@ temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PA
 
 - Read-only.
 - Classifies file names in batches of 50 into model-visible IDs from the supplied `FolderSet`.
-- A name result may request content. With `privacy.content = "on_demand"`, the core extracts bounded UTF-8 or PDF text locally and classifies those files in batches of 20. With `metadata_only`, no content is read or sent.
+- A name result may request content. With `privacy.content = "on_demand"`, the core extracts bounded UTF-8, PDF, supported ZIP/XML document, or optional local OCR text and classifies those files in batches of 20. With `metadata_only`, no content is read or sent.
+- Document extraction supports DOCX, PPTX, XLSX, ODT, ODP, and ODS with archive, expansion, XML, byte, and character limits. Optional OCR supports common raster images through a fixed, direct, time-limited local executable invocation.
 - Uses deterministic approved fallback IDs when content is disabled, unsupported, oversized, empty, or cannot be extracted. Model and endpoint failures remain errors rather than silently falling back.
 - Rejects a `FolderSet` created for a different canonical source path.
 - Uses the scope stored in the `FolderSet`; callers cannot replace it at planning time. Approved destination subtrees are excluded from scanning.
@@ -106,8 +107,9 @@ temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PA
 
 ## Configuration
 
-- Configuration version 2 requires a `[privacy]` section. `content = "metadata_only"` disables content extraction; `content = "on_demand"` enables it only for ambiguous files.
-- `.temari.toml` contains model connectivity, endpoint allowlists, extraction limits, and privacy policy only.
+- Configuration version 3 requires `[privacy]` and `[privacy.extraction]` sections. `content = "metadata_only"` disables content extraction; `content = "on_demand"` enables it only for ambiguous files.
+- `.temari.toml` contains model connectivity, endpoint allowlists, bounded extraction limits, optional OCR executable settings, and privacy policy only.
+- OCR is disabled when `[privacy.extraction.ocr]` is absent. Its executable and optional data directory must be absolute paths; language identifiers are validated tokens.
 - Approved destinations live in a `FolderSet`, not in application configuration.
 - The current implementation reads `.temari.toml` or the path supplied with `--config`.
 - API keys are loaded only from the environment-variable name configured by `model.api_key_env`; secret values never appear in flags or artifacts.
@@ -140,3 +142,4 @@ $ temari approve downloads.proposal.json --accept-all --no-input --out downloads
 5. Add interactive `organize` orchestration and explicit crash resume. Completed.
 6. Reuse the same services from the GUI and add a state database only when monitoring requires it.
 7. Add automatic two-pass name/content classification and approved deterministic extension fallbacks. Completed.
+8. Add bounded cross-platform document extraction and optional local OCR. Completed.
