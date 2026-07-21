@@ -19,6 +19,10 @@ use temari_core::{
 };
 use tempfile::NamedTempFile;
 
+mod monitoring;
+
+use monitoring::{HistoryCommand, MonitorCommand, MonitoringContext, RuleCommand};
+
 const PROPOSAL_SAMPLE_LIMIT: usize = 100;
 
 #[derive(Debug, Parser)]
@@ -31,6 +35,10 @@ struct Cli {
     /// Path to the model configuration file.
     #[arg(long, default_value = ".temari.toml", global = true)]
     config: PathBuf,
+
+    /// Path to the local monitoring state database.
+    #[arg(long, global = true)]
+    state: Option<PathBuf>,
 
     /// Print the command result as JSON when the artifact is written to a file.
     #[arg(long, global = true)]
@@ -155,6 +163,18 @@ enum Command {
         #[arg(long = "include-subtree")]
         include_subtrees: Vec<String>,
     },
+
+    /// Configure or run foreground directory monitoring.
+    #[command(subcommand)]
+    Monitor(MonitorCommand),
+
+    /// Configure deterministic local routing rules.
+    #[command(subcommand)]
+    Rule(RuleCommand),
+
+    /// Inspect durable monitoring run history.
+    #[command(subcommand)]
+    History(HistoryCommand),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -207,6 +227,36 @@ fn run() -> Result<()> {
             max_folders,
             include_subtrees,
         } => organize(&cli, source, out, *max_folders, include_subtrees),
+        Command::Monitor(command) => monitoring::run_monitor(
+            MonitoringContext::from_cli(
+                &cli.config,
+                cli.state.as_deref(),
+                cli.json,
+                cli.no_input,
+                cli.verbose,
+            )?,
+            command,
+        ),
+        Command::Rule(command) => monitoring::run_rule(
+            MonitoringContext::from_cli(
+                &cli.config,
+                cli.state.as_deref(),
+                cli.json,
+                cli.no_input,
+                cli.verbose,
+            )?,
+            command,
+        ),
+        Command::History(command) => monitoring::run_history(
+            MonitoringContext::from_cli(
+                &cli.config,
+                cli.state.as_deref(),
+                cli.json,
+                cli.no_input,
+                cli.verbose,
+            )?,
+            command,
+        ),
     }
 }
 

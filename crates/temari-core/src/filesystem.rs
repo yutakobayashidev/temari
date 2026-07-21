@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Error, artifact::normalize_relative_path};
+use crate::{Error, FileCandidate, artifact::normalize_relative_path};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +38,10 @@ pub(crate) fn canonical_directory(path: &Path) -> Result<(PathBuf, FsIdentity), 
     Ok((canonical, identity(&metadata)))
 }
 
+pub fn canonical_source_identity(path: &Path) -> Result<(PathBuf, FsIdentity), Error> {
+    canonical_directory(path)
+}
+
 pub(crate) fn fingerprint(path: &Path) -> Result<FileFingerprint, Error> {
     let metadata =
         fs::symlink_metadata(path).map_err(|source| io_error("inspect", path, source))?;
@@ -64,6 +68,25 @@ pub(crate) fn fingerprint(path: &Path) -> Result<FileFingerprint, Error> {
         size: metadata.len(),
         sha256: format!("{:x}", hasher.finalize()),
     })
+}
+
+pub fn fingerprint_candidate(
+    source: &Path,
+    candidate: &FileCandidate,
+) -> Result<FileFingerprint, Error> {
+    normalize_relative_path(&candidate.source_path)?;
+    let (source, _) = canonical_directory(source)?;
+    if let Some(parent) = Path::new(&candidate.source_path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        verify_existing_directory_chain(
+            &source,
+            parent.to_str().ok_or_else(|| {
+                Error::InvalidArtifact("source parent path must be valid UTF-8".into())
+            })?,
+        )?;
+    }
+    fingerprint(&source.join(&candidate.source_path))
 }
 
 pub(crate) fn identity(metadata: &Metadata) -> FsIdentity {

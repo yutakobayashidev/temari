@@ -64,6 +64,32 @@ If an apply journal remains `running` after a crash, reconcile and continue it e
 $ cargo run -p temari-cli -- resume downloads.apply.json
 ```
 
+## Foreground monitoring
+
+Register an approved folder set, optionally add deterministic basename rules, then run a read-only check:
+
+```console
+$ temari monitor add ~/Downloads --folders /absolute/path/downloads.folders.json
+$ temari monitor list
+$ temari rule add --monitor <MONITOR_ID> --name-glob 'invoice-*.pdf' \
+    --destination d000001 --priority 100
+$ temari monitor run --out ~/.local/state/temari/runs --once
+$ temari history list
+$ temari monitor apply <RUN_ID> --yes
+```
+
+`monitor run --once` writes an immutable Plan but does not move files. After reviewing it, `monitor apply <RUN_ID>` uses the same recorded Plan, writes an ApplySession beside it, and updates processed state only after completion. Continuous foreground polling is deliberately more explicit:
+
+```console
+$ temari monitor run --out ~/.local/state/temari/runs --apply --yes
+```
+
+No daemon or login service is installed. Stop the foreground process with the normal process signal. Every mutation cycle writes its Plan before applying it and uses the normal ApplySession journal. Only a completed journal marks a fingerprint as processed; startup reconciliation can finish the SQLite index after a crash, while a running journal still requires explicit `temari resume`.
+
+Monitoring stores definitions, schedules, rules, processed signatures, and run indexes in SQLite. Authoritative workflow artifacts remain JSON files under `--out`. The default database uses the platform user-state directory; override it with global `--state PATH`. Both the database and run artifacts must remain outside monitored sources.
+
+Rules match file basenames case-insensitively in descending priority and stable ID order. They select reviewed opaque destination IDs locally before any model call. Rule changes alter the processing signature. In unattended monitoring, `privacy.content = "ask"` behaves as no consent and uses approved local fallbacks; choose `on_demand` explicitly to permit bounded extracted text.
+
 The approval command previews every destination and asks for confirmation when stdin and stderr are terminals. For a proposal that has already been reviewed by an agent or script, make acceptance explicit:
 
 ```console
@@ -89,7 +115,7 @@ Document containers are parsed in memory without unpacking files. Archive expans
 ## CLI
 
 ```text
-temari [--config PATH] [--json] [--no-input] [--no-color] [-v] <COMMAND>
+temari [--config PATH] [--state PATH] [--json] [--no-input] [--no-color] [-v] <COMMAND>
 
 Commands:
   propose <SOURCE> --out <PROPOSAL> [--include-subtree <PATH>]...
@@ -99,6 +125,9 @@ Commands:
   undo <APPLY_SESSION> --out <UNDO_SESSION> [--yes] Restore safely recorded moves
   resume <APPLY_SESSION> [--yes]                     Reconcile and continue a running apply
   organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...
+  monitor add|list|enable|disable|remove|run|apply ...
+  rule add|list|enable|disable|remove ...
+  history list|show ...
 ```
 
 - Artifact paths go to stdout. Read-only commands accept `--out -` to emit artifact JSON. Apply and undo require persistent journal paths outside the organized source.
@@ -118,7 +147,7 @@ The workflow follows five explicit trust boundaries:
 4. `apply`: after confirmation, local code creates only required approved directories and performs validated moves while atomically updating an audit journal.
 5. `undo`: local code conservatively reverses recorded moves and removes only unchanged, empty directories created by that apply session.
 
-All five primitive stages, explicit crash resume, and the interactive `organize` orchestrator are implemented. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits, and [ADR 0009](docs/adr/0009-request-per-run-content-consent.md) for consent.
+All five primitive stages, explicit crash resume, the interactive `organize` orchestrator, and foreground monitoring are implemented. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for artifact persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits, [ADR 0008](docs/adr/0008-use-sqlite-for-monitoring-state.md) for monitoring state, and [ADR 0009](docs/adr/0009-request-per-run-content-consent.md) for consent.
 
 Example schemas are available for a model-created [proposal](examples/proposal.example.json) and a locally approved [folder set](examples/folders.example.json). Their source paths are illustrative and must match the canonical source used by `plan`.
 

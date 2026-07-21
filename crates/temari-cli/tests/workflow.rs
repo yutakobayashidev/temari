@@ -2,7 +2,7 @@ use std::{fs, path::Path, process::Command};
 
 use temari_core::{
     ApplyState, Classification, ClassificationBasis, FileCandidate, FolderProposal, MoveOutcome,
-    Plan, Proposal, apply_plan, build_plan,
+    Plan, Proposal, RunState, apply_plan, build_plan,
 };
 use tempfile::tempdir;
 
@@ -146,4 +146,119 @@ fn organize_rejects_non_interactive_use_before_creating_run_directory() {
 
     assert!(!result.status.success());
     assert!(!run_directory.exists());
+}
+
+#[test]
+fn monitoring_cli_applies_a_local_rule_and_records_history() {
+    let source = tempdir().unwrap();
+    let artifacts = tempdir().unwrap();
+    let source_path = fs::canonicalize(source.path()).unwrap();
+    fs::write(source_path.join("invoice.pdf"), b"invoice").unwrap();
+    let folder_set = Proposal {
+        version: 2,
+        source: source_path.display().to_string(),
+        scope: temari_core::ScanScope::default(),
+        files_considered: 1,
+        folders: vec![FolderProposal {
+            path: "Documents".into(),
+            description: "Documents".into(),
+        }],
+    }
+    .approve()
+    .unwrap();
+    let folders_path = artifacts.path().join("folders.json");
+    let config_path = artifacts.path().join("temari.toml");
+    let state_path = artifacts.path().join("state.sqlite3");
+    let runs_path = artifacts.path().join("runs");
+    fs::write(
+        &folders_path,
+        serde_json::to_vec_pretty(&folder_set).unwrap(),
+    )
+    .unwrap();
+    let config = include_str!("../../../examples/temari.example.toml").replace(
+        "# api_key_env = \"TEMARI_MODEL_API_KEY\"",
+        "api_key_env = \"TEMARI_TEST_KEY_THAT_IS_NOT_SET\"",
+    );
+    fs::write(&config_path, config).unwrap();
+
+    let added = Command::new(env!("CARGO_BIN_EXE_temari"))
+        .args(["--state"])
+        .arg(&state_path)
+        .args(["monitor", "add"])
+        .arg(&source_path)
+        .args(["--folders"])
+        .arg(&folders_path)
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let monitor_id = String::from_utf8(added.stdout).unwrap().trim().to_owned();
+
+    let rule = Command::new(env!("CARGO_BIN_EXE_temari"))
+        .args(["--state"])
+        .arg(&state_path)
+        .args(["rule", "add", "--monitor", &monitor_id])
+        .args(["--name-glob", "*.pdf", "--destination", "d000001"])
+        .output()
+        .unwrap();
+    assert!(
+        rule.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rule.stderr)
+    );
+
+    let run = Command::new(env!("CARGO_BIN_EXE_temari"))
+        .args(["--config"])
+        .arg(&config_path)
+        .args(["--state"])
+        .arg(&state_path)
+        .args(["monitor", "run", "--monitor", &monitor_id, "--out"])
+        .arg(&runs_path)
+        .arg("--once")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(source_path.join("invoice.pdf").exists());
+
+    let planned_history = Command::new(env!("CARGO_BIN_EXE_temari"))
+        .args(["--json", "--state"])
+        .arg(&state_path)
+        .args(["history", "list", "--monitor", &monitor_id])
+        .output()
+        .unwrap();
+    let planned_runs: Vec<temari_core::MonitoringRun> =
+        serde_json::from_slice(&planned_history.stdout).unwrap();
+    assert_eq!(planned_runs[0].state, RunState::Planned);
+
+    let applied = Command::new(env!("CARGO_BIN_EXE_temari"))
+        .args(["--state"])
+        .arg(&state_path)
+        .args(["monitor", "apply", &planned_runs[0].id, "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert!(source_path.join("Documents/invoice.pdf").exists());
+
+    let history = Command::new(env!("CARGO_BIN_EXE_temari"))
+        .args(["--json", "--state"])
+        .arg(&state_path)
+        .args(["history", "list", "--monitor", &monitor_id])
+        .output()
+        .unwrap();
+    assert!(history.status.success());
+    let runs: Vec<temari_core::MonitoringRun> = serde_json::from_slice(&history.stdout).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].state, RunState::Completed);
+    assert_eq!(runs[0].rule_matches, 1);
 }

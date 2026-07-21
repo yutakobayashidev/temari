@@ -2,12 +2,12 @@
 
 ## Status
 
-- Accepted
+- Accepted; monitoring-state portion extended by ADR 0008
 
 ## Decision Drivers
 
 - Apply and undo need durable, inspectable state even after partial failure.
-- The current product runs one explicit local workflow at a time and does not monitor folders in the background.
+- The initial product ran one explicit local workflow at a time. Foreground monitoring is now defined separately by ADR 0008.
 - Linux and macOS must share the same source of truth.
 - Workflow artifacts must remain easy for a person or agent to review without database tooling.
 
@@ -16,7 +16,7 @@
 - `Proposal`, `FolderSet`, and `Plan` are already versioned JSON artifacts.
 - Apply introduces incremental state that must be checkpointed before and after filesystem mutations.
 - Future monitoring may require queryable state for rules, prompts, processed-file state, sessions, and metrics.
-- Temari does not yet need monitoring queries, rule statistics, or multi-session GUI state.
+- The manual workflow does not need monitoring queries, rule statistics, or multi-session GUI state.
 
 ## Options Considered
 

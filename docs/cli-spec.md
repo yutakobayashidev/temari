@@ -14,6 +14,12 @@ temari [global options] apply <PLAN> --out <APPLY_SESSION> [--yes]
 temari [global options] undo <APPLY_SESSION> --out <UNDO_SESSION> [--yes]
 temari [global options] resume <APPLY_SESSION> [--yes]
 temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...
+temari [global options] monitor add <SOURCE> --folders <FOLDER_SET> [--interval <SECONDS>]
+temari [global options] monitor list|enable|disable|remove ...
+temari [global options] monitor run --out <RUN_ROOT> [--monitor <ID>] [--once] [--apply --yes]
+temari [global options] monitor apply <RUN_ID> [--yes]
+temari [global options] rule add|list|enable|disable|remove ...
+temari [global options] history list|show ...
 ```
 
 `organize` is an interactive convenience command. The five primitive commands remain the stable interface for agents and scripts.
@@ -90,10 +96,34 @@ temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PA
 - Keeps name, content, and fallback processing inside Stage 3 and reports their counts without adding another command boundary.
 - Under `ask`, discloses the model origin, exact sanitized ambiguous paths, extraction limits, and local OCR status, then asks once. It never displays credentials, endpoint paths or queries, executable paths, or extracted text.
 
+### `monitor`
+
+- `add` binds one canonical, non-overlapping source to one immutable approved FolderSet digest and an interval of at least ten seconds. Definitions are enabled unless `--disabled` is supplied.
+- `run --once` performs one due-time pass and creates read-only Plans. Selecting `--monitor <ID>` checks that monitor immediately, even when disabled.
+- `apply <RUN_ID>` applies one previously reviewed `planned` run, writes its ApplySession beside the Plan, and completes the processed index only after the journal is complete. It requires confirmation or `--yes`.
+- Running without `--once` polls in the foreground. It requires standing mutation authorization through both `--apply` and `--yes`; neither flag is accepted alone. Temari does not install or launch a service.
+- The run root, state database, and FolderSet artifact must remain outside the monitored source. Each non-empty run gets a private `<MONITOR_ID>/<RUN_ID>/` directory containing its authoritative Plan and, when applied, ApplySession.
+- Enabled local rules run before name classification. Remaining files use the same name/content/fallback services as `plan`. Since monitoring is non-interactive, `ask` never grants content consent and uses local fallbacks.
+- Unchanged files are skipped only after a completed ApplySession has durably populated the processed index. The processing signature includes the file fingerprint, FolderSet digest, and enabled-rule digest.
+- Startup reconciles interrupted database rows from Plan and ApplySession JSON. Completed journals may finalize the index; running journals become `needs_resume`; missing, invalid, failed, or partial journals never mark files processed.
+
+### `rule`
+
+- Rules are case-insensitive basename globs. Path separators are literal, so rules cannot match or construct arbitrary source paths.
+- Higher priority wins; equal priority uses stable rule-ID order.
+- A rule selects only an opaque destination ID present in the monitor's reviewed FolderSet. Enabling a rule revalidates the complete active rule set.
+- Removal is a soft delete and requires a terminal confirmation or `--yes`.
+
+### `history`
+
+- `list [--monitor <ID>] [--limit <N>]` reads the cross-run SQLite index.
+- `show <RUN_ID>` displays run status, artifact paths, aggregate routing counts, and staged file metadata. It never contains extracted text, raw model responses, or credentials.
+
 ## Global options and output
 
 ```text
 --config <PATH>   Override model and privacy configuration
+--state <PATH>    Override the local monitoring SQLite database
 --json            Emit a machine-readable command result
 --no-input        Never prompt; fail when explicit input is missing
 --no-color        Disable color
@@ -128,6 +158,11 @@ $ temari undo downloads.apply.json --out downloads.undo.json
 $ temari resume interrupted.apply.json
 $ temari organize ~/Downloads --out downloads-run
 $ temari organize ~/Downloads --include-subtree Receipts --include-subtree Work --out downloads-run
+$ temari monitor add ~/Downloads --folders /absolute/path/downloads.folders.json
+$ temari monitor run --out ~/.local/state/temari/runs --once
+$ temari monitor apply <RUN_ID> --yes
+$ temari monitor run --out ~/.local/state/temari/runs --apply --yes
+$ temari history list
 ```
 
 For an agent-driven approval after the proposal has already been reviewed:
@@ -143,7 +178,8 @@ $ temari approve downloads.proposal.json --accept-all --no-input --out downloads
 3. Migrate `plan` to consume a `FolderSet` and emit a durable plan.
 4. Implement apply with audit sessions, then undo. Completed.
 5. Add interactive `organize` orchestration and explicit crash resume. Completed.
-6. Reuse the same services from the GUI and add a state database only when monitoring requires it.
+6. Reuse the same services for portable polling, rules, processed-file tracking, and run history. Completed.
 7. Add automatic two-pass name/content classification and approved deterministic extension fallbacks. Completed.
 8. Add bounded cross-platform document extraction and optional local OCR. Completed.
 9. Add ambiguity-aware per-run content consent without making primitive commands interactive. Completed.
+10. Add a GUI adapter over the same application services. Not started.

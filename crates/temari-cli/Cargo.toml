@@ -13,6 +13,7 @@ path = "src/main.rs"
 temari-core = { path = "../temari-core" }
 anyhow.workspace = true
 clap.workspace = true
+directories.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 shlex.workspace = true

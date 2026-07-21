@@ -6,6 +6,7 @@ mod extraction;
 mod filesystem;
 mod lock;
 mod model;
+mod monitor;
 mod plan;
 mod rules;
 mod scan;
@@ -26,16 +27,25 @@ pub use classification::{
 };
 pub use config::{Config, ContentPolicy, ExtractionConfig, ModelConfig, OcrConfig, PrivacyConfig};
 pub use extraction::LocalContentExtractor;
-pub use filesystem::{FileFingerprint, FsIdentity};
+pub use filesystem::{
+    FileFingerprint, FsIdentity, canonical_source_identity, fingerprint_candidate,
+};
 pub use lock::SourceLock;
 pub use model::{
     Classification, ClassificationBasis, Classifier, ContentCandidate, FolderProposer,
     NameClassification, NameDecision, OpenAiCompatibleModel,
 };
+pub use monitor::{
+    MonitoringOptions, MonitoringPlan, MonitoringStats, apply_monitoring_plan,
+    persist_monitoring_plan, plan_monitor_cycle, processing_signature,
+};
 pub use plan::{Plan, PlanEntry, build_plan};
 pub use rules::{LocalRule, RuleMatch, RuleSet};
 pub use scan::{FileCandidate, scan_directory, select_representative_files};
-pub use state::{MonitorRecord, MonitoringRun, ProcessedFileRecord, RunState, StateStore};
+pub use state::{
+    MonitorRecord, MonitoringRun, ProcessedFileRecord, ReconcileSummary, RunState,
+    StagedFileRecord, StateStore,
+};
 
 use thiserror::Error;
 
