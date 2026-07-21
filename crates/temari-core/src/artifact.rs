@@ -34,6 +34,64 @@ pub struct ApprovedFolder {
     pub id: String,
     pub path: String,
     pub description: String,
+    pub model_visible: bool,
+    pub fallback: Option<FallbackCategory>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackCategory {
+    Pdf,
+    Spreadsheets,
+    Images,
+    Videos,
+    Audio,
+    Archives,
+    Code,
+    Presentations,
+    Miscellaneous,
+}
+
+impl FallbackCategory {
+    pub const ALL: [Self; 9] = [
+        Self::Pdf,
+        Self::Spreadsheets,
+        Self::Images,
+        Self::Videos,
+        Self::Audio,
+        Self::Archives,
+        Self::Code,
+        Self::Presentations,
+        Self::Miscellaneous,
+    ];
+
+    pub fn path(self) -> &'static str {
+        match self {
+            Self::Pdf => "Others/PDFs",
+            Self::Spreadsheets => "Others/Spreadsheets",
+            Self::Images => "Others/Images",
+            Self::Videos => "Others/Videos",
+            Self::Audio => "Others/Audio",
+            Self::Archives => "Others/Archives",
+            Self::Code => "Others/Code",
+            Self::Presentations => "Others/Presentations",
+            Self::Miscellaneous => "Others/Miscellaneous",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Pdf => "PDF files that could not be classified by meaning",
+            Self::Spreadsheets => "Spreadsheets that could not be classified by meaning",
+            Self::Images => "Images that could not be classified by meaning",
+            Self::Videos => "Videos that could not be classified by meaning",
+            Self::Audio => "Audio files that could not be classified by meaning",
+            Self::Archives => "Archives that could not be classified by meaning",
+            Self::Code => "Source files that could not be classified by meaning",
+            Self::Presentations => "Presentations that could not be classified by meaning",
+            Self::Miscellaneous => "Files that could not be classified by meaning or type",
+        }
+    }
 }
 
 impl Proposal {
@@ -82,10 +140,28 @@ impl Proposal {
                 id: format!("d{:06}", index + 1),
                 path,
                 description: proposal.description.trim().to_owned(),
+                model_visible: true,
+                fallback: None,
+            });
+        }
+        for category in FallbackCategory::ALL {
+            if let Some(folder) = folders
+                .iter_mut()
+                .find(|folder| folder.path.eq_ignore_ascii_case(category.path()))
+            {
+                folder.fallback = Some(category);
+                continue;
+            }
+            folders.push(ApprovedFolder {
+                id: format!("d{:06}", folders.len() + 1),
+                path: category.path().into(),
+                description: category.description().into(),
+                model_visible: false,
+                fallback: Some(category),
             });
         }
         let folder_set = FolderSet {
-            version: 1,
+            version: 2,
             source: self.source,
             folders,
         };
@@ -102,9 +178,9 @@ impl FolderSet {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        if self.version != 1 {
+        if self.version != 2 {
             return Err(Error::InvalidArtifact(format!(
-                "unsupported folder-set version {}; expected 1",
+                "unsupported folder-set version {}; expected 2",
                 self.version
             )));
         }
@@ -121,6 +197,8 @@ impl FolderSet {
 
         let mut ids = HashSet::new();
         let mut paths = HashSet::new();
+        let mut fallbacks = HashSet::new();
+        let mut model_visible = 0;
         for folder in &self.folders {
             if folder.id.trim().is_empty() || !ids.insert(folder.id.as_str()) {
                 return Err(Error::InvalidArtifact(format!(
@@ -147,6 +225,26 @@ impl FolderSet {
                 return Err(Error::InvalidArtifact(format!(
                     "folder {:?} must have a non-empty single-line description",
                     folder.id
+                )));
+            }
+            if let Some(category) = folder.fallback
+                && !fallbacks.insert(category)
+            {
+                return Err(Error::InvalidArtifact(format!(
+                    "fallback category must be unique: {category:?}"
+                )));
+            }
+            model_visible += usize::from(folder.model_visible);
+        }
+        if model_visible == 0 {
+            return Err(Error::InvalidArtifact(
+                "folder set must contain at least one model-visible destination".into(),
+            ));
+        }
+        for category in FallbackCategory::ALL {
+            if !fallbacks.contains(&category) {
+                return Err(Error::InvalidArtifact(format!(
+                    "folder set is missing fallback category {category:?}"
                 )));
             }
         }
@@ -217,6 +315,8 @@ mod tests {
 
         assert_eq!(folder_set.folders[0].id, "d000001");
         assert_eq!(folder_set.folders[0].path, "Work/Reports");
+        assert_eq!(folder_set.version, 2);
+        assert_eq!(folder_set.folders.len(), 11);
     }
 
     #[test]
@@ -250,5 +350,23 @@ mod tests {
         proposal.folders[0].description = "Documents\nwith injected output".into();
 
         assert!(proposal.approve().is_err());
+    }
+
+    #[test]
+    fn approval_reuses_a_proposed_fallback_path() {
+        let folder_set = proposal(&["Others/PDFs"]).approve().unwrap();
+
+        assert_eq!(folder_set.folders.len(), FallbackCategory::ALL.len());
+        assert_eq!(folder_set.folders[0].fallback, Some(FallbackCategory::Pdf));
+    }
+
+    #[test]
+    fn folder_set_requires_every_fallback_category() {
+        let mut folder_set = proposal(&["Documents"]).approve().unwrap();
+        folder_set
+            .folders
+            .retain(|folder| folder.fallback != Some(FallbackCategory::Images));
+
+        assert!(folder_set.validate().is_err());
     }
 }

@@ -2,14 +2,15 @@
 
 `Temari` is a private, personal-use tool that plans and applies file organization with a local model or a model hosted on an explicitly trusted internal network.
 
-Proposal, approval, and planning are read-only. Filesystem changes require a separate confirmed `apply` command and produce a durable JSON journal that can be inspected or passed to `undo`. The application does not send file contents, watch directories, use a state database, or send telemetry.
+Proposal, approval, and planning are read-only. Filesystem changes require a separate confirmed `apply` command and produce a durable JSON journal that can be inspected or passed to `undo`. Content extraction is disabled by default; the explicit `on_demand` privacy policy sends bounded text only for ambiguous files. The application does not watch directories, use a state database, or send telemetry.
 
 ## Trust boundaries
 
-- During classification, the model selects only user-approved opaque destination IDs. Model-proposed folder names remain untrusted data until local approval validates them and assigns those IDs.
+- During classification, the model selects only user-approved, model-visible opaque destination IDs. Model-proposed folder names remain untrusted data until local approval validates them and assigns those IDs.
+- Approval adds deterministic `Others/*` fallbacks as opaque destinations. Automatically added fallbacks are local-only; an identically named user destination is reused.
 - The entire response is rejected if it contains an unknown file ID, unknown destination ID, duplicate result, or missing result.
 - Symlinks, directories, and paths outside the source root are excluded from classification.
-- Plans contain local SHA-256, size, device, and inode fingerprints. These values and file contents are never sent to the model.
+- Plans contain local SHA-256, size, device, and inode fingerprints. These values and raw files are never sent to the model. Extracted text is neither logged nor persisted.
 - Apply revalidates the source root, fingerprints, real directory components, and unoccupied destinations before mutation. It never overwrites.
 - Undo restores only recorded moves whose identity and content still match, and removes only session-created directories that remain empty.
 - Every model endpoint hostname must appear in an explicit allowlist.
@@ -59,6 +60,17 @@ $ cargo run -p temari-cli -- approve downloads.proposal.json \
 
 To use an internal model, change `model.base_url` and add its hostname to `model.allowed_hosts`. The allowlist is enforced immediately before the request; it is not documentation-only configuration.
 
+To enable the automatic second pass, set the explicit privacy policy:
+
+```toml
+[privacy]
+content = "on_demand"
+max_content_chars = 20000
+max_content_file_bytes = 10485760
+```
+
+The name pass runs for every file. Only `needs_content` results use local UTF-8 or PDF text extraction. Unsupported, failed, empty, oversized, or metadata-only cases use an approved local extension fallback instead.
+
 ## CLI
 
 ```text
@@ -86,12 +98,12 @@ Commands:
 The workflow follows five explicit trust boundaries:
 
 1. `propose`: the model suggests a folder hierarchy from file-name metadata.
-2. `approve`: the user edits and approves the proposal; local code assigns opaque destination IDs and validates every relative path.
-3. `plan`: the model classifies files only into those approved IDs and writes a validated, read-only plan.
+2. `approve`: the user edits and approves the proposal; local code assigns opaque destination IDs, validates every relative path, and adds visible local-only extension fallbacks.
+3. `plan`: the model classifies names into model-visible IDs, ambiguous files optionally use bounded extracted text, and unresolved files use approved local fallback IDs. The command writes a validated, read-only plan with a classification basis per move.
 4. `apply`: after confirmation, local code creates only required approved directories and performs validated moves while atomically updating an audit journal.
 5. `undo`: local code conservatively reverses recorded moves and removes only unchanged, empty directories created by that apply session.
 
-All five primitive stages, explicit crash resume, and the interactive `organize` orchestrator are implemented. Background monitoring remains future work. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy and [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for the persistence decision.
+All five primitive stages, explicit crash resume, and the interactive `organize` orchestrator are implemented. Background monitoring remains future work. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for persistence, and [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification and privacy.
 
 Example schemas are available for a model-created [proposal](examples/proposal.example.json) and a locally approved [folder set](examples/folders.example.json). Their source paths are illustrative and must match the canonical source used by `plan`.
 

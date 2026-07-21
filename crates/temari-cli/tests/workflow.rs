@@ -1,13 +1,25 @@
 use std::{fs, path::Path, process::Command};
 
 use temari_core::{
-    ApplyState, ApprovedFolder, Classification, FileCandidate, MoveOutcome, Plan, apply_plan,
-    build_plan,
+    ApplyState, Classification, ClassificationBasis, FileCandidate, FolderProposal, MoveOutcome,
+    Plan, Proposal, apply_plan, build_plan,
 };
 use tempfile::tempdir;
 
 fn write_plan(source: &Path, path: &Path) -> Plan {
     fs::write(source.join("report.txt"), b"report").unwrap();
+    let folders = Proposal {
+        version: 1,
+        source: source.display().to_string(),
+        files_considered: 1,
+        folders: vec![FolderProposal {
+            path: "Documents".into(),
+            description: "Documents".into(),
+        }],
+    }
+    .approve()
+    .unwrap()
+    .folders;
     let plan = build_plan(
         source,
         &[FileCandidate {
@@ -15,15 +27,12 @@ fn write_plan(source: &Path, path: &Path) -> Plan {
             name: "report.txt".into(),
             extension: "txt".into(),
         }],
-        &[ApprovedFolder {
-            id: "d000001".into(),
-            path: "Documents".into(),
-            description: "Documents".into(),
-        }],
+        &folders,
         vec![Classification {
             file_id: "f000001".into(),
             destination_id: "d000001".into(),
             reasoning: None,
+            basis: ClassificationBasis::Name,
         }],
     )
     .unwrap();

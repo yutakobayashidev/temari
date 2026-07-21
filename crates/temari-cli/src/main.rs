@@ -10,10 +10,10 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, Subcommand};
 use serde::Serialize;
 use temari_core::{
-    ApplySession, ApplyState, Classifier, Config, FolderProposer, FolderSet, OpenAiCompatibleModel,
-    Plan, Proposal, UndoState, apply_plan, build_plan, preflight_apply, preflight_resume,
-    preflight_undo, resume_apply_session, scan_directory, select_representative_files,
-    undo_session,
+    ApplySession, ApplyState, ClassificationBasis, ClassificationOptions, Config, FolderProposer,
+    FolderSet, LocalContentExtractor, OpenAiCompatibleModel, Plan, Proposal, UndoState, apply_plan,
+    build_plan, classify_files, preflight_apply, preflight_resume, preflight_undo,
+    resume_apply_session, scan_directory, select_representative_files, undo_session,
 };
 use tempfile::NamedTempFile;
 
@@ -249,14 +249,7 @@ fn approve(cli: &Cli, proposal_path: &Path, out: &Path, accept_all: bool) -> Res
     match mode {
         ApprovalMode::Accept => {}
         ApprovalMode::Prompt => {
-            eprintln!("Approve these folders for {}?", folder_set.source);
-            for folder in &folder_set.folders {
-                eprintln!(
-                    "  {}/ — {}",
-                    terminal_text(&folder.path),
-                    terminal_text(&folder.description)
-                );
-            }
+            render_folder_set(&folder_set);
             eprint!("Approve all folders? [y/N] ");
             io::stderr().flush()?;
             let mut answer = String::new();
@@ -289,29 +282,50 @@ fn plan(cli: &Cli, source: &Path, folders_path: &Path, out: &Path) -> Result<()>
         );
     }
 
-    let plan = generate_plan(cli, &source, &folder_set)?;
+    let plan = generate_plan(cli, &source, &folder_set, cli.verbose > 0)?;
     write_artifact(out, &plan)?;
     print_output_result(cli, out)
 }
 
-fn generate_plan(cli: &Cli, source: &Path, folder_set: &FolderSet) -> Result<Plan> {
+fn generate_plan(
+    cli: &Cli,
+    source: &Path,
+    folder_set: &FolderSet,
+    show_progress: bool,
+) -> Result<Plan> {
     let config = load_config(cli)?;
     let files =
         scan_directory(source).with_context(|| format!("failed to scan {}", source.display()))?;
-    if cli.verbose > 0 {
+    if show_progress {
         eprintln!("Classifying {} file name(s)...", files.len());
     }
-    let classifications = if files.is_empty() {
-        Vec::new()
-    } else {
-        let model = OpenAiCompatibleModel::new(&config.model)?;
-        model.classify_names(&files, &folder_set.folders)?
-    };
+    let model = OpenAiCompatibleModel::new(&config.model)?;
+    let summary = classify_files(
+        source,
+        &files,
+        &folder_set.folders,
+        &model,
+        &LocalContentExtractor,
+        ClassificationOptions {
+            content_policy: config.privacy.content,
+            max_content_chars: config.privacy.max_content_chars,
+            max_content_file_bytes: config.privacy.max_content_file_bytes,
+            name_batch_size: 50,
+            content_batch_size: 20,
+            batch_delay: std::time::Duration::from_millis(500),
+        },
+    )?;
+    if show_progress {
+        eprintln!(
+            "Classification: {} by name, {} by content, {} by extension fallback",
+            summary.by_name, summary.by_content, summary.by_fallback
+        );
+    }
     Ok(build_plan(
         source,
         &files,
         &folder_set.folders,
-        classifications,
+        summary.classifications,
     )?)
 }
 
@@ -487,7 +501,7 @@ fn organize(cli: &Cli, source: &Path, run_directory: &Path, max_folders: usize) 
     write_artifact(&folders_path, &folder_set)?;
 
     eprintln!("Stage 3/4: creating an exact read-only plan...");
-    let plan = generate_plan(cli, &source, &folder_set).with_context(|| {
+    let plan = generate_plan(cli, &source, &folder_set, true).with_context(|| {
         format!(
             "planning failed; artifacts remain in {}",
             run_directory.display()
@@ -560,7 +574,10 @@ fn review_proposal(raw: &Proposal, review_path: &Path, run_directory: &Path) -> 
                 continue;
             }
         };
-        render_proposal(&review);
+        match review.clone().approve() {
+            Ok(folder_set) => render_folder_set(&folder_set),
+            Err(_) => render_proposal(&review),
+        }
         eprint!("[a]pprove destinations, [e]dit in $VISUAL/$EDITOR, [q]uit: ");
         io::stderr().flush()?;
         let mut choice = String::new();
@@ -608,17 +625,58 @@ fn render_proposal(proposal: &Proposal) {
     eprintln!("No directories or files have been changed.");
 }
 
+fn render_folder_set(folder_set: &FolderSet) {
+    eprintln!(
+        "Destinations for {} (automatic fallbacks are marked):",
+        terminal_text(&folder_set.source)
+    );
+    for folder in &folder_set.folders {
+        let marker = match (folder.fallback, folder.model_visible) {
+            (Some(_), true) => " [destination + fallback]",
+            (Some(_), false) => " [local fallback]",
+            (None, _) => "",
+        };
+        eprintln!(
+            "  {}/{} — {}",
+            terminal_text(&folder.path),
+            marker,
+            terminal_text(&folder.description)
+        );
+    }
+    eprintln!("No directories or files have been changed.");
+}
+
 fn render_plan(plan: &Plan, apply_path: &Path) -> Result<()> {
     eprintln!("Plan for {}:", plan.source);
     eprintln!("  SHA-256: {}", plan.sha256()?);
     for directory in &plan.directories {
-        eprintln!("  mkdir {directory}/");
+        eprintln!("  mkdir {}/", terminal_text(directory));
     }
     for entry in &plan.entries {
-        eprintln!("  move {} -> {}", entry.file_name, entry.destination_path);
+        let basis = match entry.classification_basis {
+            ClassificationBasis::Name => "name",
+            ClassificationBasis::Content => "content",
+            ClassificationBasis::ExtensionFallback => "fallback",
+        };
+        eprintln!(
+            "  [{basis}] move {} -> {}",
+            terminal_text(&entry.file_name),
+            terminal_text(&entry.destination_path)
+        );
     }
+    let by_name = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.classification_basis == ClassificationBasis::Name)
+        .count();
+    let by_content = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.classification_basis == ClassificationBasis::Content)
+        .count();
+    let by_fallback = plan.entries.len() - by_name - by_content;
     eprintln!(
-        "Summary: {} move(s), up to {} new directorie(s), no overwrites",
+        "Summary: {} move(s) ({by_name} name, {by_content} content, {by_fallback} fallback), up to {} new directorie(s), no overwrites",
         plan.entries.len(),
         plan.directories.len()
     );

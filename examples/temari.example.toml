@@ -1,7 +1,13 @@
-version = 1
+version = 2
 
 [model]
 base_url = "http://127.0.0.1:11434/v1"
 name = "qwen2.5:7b"
 allowed_hosts = ["127.0.0.1", "localhost", "::1"]
 # api_key_env = "TEMARI_MODEL_API_KEY"
+
+[privacy]
+# Use "on_demand" to extract and send bounded text only when name classification is ambiguous.
+content = "metadata_only"
+max_content_chars = 20000
+max_content_file_bytes = 10485760

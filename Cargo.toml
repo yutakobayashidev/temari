@@ -12,6 +12,7 @@ license = "LicenseRef-Proprietary"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+pdf-extract = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

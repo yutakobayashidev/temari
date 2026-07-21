@@ -10,6 +10,7 @@ use crate::Error;
 pub struct Config {
     pub version: u32,
     pub model: ModelConfig,
+    pub privacy: PrivacyConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -20,6 +21,21 @@ pub struct ModelConfig {
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
     pub api_key_env: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivacyConfig {
+    pub content: ContentPolicy,
+    pub max_content_chars: usize,
+    pub max_content_file_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentPolicy {
+    MetadataOnly,
+    OnDemand,
 }
 
 impl Config {
@@ -34,9 +50,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        if self.version != 1 {
+        if self.version != 2 {
             return Err(Error::InvalidConfig(format!(
-                "unsupported config version {}; expected 1",
+                "unsupported config version {}; expected 2",
                 self.version
             )));
         }
@@ -45,6 +61,16 @@ impl Config {
         }
 
         self.model.validate_endpoint()?;
+        if self.privacy.max_content_chars == 0 {
+            return Err(Error::InvalidConfig(
+                "privacy.max_content_chars must be greater than zero".into(),
+            ));
+        }
+        if self.privacy.max_content_file_bytes == 0 {
+            return Err(Error::InvalidConfig(
+                "privacy.max_content_file_bytes must be greater than zero".into(),
+            ));
+        }
 
         Ok(())
     }
@@ -87,12 +113,17 @@ mod tests {
 
     fn config() -> Config {
         Config {
-            version: 1,
+            version: 2,
             model: ModelConfig {
                 base_url: "http://127.0.0.1:11434/v1".into(),
                 name: "local".into(),
                 allowed_hosts: vec!["127.0.0.1".into()],
                 api_key_env: None,
+            },
+            privacy: PrivacyConfig {
+                content: ContentPolicy::MetadataOnly,
+                max_content_chars: 20_000,
+                max_content_file_bytes: 10 * 1024 * 1024,
             },
         }
     }

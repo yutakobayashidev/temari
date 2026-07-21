@@ -1039,12 +1039,26 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::{ApprovedFolder, Classification, FileCandidate, build_plan};
+    use crate::{
+        Classification, ClassificationBasis, FileCandidate, FolderProposal, Proposal, build_plan,
+    };
 
     use super::*;
 
     fn plan(root: &Path) -> Plan {
         fs::write(root.join("report.txt"), b"report").unwrap();
+        let folders = Proposal {
+            version: 1,
+            source: root.display().to_string(),
+            files_considered: 1,
+            folders: vec![FolderProposal {
+                path: "Documents/Reports".into(),
+                description: "Reports".into(),
+            }],
+        }
+        .approve()
+        .unwrap()
+        .folders;
         build_plan(
             root,
             &[FileCandidate {
@@ -1052,15 +1066,12 @@ mod tests {
                 name: "report.txt".into(),
                 extension: "txt".into(),
             }],
-            &[ApprovedFolder {
-                id: "d000001".into(),
-                path: "Documents/Reports".into(),
-                description: "Reports".into(),
-            }],
+            &folders,
             vec![Classification {
                 file_id: "f000001".into(),
                 destination_id: "d000001".into(),
                 reasoning: None,
+                basis: ClassificationBasis::Name,
             }],
         )
         .unwrap()

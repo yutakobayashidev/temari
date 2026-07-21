@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ApprovedFolder, Classification, Error, FileCandidate, FileFingerprint, FsIdentity,
+    ApprovedFolder, Classification, ClassificationBasis, Error, FileCandidate, FileFingerprint,
+    FsIdentity,
     artifact::normalize_relative_path,
     filesystem::{
         canonical_directory, checked_join, fingerprint, path_exists, verify_directory_chain,
@@ -44,6 +45,7 @@ pub struct PlanEntry {
     pub requested_destination: String,
     pub destination_path: String,
     pub reasoning: Option<String>,
+    pub classification_basis: ClassificationBasis,
 }
 
 impl Plan {
@@ -58,9 +60,9 @@ impl Plan {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        if self.version != 1 {
+        if self.version != 2 {
             return Err(Error::InvalidArtifact(format!(
-                "unsupported plan version {}; expected 1",
+                "unsupported plan version {}; expected 2",
                 self.version
             )));
         }
@@ -94,7 +96,7 @@ impl Plan {
         let mut file_names = HashSet::new();
         let mut destinations = HashSet::new();
         let folder_set = crate::FolderSet {
-            version: 1,
+            version: 2,
             source: self.source.clone(),
             folders: self.folders.clone(),
         };
@@ -136,6 +138,23 @@ impl Plan {
                     "plan entry {:?} escapes its approved destination",
                     entry.file_id
                 )));
+            }
+            match entry.classification_basis {
+                ClassificationBasis::Name | ClassificationBasis::Content
+                    if !folder.model_visible =>
+                {
+                    return Err(Error::InvalidArtifact(format!(
+                        "plan entry {:?} uses a local-only destination for model classification",
+                        entry.file_id
+                    )));
+                }
+                ClassificationBasis::ExtensionFallback if folder.fallback.is_none() => {
+                    return Err(Error::InvalidArtifact(format!(
+                        "plan entry {:?} uses a non-fallback destination as a fallback",
+                        entry.file_id
+                    )));
+                }
+                _ => {}
             }
             if !destinations.insert(entry.destination_path.as_str()) {
                 return Err(Error::InvalidArtifact(format!(
@@ -243,6 +262,7 @@ pub fn build_plan(
             requested_destination,
             destination_path,
             reasoning: classification.reasoning,
+            classification_basis: classification.basis,
         });
     }
 
@@ -257,7 +277,7 @@ pub fn build_plan(
         ));
     }
     let plan = Plan {
-        version: 1,
+        version: 2,
         source: source_text.to_owned(),
         source_identity,
         collision_policy: CollisionPolicy::Rename,
@@ -407,12 +427,19 @@ mod tests {
         }
     }
 
-    fn folder() -> ApprovedFolder {
-        ApprovedFolder {
-            id: "docs".into(),
-            path: "Documents/Reports".into(),
-            description: "Documents".into(),
+    fn folders() -> Vec<ApprovedFolder> {
+        crate::Proposal {
+            version: 1,
+            source: "/tmp/inbox".into(),
+            files_considered: 1,
+            folders: vec![crate::FolderProposal {
+                path: "Documents/Reports".into(),
+                description: "Documents".into(),
+            }],
         }
+        .approve()
+        .unwrap()
+        .folders
     }
 
     fn classification(file_id: &str, destination_id: &str) -> Classification {
@@ -420,6 +447,7 @@ mod tests {
             file_id: file_id.into(),
             destination_id: destination_id.into(),
             reasoning: None,
+            basis: ClassificationBasis::Name,
         }
     }
 
@@ -428,11 +456,12 @@ mod tests {
         let root = tempdir().unwrap();
         fs::write(root.path().join("report.txt"), b"report").unwrap();
 
+        let folders = folders();
         let plan = build_plan(
             root.path(),
             &[file("f1", "report.txt")],
-            &[folder()],
-            vec![classification("f1", "docs")],
+            &folders,
+            vec![classification("f1", "d000001")],
         )
         .unwrap();
 
@@ -452,9 +481,13 @@ mod tests {
         fs::create_dir_all(root.path().join("Documents/Reports")).unwrap();
         File::create(root.path().join("Documents/Reports/report.txt")).unwrap();
         let files = [file("f1", "report.txt"), file("f2", "report-copy.txt")];
-        let classifications = vec![classification("f2", "docs"), classification("f1", "docs")];
+        let classifications = vec![
+            classification("f2", "d000001"),
+            classification("f1", "d000001"),
+        ];
 
-        let plan = build_plan(root.path(), &files, &[folder()], classifications).unwrap();
+        let folders = folders();
+        let plan = build_plan(root.path(), &files, &folders, classifications).unwrap();
 
         assert_eq!(
             plan.entries[0].destination_path,
@@ -470,10 +503,11 @@ mod tests {
     fn rejects_unknown_destination_id() {
         let root = tempdir().unwrap();
         fs::write(root.path().join("report.txt"), b"report").unwrap();
+        let folders = folders();
         let error = build_plan(
             root.path(),
             &[file("f1", "report.txt")],
-            &[folder()],
+            &folders,
             vec![classification("f1", "invented")],
         )
         .unwrap_err();
@@ -485,10 +519,11 @@ mod tests {
     fn rejects_missing_classification() {
         let root = tempdir().unwrap();
         fs::write(root.path().join("report.txt"), b"report").unwrap();
+        let folders = folders();
         let error = build_plan(
             root.path(),
             &[file("f1", "report.txt")],
-            &[folder()],
+            &folders,
             Vec::new(),
         )
         .unwrap_err();

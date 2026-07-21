@@ -32,16 +32,20 @@ temari [global options] organize <SOURCE> --out <RUN_DIR>
 - Read-only with respect to the organized source.
 - Previews the proposed hierarchy and asks for confirmation when stdin and stderr are terminals. Edit the proposal JSON before approval when hierarchy changes are needed.
 - Validates normalized relative paths and assigns opaque destination IDs.
-- Produces a versioned `FolderSet`.
+- Adds deterministic `Others/*` destinations for PDF, spreadsheet, image, video, audio, archive, code, presentation, and miscellaneous fallbacks. Automatically added fallbacks are visible during approval but local-only during classification; an identically named user proposal is reused and remains model-visible.
+- Produces a version 2 `FolderSet` that identifies model-visible and fallback destinations.
 - In non-interactive mode, fails unless `--accept-all` is supplied.
 
 ### `plan`
 
 - Read-only.
-- Classifies files only into IDs from the supplied `FolderSet`.
+- Classifies file names in batches of 50 into model-visible IDs from the supplied `FolderSet`.
+- A name result may request content. With `privacy.content = "on_demand"`, the core extracts bounded UTF-8 or PDF text locally and classifies those files in batches of 20. With `metadata_only`, no content is read or sent.
+- Uses deterministic approved fallback IDs when content is disabled, unsupported, oversized, empty, or cannot be extracted. Model and endpoint failures remain errors rather than silently falling back.
 - Rejects a `FolderSet` created for a different canonical source path.
-- Produces a versioned `Plan` containing approved folders, local SHA-256 and filesystem identities, required directories, collision-resolved destinations, and optional model reasoning.
+- Produces a version 2 `Plan` containing approved folders, local SHA-256 and filesystem identities, required directories, collision-resolved destinations, classification basis, and optional reasoning.
 - Hashes are computed locally and are never sent to the model.
+- Extracted text and model connectivity are never written to the Plan.
 
 ### `apply`
 
@@ -76,6 +80,7 @@ temari [global options] organize <SOURCE> --out <RUN_DIR>
 - Writes `proposal.json`, editable `proposal-review.json`, `folders.json`, `plan.json`, and `apply-session.json` as stages complete.
 - Offers approve, edit through `$VISUAL` or `$EDITOR`, or quit. Editing may change only folders and descriptions, not the source or sampling context.
 - Shows exact mkdir and collision-resolved move operations before a separate apply confirmation.
+- Keeps name, content, and fallback processing inside Stage 3 and reports their counts without adding another command boundary.
 
 ## Global options and output
 
@@ -97,7 +102,8 @@ temari [global options] organize <SOURCE> --out <RUN_DIR>
 
 ## Configuration
 
-- `.temari.toml` contains model connectivity, endpoint allowlists, timeouts, and privacy policy only.
+- Configuration version 2 requires a `[privacy]` section. `content = "metadata_only"` disables content extraction; `content = "on_demand"` enables it only for ambiguous files.
+- `.temari.toml` contains model connectivity, endpoint allowlists, extraction limits, and privacy policy only.
 - Approved destinations live in a `FolderSet`, not in application configuration.
 - The current implementation reads `.temari.toml` or the path supplied with `--config`.
 - API keys are loaded only from the environment-variable name configured by `model.api_key_env`; secret values never appear in flags or artifacts.
@@ -128,3 +134,4 @@ $ temari approve downloads.proposal.json --accept-all --no-input --out downloads
 4. Implement apply with audit sessions, then undo. Completed.
 5. Add interactive `organize` orchestration and explicit crash resume. Completed.
 6. Reuse the same services from the GUI and add a state database only when monitoring requires it.
+7. Add automatic two-pass name/content classification and approved deterministic extension fallbacks. Completed.

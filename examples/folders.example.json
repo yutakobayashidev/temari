@@ -1,16 +1,83 @@
 {
-  "version": 1,
+  "version": 2,
   "source": "/home/alice/Downloads",
   "folders": [
     {
       "id": "d000001",
       "path": "Documents",
-      "description": "Text documents, notes, reports, and office files"
+      "description": "Text documents, notes, reports, and office files",
+      "model_visible": true,
+      "fallback": null
     },
     {
       "id": "d000002",
       "path": "Images/Screenshots",
-      "description": "Screenshots and screen recordings"
+      "description": "Screenshots and screen recordings",
+      "model_visible": true,
+      "fallback": null
+    },
+    {
+      "id": "d000003",
+      "path": "Others/PDFs",
+      "description": "PDF files that could not be classified by meaning",
+      "model_visible": false,
+      "fallback": "pdf"
+    },
+    {
+      "id": "d000004",
+      "path": "Others/Spreadsheets",
+      "description": "Spreadsheets that could not be classified by meaning",
+      "model_visible": false,
+      "fallback": "spreadsheets"
+    },
+    {
+      "id": "d000005",
+      "path": "Others/Images",
+      "description": "Images that could not be classified by meaning",
+      "model_visible": false,
+      "fallback": "images"
+    },
+    {
+      "id": "d000006",
+      "path": "Others/Videos",
+      "description": "Videos that could not be classified by meaning",
+      "model_visible": false,
+      "fallback": "videos"
+    },
+    {
+      "id": "d000007",
+      "path": "Others/Audio",
+      "description": "Audio files that could not be classified by meaning",
+      "model_visible": false,
+      "fallback": "audio"
+    },
+    {
+      "id": "d000008",
+      "path": "Others/Archives",
+      "description": "Archives that could not be classified by meaning",
+      "model_visible": false,
+      "fallback": "archives"
+    },
+    {
+      "id": "d000009",
+      "path": "Others/Code",
+      "description": "Source files that could not be classified by meaning",
+      "model_visible": false,
+      "fallback": "code"
+    },
+    {
+      "id": "d000010",
+      "path": "Others/Presentations",
+      "description": "Presentations that could not be classified by meaning",
+      "model_visible": false,
+      "fallback": "presentations"
+    },
+    {
+      "id": "d000011",
+      "path": "Others/Miscellaneous",
+      "description": "Files that could not be classified by meaning or type",
+      "model_visible": false,
+      "fallback": "miscellaneous"
     }
   ]
 }

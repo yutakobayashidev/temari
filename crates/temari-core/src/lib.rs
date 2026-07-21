@@ -1,5 +1,6 @@
 mod apply;
 mod artifact;
+mod classification;
 mod config;
 mod filesystem;
 mod model;
@@ -12,10 +13,17 @@ pub use apply::{
     UndoState, apply_plan, preflight_apply, preflight_resume, preflight_undo, resume_apply_session,
     undo_session,
 };
-pub use artifact::{ApprovedFolder, FolderProposal, FolderSet, Proposal};
-pub use config::{Config, ModelConfig};
+pub use artifact::{ApprovedFolder, FallbackCategory, FolderProposal, FolderSet, Proposal};
+pub use classification::{
+    ClassificationOptions, ClassificationSummary, ContentExtractor, LocalContentExtractor,
+    classify_files,
+};
+pub use config::{Config, ContentPolicy, ModelConfig, PrivacyConfig};
 pub use filesystem::{FileFingerprint, FsIdentity};
-pub use model::{Classification, Classifier, FolderProposer, OpenAiCompatibleModel};
+pub use model::{
+    Classification, ClassificationBasis, Classifier, ContentCandidate, FolderProposer,
+    NameClassification, NameDecision, OpenAiCompatibleModel,
+};
 pub use plan::{Plan, PlanEntry, build_plan};
 pub use scan::{FileCandidate, scan_directory, select_representative_files};
 

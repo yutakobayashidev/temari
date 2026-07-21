@@ -10,3 +10,4 @@
 - When presenting Japanese name candidates, vary consonants and sound textures; repeated hard `k` sounds across the shortlist can make otherwise cute names feel monotonous.
 - A literal diminutive such as "small box" can have the right product metaphor but still feel cheap or childish; preserve the image while moving to a more evocative Japanese word with room for interpretation.
 - When the desired brand personality is cute and Japanese, prefer short native words, mimetic expressions, or Japanese-derived coinages over cold, globally generic AI-style names.
+- When reverse-engineering a trust boundary, distinguish limiting the model's prompt candidates from enforcing the returned value locally. Verify the lookup operands and the final call path before claiming an allowlist check exists.
