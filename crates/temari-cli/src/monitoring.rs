@@ -630,7 +630,7 @@ fn run_monitor_cycle(
             options,
         )?;
         if monitoring.plan.entries.is_empty() {
-            store.finish_run(&run_id, RunState::Noop, unix_ms()?, None)?;
+            store.finish_noop(&run_id, monitoring.stats.total_files as u64, unix_ms()?)?;
             print_cycle(context, monitor, &run_id, &monitoring.stats, None, "noop")?;
             return Ok(());
         }

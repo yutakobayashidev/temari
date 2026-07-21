@@ -570,6 +570,29 @@ impl StateStore {
         )
     }
 
+    pub fn finish_noop(
+        &mut self,
+        run_id: &str,
+        total_files: u64,
+        finished_unix_ms: i64,
+    ) -> Result<(), Error> {
+        require_changed(
+            self.connection.execute(
+                "UPDATE monitor_runs
+                 SET state = 'noop', finished_unix_ms = ?2,
+                     total_files = ?3, error = NULL
+                 WHERE id = ?1 AND state = 'planning'",
+                params![
+                    run_id,
+                    finished_unix_ms,
+                    to_i64(total_files, "total files")?
+                ],
+            )?,
+            "planning run",
+            run_id,
+        )
+    }
+
     fn complete_run(
         &mut self,
         run_id: &str,
@@ -1401,6 +1424,21 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn noop_run_preserves_the_scanned_file_count() {
+        let root = tempdir().unwrap();
+        let mut store = StateStore::open_in_memory().unwrap();
+        setup_monitor(&mut store, root.path());
+        store.start_run("run1", "m1", 100).unwrap();
+
+        store.finish_noop("run1", 3, 200).unwrap();
+
+        let run = store.run("run1").unwrap().unwrap();
+        assert_eq!(run.state, RunState::Noop);
+        assert_eq!(run.total_files, 3);
+        assert_eq!(run.finished_unix_ms, Some(200));
     }
 
     #[test]
