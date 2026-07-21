@@ -1,18 +1,23 @@
 use std::{
     collections::BTreeMap,
+    fs::{self, OpenOptions},
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use temari_core::{
-    ClassificationOptions, Classifier, Config, ContentDecision, ContentExtractor, ContentPolicy,
-    FileCandidate, FolderProposal, FolderProposer, FolderSet, LocalContentExtractor,
-    OpenAiCompatibleModel, Plan, Proposal, ScanScope, build_plan, classify_file_names,
-    complete_classification, scan_directory, select_representative_files,
+    ApplySession, ApplyState, ClassificationOptions, Classifier, Config, ContentDecision,
+    ContentExtractor, ContentPolicy, DirectoryOutcome, FileCandidate, FolderProposal,
+    FolderProposer, FolderSet, LocalContentExtractor, MoveOutcome, OpenAiCompatibleModel, Plan,
+    Proposal, ScanScope, UndoDirectoryOutcome, UndoMoveOutcome, UndoSession, UndoState, apply_plan,
+    build_plan, classify_file_names, complete_classification, scan_directory,
+    select_representative_files, undo_session,
 };
 
 const SCAN_PREVIEW_LIMIT: usize = 80;
@@ -30,10 +35,38 @@ struct ApprovedState {
     config: Config,
 }
 
+#[derive(Clone)]
+struct PlannedState {
+    plan: Plan,
+    sha256: String,
+}
+
+#[derive(Clone)]
+struct AppliedState {
+    session: ApplySession,
+    run_directory: PathBuf,
+    plan_path: PathBuf,
+    apply_path: PathBuf,
+    undo_path: PathBuf,
+    undo: Option<UndoSession>,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum Operation {
+    #[default]
+    Idle,
+    Applying,
+    Undoing,
+}
+
 #[derive(Default)]
 struct WorkflowState {
+    revision: u64,
     proposal: Option<ProposalState>,
     approved: Option<ApprovedState>,
+    planned: Option<PlannedState>,
+    applied: Option<AppliedState>,
+    operation: Operation,
 }
 
 #[derive(Clone, Default)]
@@ -80,6 +113,44 @@ struct ApproveRequest {
 struct PlanPreview {
     plan: Plan,
     sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ApplyRequest {
+    plan_sha256: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyResult {
+    state: ApplyState,
+    session_id: String,
+    plan_sha256: String,
+    planned_files: usize,
+    moved_files: usize,
+    created_directories: usize,
+    conflicts: usize,
+    run_directory: String,
+    plan_path: String,
+    journal_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct UndoRequest {
+    apply_session_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UndoResult {
+    state: UndoState,
+    apply_session_id: String,
+    restored_files: usize,
+    removed_directories: usize,
+    conflicts: usize,
+    journal_path: String,
 }
 
 #[derive(Serialize)]
@@ -146,14 +217,19 @@ async fn propose_structure(
         return Err("maximum folder count must be greater than zero".into());
     }
 
-    {
+    let revision = {
         let mut workflow = state
             .workflow
             .lock()
             .map_err(|_| "workflow state is unavailable".to_owned())?;
+        require_idle(&workflow)?;
+        workflow.revision = workflow.revision.wrapping_add(1);
         workflow.proposal = None;
         workflow.approved = None;
-    }
+        workflow.planned = None;
+        workflow.applied = None;
+        workflow.revision
+    };
 
     let proposal_state = tauri::async_runtime::spawn_blocking(move || generate_proposal(request))
         .await
@@ -163,6 +239,10 @@ async fn propose_structure(
         .workflow
         .lock()
         .map_err(|_| "workflow state is unavailable".to_owned())?;
+    require_idle(&workflow)?;
+    if workflow.revision != revision {
+        return Err("the workflow changed while the proposal was being created".into());
+    }
     workflow.proposal = Some(proposal_state);
     Ok(proposal)
 }
@@ -176,6 +256,7 @@ fn approve_structure(
         .workflow
         .lock()
         .map_err(|_| "workflow state is unavailable".to_owned())?;
+    require_idle(&workflow)?;
     let proposal_state = workflow
         .proposal
         .clone()
@@ -187,21 +268,125 @@ fn approve_structure(
         folders: folders.clone(),
         config: proposal_state.config,
     });
+    workflow.planned = None;
+    workflow.applied = None;
+    workflow.revision = workflow.revision.wrapping_add(1);
     Ok(folders)
 }
 
 #[tauri::command]
 async fn preview_plan(state: State<'_, AppState>) -> Result<PlanPreview, String> {
-    let approved = state
+    let (approved, revision) = {
+        let workflow = state
+            .workflow
+            .lock()
+            .map_err(|_| "workflow state is unavailable".to_owned())?;
+        require_idle(&workflow)?;
+        let approved = workflow
+            .approved
+            .clone()
+            .ok_or_else(|| "approve destinations before creating a plan".to_owned())?;
+        (approved, workflow.revision)
+    };
+    let preview = tauri::async_runtime::spawn_blocking(move || generate_plan(approved))
+        .await
+        .map_err(|error| format!("plan preview task failed: {error}"))??;
+    let mut workflow = state
         .workflow
         .lock()
-        .map_err(|_| "workflow state is unavailable".to_owned())?
-        .approved
-        .clone()
-        .ok_or_else(|| "approve destinations before creating a plan".to_owned())?;
-    tauri::async_runtime::spawn_blocking(move || generate_plan(approved))
+        .map_err(|_| "workflow state is unavailable".to_owned())?;
+    require_idle(&workflow)?;
+    if workflow.revision != revision || workflow.applied.is_some() {
+        return Err("the workflow changed while the Plan was being created".into());
+    }
+    workflow.planned = Some(PlannedState {
+        plan: preview.plan.clone(),
+        sha256: preview.sha256.clone(),
+    });
+    workflow.applied = None;
+    Ok(preview)
+}
+
+#[tauri::command]
+async fn apply_reviewed_plan(
+    request: ApplyRequest,
+    state: State<'_, AppState>,
+) -> Result<ApplyResult, String> {
+    let planned = {
+        let mut workflow = state
+            .workflow
+            .lock()
+            .map_err(|_| "workflow state is unavailable".to_owned())?;
+        if workflow.operation != Operation::Idle {
+            return Err("another filesystem operation is already running".into());
+        }
+        let planned = reviewed_plan(&workflow, &request.plan_sha256)?;
+        workflow.operation = Operation::Applying;
+        planned
+    };
+
+    let result = tauri::async_runtime::spawn_blocking(move || apply_planned(planned))
         .await
-        .map_err(|error| format!("plan preview task failed: {error}"))?
+        .map_err(|error| format!("apply task failed: {error}"))
+        .and_then(|result| result);
+    let mut workflow = state
+        .workflow
+        .lock()
+        .map_err(|_| "workflow state is unavailable".to_owned())?;
+    workflow.operation = Operation::Idle;
+    match result {
+        Ok(applied) => {
+            let response = summarize_apply(&applied)?;
+            workflow.applied = Some(applied);
+            Ok(response)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[tauri::command]
+async fn undo_applied_plan(
+    request: UndoRequest,
+    state: State<'_, AppState>,
+) -> Result<UndoResult, String> {
+    let applied = {
+        let mut workflow = state
+            .workflow
+            .lock()
+            .map_err(|_| "workflow state is unavailable".to_owned())?;
+        if workflow.operation != Operation::Idle {
+            return Err("another filesystem operation is already running".into());
+        }
+        let applied = workflow
+            .applied
+            .clone()
+            .ok_or_else(|| "there is no applied desktop session to undo".to_owned())?;
+        if applied.session.id != request.apply_session_id {
+            return Err("the requested apply session is not the active desktop session".into());
+        }
+        if applied.undo.is_some() {
+            return Err("the active desktop session has already been undone".into());
+        }
+        workflow.operation = Operation::Undoing;
+        applied
+    };
+
+    let result = tauri::async_runtime::spawn_blocking(move || undo_applied(applied))
+        .await
+        .map_err(|error| format!("undo task failed: {error}"))
+        .and_then(|result| result);
+    let mut workflow = state
+        .workflow
+        .lock()
+        .map_err(|_| "workflow state is unavailable".to_owned())?;
+    workflow.operation = Operation::Idle;
+    match result {
+        Ok((applied, response)) => {
+            workflow.applied = Some(applied);
+            Ok(response)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn generate_proposal(request: ProposeRequest) -> Result<ProposalState, String> {
@@ -286,6 +471,242 @@ fn generate_plan_with<C: Classifier, E: ContentExtractor>(
     Ok(PlanPreview { plan, sha256 })
 }
 
+fn apply_planned(planned: PlannedState) -> Result<AppliedState, String> {
+    let workflow_root = desktop_workflow_root()?;
+    apply_planned_at(planned, &workflow_root)
+}
+
+fn reviewed_plan(workflow: &WorkflowState, plan_sha256: &str) -> Result<PlannedState, String> {
+    if workflow.applied.is_some() {
+        return Err("the reviewed plan has already been applied".into());
+    }
+    let planned = workflow
+        .planned
+        .clone()
+        .ok_or_else(|| "preview a plan before applying it".to_owned())?;
+    if plan_sha256 != planned.sha256 {
+        return Err("the confirmed plan no longer matches the reviewed plan".into());
+    }
+    if planned.plan.entries.is_empty() {
+        return Err("the reviewed plan contains no moves".into());
+    }
+    Ok(planned)
+}
+
+fn require_idle(workflow: &WorkflowState) -> Result<(), String> {
+    if workflow.operation == Operation::Idle {
+        Ok(())
+    } else {
+        Err("another filesystem operation is already running".into())
+    }
+}
+
+fn apply_planned_at(planned: PlannedState, workflow_root: &Path) -> Result<AppliedState, String> {
+    let source = canonical_source(&planned.plan.source)?;
+    fs::create_dir_all(workflow_root)
+        .map_err(|error| format!("could not create desktop workflow directory: {error}"))?;
+    fs::set_permissions(workflow_root, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("could not secure desktop workflow directory: {error}"))?;
+    let workflow_root = workflow_root
+        .canonicalize()
+        .map_err(|error| format!("could not resolve desktop workflow directory: {error}"))?;
+    if workflow_root.starts_with(&source) {
+        return Err("desktop workflow journals must be outside the organized source".into());
+    }
+
+    let run_directory = create_run_directory(&workflow_root, &planned.sha256)?;
+    let plan_path = run_directory.join("plan.json");
+    let apply_path = run_directory.join("apply.json");
+    let undo_path = run_directory.join("undo.json");
+    write_new_json(&plan_path, &planned.plan)?;
+    let session = apply_plan(&planned.plan, &apply_path).map_err(|error| {
+        format!(
+            "apply failed: {error}. The reviewed Plan is saved at {} and any recovery journal is at {}",
+            plan_path.display(),
+            apply_path.display()
+        )
+    })?;
+
+    Ok(AppliedState {
+        session,
+        run_directory,
+        plan_path,
+        apply_path,
+        undo_path,
+        undo: None,
+    })
+}
+
+fn undo_applied(mut applied: AppliedState) -> Result<(AppliedState, UndoResult), String> {
+    let undo = undo_session(&applied.session, &applied.undo_path).map_err(|error| {
+        format!(
+            "undo failed: {error}. Inspect the apply journal at {} and undo journal at {}",
+            applied.apply_path.display(),
+            applied.undo_path.display()
+        )
+    })?;
+    let response = summarize_undo(&undo, &applied.undo_path)?;
+    applied.undo = Some(undo);
+    Ok((applied, response))
+}
+
+fn desktop_workflow_root() -> Result<PathBuf, String> {
+    let directories = ProjectDirs::from("dev", "yutakobayashidev", "temari")
+        .ok_or_else(|| "could not determine the user state directory".to_owned())?;
+    Ok(directories
+        .state_dir()
+        .unwrap_or_else(|| directories.data_local_dir())
+        .join("workflows"))
+}
+
+fn create_run_directory(root: &Path, plan_sha256: &str) -> Result<PathBuf, String> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_owned())?
+        .as_millis();
+    let digest = plan_sha256.get(..12).unwrap_or(plan_sha256);
+    for suffix in 0..100_u8 {
+        let name = if suffix == 0 {
+            format!("{timestamp}-{}-{digest}", std::process::id())
+        } else {
+            format!("{timestamp}-{}-{digest}-{suffix}", std::process::id())
+        };
+        let path = root.join(name);
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    .map_err(|error| format!("could not secure desktop workflow run: {error}"))?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!("could not create desktop workflow run: {error}"));
+            }
+        }
+    }
+    Err("could not allocate a unique desktop workflow run".into())
+}
+
+fn write_new_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let temporary = path.with_extension("json.tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|error| format!("could not create Plan artifact: {error}"))?;
+    serde_json::to_writer_pretty(&mut file, value)
+        .map_err(|error| format!("could not serialize Plan artifact: {error}"))?;
+    file.write_all(b"\n")
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("could not persist Plan artifact: {error}"))?;
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("could not publish Plan artifact: {error}"))?;
+    sync_workflow_directory(path.parent().expect("artifact path has a parent"))?;
+    Ok(())
+}
+
+fn sync_workflow_directory(directory: &Path) -> Result<(), String> {
+    fs::File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("could not sync workflow directory: {error}"))
+}
+
+fn summarize_apply(applied: &AppliedState) -> Result<ApplyResult, String> {
+    let moved_files = applied
+        .session
+        .moves
+        .iter()
+        .filter(|record| record.outcome == MoveOutcome::Moved)
+        .count();
+    let created_directories = applied
+        .session
+        .directories
+        .iter()
+        .filter(|record| matches!(record.outcome, DirectoryOutcome::Created { .. }))
+        .count();
+    let move_conflicts = applied
+        .session
+        .moves
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.outcome,
+                MoveOutcome::Conflict { .. } | MoveOutcome::Failed { .. }
+            )
+        })
+        .count();
+    let directory_conflicts = applied
+        .session
+        .directories
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.outcome,
+                DirectoryOutcome::Conflict { .. } | DirectoryOutcome::Failed { .. }
+            )
+        })
+        .count();
+    Ok(ApplyResult {
+        state: applied.session.state.clone(),
+        session_id: applied.session.id.clone(),
+        plan_sha256: applied.session.plan_sha256.clone(),
+        planned_files: applied.session.moves.len(),
+        moved_files,
+        created_directories,
+        conflicts: move_conflicts + directory_conflicts,
+        run_directory: path_to_string(&applied.run_directory)?,
+        plan_path: path_to_string(&applied.plan_path)?,
+        journal_path: path_to_string(&applied.apply_path)?,
+    })
+}
+
+fn summarize_undo(undo: &UndoSession, journal_path: &Path) -> Result<UndoResult, String> {
+    let restored_files = undo
+        .moves
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.outcome,
+                UndoMoveOutcome::Restored | UndoMoveOutcome::AlreadyRestored
+            )
+        })
+        .count();
+    let removed_directories = undo
+        .directories
+        .iter()
+        .filter(|record| record.outcome == UndoDirectoryOutcome::Removed)
+        .count();
+    let move_conflicts = undo
+        .moves
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.outcome,
+                UndoMoveOutcome::Conflict { .. } | UndoMoveOutcome::Failed { .. }
+            )
+        })
+        .count();
+    let directory_conflicts = undo
+        .directories
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.outcome,
+                UndoDirectoryOutcome::Conflict { .. } | UndoDirectoryOutcome::Failed { .. }
+            )
+        })
+        .count();
+    Ok(UndoResult {
+        state: undo.state.clone(),
+        apply_session_id: undo.apply_session_id.clone(),
+        restored_files,
+        removed_directories,
+        conflicts: move_conflicts + directory_conflicts,
+        journal_path: path_to_string(journal_path)?,
+    })
+}
+
 fn canonical_source(source: &str) -> Result<PathBuf, String> {
     if source.trim().is_empty() {
         return Err("source folder must not be empty".into());
@@ -337,7 +758,9 @@ pub fn run() {
             scan_source,
             propose_structure,
             approve_structure,
-            preview_plan
+            preview_plan,
+            apply_reviewed_plan,
+            undo_applied_plan
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Temari desktop");
@@ -499,6 +922,31 @@ mod tests {
         .unwrap()
     }
 
+    fn reviewed_test_plan(source: &Path) -> PlannedState {
+        std::fs::write(source.join("loose.txt"), "loose").unwrap();
+        let folders = approved_folders(source);
+        let destination_id = folders
+            .folders
+            .iter()
+            .find(|folder| folder.path == "Documents")
+            .unwrap()
+            .id
+            .clone();
+        let preview = generate_plan_with(
+            &folders,
+            &test_config(ContentPolicy::MetadataOnly),
+            &NameClassifier {
+                destination_id: Some(destination_id),
+            },
+            &NeverExtract,
+        )
+        .unwrap();
+        PlannedState {
+            plan: preview.plan,
+            sha256: preview.sha256,
+        }
+    }
+
     #[test]
     fn plan_preview_builds_a_real_plan_and_excludes_approved_destinations() {
         let source = tempdir().unwrap();
@@ -564,5 +1012,69 @@ mod tests {
             preview.plan.entries[0].destination_path,
             "Others/PDFs/ambiguous.pdf"
         );
+    }
+
+    #[test]
+    fn apply_uses_the_exact_backend_held_plan_and_undo_restores_it() {
+        let source = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        let planned = reviewed_test_plan(source.path());
+        let expected_sha256 = planned.sha256.clone();
+        let mut workflow = WorkflowState {
+            planned: Some(planned),
+            ..WorkflowState::default()
+        };
+
+        assert!(reviewed_plan(&workflow, "wrong-digest").is_err());
+        assert!(source.path().join("loose.txt").exists());
+
+        let confirmed = reviewed_plan(&workflow, &expected_sha256).unwrap();
+        let applied = apply_planned_at(confirmed, journals.path()).unwrap();
+        assert_eq!(applied.session.state, ApplyState::Completed);
+        assert!(source.path().join("Documents/loose.txt").exists());
+        assert!(!source.path().join("loose.txt").exists());
+        assert_eq!(
+            applied.plan_path.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            applied.apply_path.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let apply_bytes = std::fs::read(&applied.apply_path).unwrap();
+        workflow.applied = Some(applied.clone());
+        assert!(reviewed_plan(&workflow, &expected_sha256).is_err());
+
+        let (applied, undo_result) = undo_applied(applied).unwrap();
+        assert_eq!(undo_result.state, UndoState::Completed);
+        assert_eq!(undo_result.restored_files, 1);
+        assert!(source.path().join("loose.txt").exists());
+        assert!(!source.path().join("Documents/loose.txt").exists());
+        assert_eq!(std::fs::read(&applied.apply_path).unwrap(), apply_bytes);
+        assert!(applied.undo_path.is_file());
+    }
+
+    #[test]
+    fn apply_rejects_a_file_changed_after_preview() {
+        let source = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        let planned = reviewed_test_plan(source.path());
+        std::fs::write(source.path().join("loose.txt"), "changed after preview").unwrap();
+
+        let error = apply_planned_at(planned, journals.path()).err().unwrap();
+
+        assert!(error.contains("source changed after planning"));
+        assert!(source.path().join("loose.txt").exists());
+        assert!(!source.path().join("Documents/loose.txt").exists());
+    }
+
+    #[test]
+    fn apply_ipc_rejects_unexpected_fields() {
+        let request = serde_json::json!({
+            "planSha256": "reviewed",
+            "source": "/tmp/injected"
+        });
+
+        assert!(serde_json::from_value::<ApplyRequest>(request).is_err());
     }
 }

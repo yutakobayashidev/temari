@@ -190,9 +190,31 @@ button:focus-visible, input:focus-visible, a:focus-visible { outline: 3px solid 
 .primary-action.is-busy { color: transparent; position: relative; }
 .primary-action.is-busy::after { content: ""; position: absolute; inset: 50% auto auto 50%; width: 14px; height: 14px; margin: -8px; border: 2px solid rgba(255,255,255,.4); border-top-color: white; border-radius: 50%; animation: spin .7s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
-.apply-action { display: flex; align-items: center; justify-content: space-between; padding: 0 14px; color: #879198; background: transparent; border: 1px dashed #c5ceca; text-align: left; cursor: not-allowed; }
+.apply-action { display: flex; align-items: center; justify-content: space-between; padding: 0 14px; color: white; background: var(--persimmon); border: 1px solid var(--persimmon); text-align: left; cursor: pointer; box-shadow: 0 8px 18px rgba(217,120,82,.18); }
+.apply-action:hover:not(:disabled) { background: #c96a46; border-color: #c96a46; }
+.apply-action.is-undo { color: var(--indigo); background: transparent; border-color: #aeb9d5; box-shadow: none; }
+.apply-action.is-undo:hover:not(:disabled) { color: white; background: var(--indigo); border-color: var(--indigo); }
+.apply-action:disabled { color: #879198; background: transparent; border: 1px dashed #c5ceca; box-shadow: none; cursor: not-allowed; }
 .apply-action span { font-size: 11px; font-weight: 650; }
 .apply-action small { font: 8px "SFMono-Regular", monospace; text-transform: uppercase; letter-spacing: .06em; }
+
+.confirm-dialog { width: min(480px, calc(100vw - 32px)); padding: 0; border: 0; border-radius: 12px; color: var(--ink); background: var(--paper); box-shadow: 0 28px 90px rgba(12,22,35,.34); }
+.confirm-dialog::backdrop { background: rgba(14,24,38,.66); backdrop-filter: blur(4px); }
+.confirm-dialog form { position: relative; padding: 32px; }
+.confirm-dialog h2 { margin: 9px 0 10px; color: var(--sumi); font-family: "Iowan Old Style", "Yu Mincho", serif; font-size: 28px; font-weight: 550; }
+.confirm-dialog form > p:not(.eyebrow) { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.65; }
+.dialog-close { position: absolute; top: 15px; right: 15px; width: 30px; height: 30px; border: 0; border-radius: 50%; color: var(--muted); background: transparent; font-size: 20px; cursor: pointer; }
+.dialog-close:hover { background: #e9eeeb; }
+.confirm-dialog dl { display: grid; gap: 1px; overflow: hidden; margin: 22px 0; border: 1px solid var(--line); border-radius: 7px; background: var(--line); }
+.confirm-dialog dl div { display: grid; grid-template-columns: 112px minmax(0,1fr); gap: 10px; padding: 10px 11px; background: white; }
+.confirm-dialog dt { color: var(--muted); font: 650 8px "SFMono-Regular", monospace; letter-spacing: .06em; text-transform: uppercase; }
+.confirm-dialog dd { min-width: 0; margin: 0; color: var(--ink); font: 10px "SFMono-Regular", monospace; overflow-wrap: anywhere; }
+.confirm-dialog .digest { grid-template-columns: 1fr; gap: 5px; }
+.dialog-actions { display: grid; grid-template-columns: 1fr 1.35fr; gap: 9px; }
+.dialog-actions button { min-height: 45px; border-radius: 6px; font-size: 11px; font-weight: 650; cursor: pointer; }
+.dialog-cancel { color: var(--ink); background: transparent; border: 1px solid var(--line); }
+.dialog-confirm { color: white; background: var(--persimmon); border: 1px solid var(--persimmon); }
+.dialog-confirm:hover { background: #c96a46; border-color: #c96a46; }
 
 @media (max-width: 1000px) {
   .shell { grid-template-columns: 82px minmax(0,1fr); }
@@ -219,6 +241,7 @@ button:focus-visible, input:focus-visible, a:focus-visible { outline: 3px solid 
   #folder-fields { max-height: none; }
   .plan-entries { max-height: none; }
   .folder-node { max-width: 112px; }
+  .confirm-dialog form { padding: 27px 22px 22px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -1,8 +1,9 @@
 import "./styles.css";
-import { approveStructure, chooseConfig, chooseSource, defaultConfigLocation, previewPlan, proposeStructure, scanSource } from "./api";
-import type { ClassificationBasis, FolderProposal, FolderSet, PlanPreview, Proposal, ScanPreview } from "./types";
+import { applyReviewedPlan, approveStructure, chooseConfig, chooseSource, defaultConfigLocation, previewPlan, proposeStructure, scanSource, undoAppliedPlan } from "./api";
+import type { ApplyResult, ClassificationBasis, FolderProposal, FolderSet, PlanPreview, Proposal, ScanPreview, UndoResult } from "./types";
 
-type Stage = "source" | "scan" | "shape" | "approve" | "plan";
+type Stage = "source" | "scan" | "shape" | "approve" | "plan" | "apply";
+type Mutation = "idle" | "applying" | "applied" | "undoing" | "undone";
 
 type AppState = {
   stage: Stage;
@@ -11,6 +12,9 @@ type AppState = {
   proposal: Proposal | null;
   approved: FolderSet | null;
   planPreview: PlanPreview | null;
+  applyResult: ApplyResult | null;
+  undoResult: UndoResult | null;
+  mutation: Mutation;
   busy: boolean;
   error: string | null;
   configPath: string;
@@ -24,6 +28,9 @@ const state: AppState = {
   proposal: null,
   approved: null,
   planPreview: null,
+  applyResult: null,
+  undoResult: null,
+  mutation: "idle",
   busy: false,
   error: null,
   configPath: "",
@@ -51,7 +58,7 @@ app.innerHTML = `
         <li data-stage="shape"><span>3</span><div><strong>Shape</strong><small>Review the structure</small></div></li>
         <li data-stage="approve"><span>4</span><div><strong>Approve</strong><small>Trust the destinations</small></div></li>
         <li data-stage="plan"><span>5</span><div><strong>Plan</strong><small>Review every move</small></div></li>
-        <li class="locked"><span>6</span><div><strong>Apply</strong><small>Not in this preview</small></div></li>
+        <li data-stage="apply"><span>6</span><div><strong>Apply</strong><small>Move with a journal</small></div></li>
       </ol>
       <div class="local-boundary">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 4.5 5.2v5.9c0 4.9 3.1 9.4 7.5 10.9 4.4-1.5 7.5-6 7.5-10.9V5.2L12 2Zm0 3.1 4.5 1.9v4.1c0 3.4-1.8 6.6-4.5 7.8-2.7-1.2-4.5-4.4-4.5-7.8V7L12 5.1Z"/></svg>
@@ -122,13 +129,26 @@ app.innerHTML = `
         <div class="status-message" id="status-message" role="status" aria-live="polite" hidden></div>
         <div class="review-actions">
           <button class="primary-action" id="main-action" type="button" disabled>Select a source</button>
-          <button class="apply-action" id="apply-action" type="button" disabled title="Apply remains in the audited command-line workflow for this preview">
-            <span>Apply moves</span><small>Locked in this preview</small>
+          <button class="apply-action" id="apply-action" type="button" disabled>
+            <span>Apply moves</span><small>Review &amp; confirm</small>
           </button>
         </div>
       </aside>
     </main>
   </div>
+  <dialog class="confirm-dialog" id="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <button class="dialog-close" value="cancel" aria-label="Cancel">×</button>
+      <p class="eyebrow" id="confirm-kicker">Final confirmation</p>
+      <h2 id="confirm-title">Apply reviewed moves?</h2>
+      <p id="confirm-copy"></p>
+      <dl id="confirm-details"></dl>
+      <div class="dialog-actions">
+        <button class="dialog-cancel" value="cancel" autofocus>Cancel</button>
+        <button class="dialog-confirm" id="dialog-confirm" type="button">Apply moves</button>
+      </div>
+    </form>
+  </dialog>
 `;
 
 const $ = <T extends Element>(selector: string): T => {
@@ -143,6 +163,9 @@ const changeSourceButton = $("#change-source") as HTMLButtonElement;
 const chooseConfigButton = $("#choose-config") as HTMLButtonElement;
 const addFolderButton = $("#add-folder") as HTMLButtonElement;
 const configPathInput = $("#config-path") as HTMLInputElement;
+const applyAction = $("#apply-action") as HTMLButtonElement;
+const confirmDialog = $("#confirm-dialog") as HTMLDialogElement;
+const dialogConfirm = $("#dialog-confirm") as HTMLButtonElement;
 
 function setBusy(busy: boolean): void {
   state.busy = busy;
@@ -150,6 +173,7 @@ function setBusy(busy: boolean): void {
   chooseSourceButton.disabled = busy;
   changeSourceButton.disabled = busy;
   chooseConfigButton.disabled = busy;
+  applyAction.disabled = busy;
   mainAction.classList.toggle("is-busy", busy);
 }
 
@@ -159,7 +183,7 @@ function basename(path: string): string {
 
 function render(): void {
   document.querySelectorAll<HTMLElement>("[data-stage]").forEach((item) => {
-    const stages: Stage[] = ["source", "scan", "shape", "approve", "plan"];
+    const stages: Stage[] = ["source", "scan", "shape", "approve", "plan", "apply"];
     const itemStage = item.dataset.stage as Stage;
     item.classList.toggle("active", itemStage === state.stage);
     item.classList.toggle("complete", stages.indexOf(itemStage) < stages.indexOf(state.stage));
@@ -171,6 +195,7 @@ function render(): void {
     shape: ["Proposed structure", "Gather files into calm groups."],
     approve: ["Locally approved", "Your structure is ready."],
     plan: ["Read-only plan", "Follow every thread before it moves."],
+    apply: state.mutation === "undone" ? ["Undo complete", "Everything is back in place."] : ["Journaled apply", "Every move has a way home."],
   };
   $("#stage-kicker").textContent = titles[state.stage][0];
   $("#workspace-title").textContent = titles[state.stage][1];
@@ -305,7 +330,13 @@ function renderNodes(): void {
 function renderReviewText(): void {
   const title = $("#review-title");
   const copy = $("#review-copy");
-  if (state.approved) {
+  if (state.undoResult) {
+    title.textContent = state.undoResult.state === "completed" ? "Moves undone" : "Undo needs attention";
+    copy.textContent = `${state.undoResult.restoredFiles} files were restored. The undo journal records the exact result.`;
+  } else if (state.applyResult) {
+    title.textContent = state.applyResult.state === "completed" ? "Files organized" : "Apply needs attention";
+    copy.textContent = `${state.applyResult.movedFiles} of ${state.applyResult.plannedFiles} reviewed moves completed. The Plan remains visible below.`;
+  } else if (state.approved) {
     if (state.planPreview) {
       if (state.planPreview.plan.entries.length === 0) {
         title.textContent = "No moves needed";
@@ -342,22 +373,49 @@ function renderAction(): void {
     shape: "Approve destinations",
     approve: "Preview moves",
     plan: "Plan ready",
+    apply: "Organize another folder",
   };
   mainAction.textContent = labels[state.stage];
   mainAction.disabled = state.busy
     || !state.source
-    || state.stage === "plan"
+    || (state.stage === "plan")
+    || (state.stage === "apply" && state.mutation !== "applied" && state.mutation !== "undone")
     || (state.stage === "scan" && !state.configPath);
-  const applyAction = $("#apply-action") as HTMLButtonElement;
   const moveCount = state.planPreview?.plan.entries.length;
-  applyAction.querySelector("span")!.textContent = moveCount === undefined ? "Apply moves" : `Apply ${moveCount} moves`;
+  const label = applyAction.querySelector("span")!;
+  const hint = applyAction.querySelector("small")!;
+  if (state.mutation === "applied") {
+    label.textContent = "Undo applied moves";
+    hint.textContent = "Review & confirm";
+  } else if (state.mutation === "applying") {
+    label.textContent = "Applying…";
+    hint.textContent = "Writing journal";
+  } else if (state.mutation === "undoing") {
+    label.textContent = "Undoing…";
+    hint.textContent = "Writing journal";
+  } else if (state.mutation === "undone") {
+    label.textContent = "Moves undone";
+    hint.textContent = "Journal complete";
+  } else {
+    label.textContent = moveCount === undefined ? "Apply moves" : `Apply ${moveCount} moves`;
+    hint.textContent = "Review & confirm";
+  }
+  applyAction.disabled = state.busy
+    || state.mutation === "undone"
+    || !state.planPreview
+    || state.planPreview.plan.entries.length === 0;
+  applyAction.classList.toggle("is-undo", state.mutation === "applied");
 }
 
 function renderStatus(): void {
   const status = $("#status-message") as HTMLElement;
-  status.hidden = !state.error && !state.approved;
+  status.hidden = !state.error && !state.approved && !state.applyResult && !state.undoResult;
   status.classList.toggle("error", state.error !== null);
-  status.textContent = state.error ?? (state.planPreview
+  status.textContent = state.error ?? (state.undoResult
+    ? `${state.undoResult.state === "completed" ? "Undo complete" : "Undo partially completed"}: ${state.undoResult.restoredFiles} files restored. Journal: ${state.undoResult.journalPath}`
+    : state.applyResult
+      ? `${state.applyResult.state === "completed" ? "Apply complete" : "Apply partially completed"}: ${state.applyResult.movedFiles}/${state.applyResult.plannedFiles} files moved. Journal: ${state.applyResult.journalPath}`
+      : state.planPreview
     ? `Plan ready. ${state.planPreview.plan.entries.length} moves and ${state.planPreview.plan.directories.length} folders to create. Nothing changed on disk.`
     : state.approved
       ? "Destinations approved. Preview the moves before any files can change."
@@ -380,7 +438,17 @@ async function selectSource(): Promise<void> {
   try {
     const source = await chooseSource();
     if (!source) return;
-    Object.assign(state, { stage: "source", source, scan: null, proposal: null, approved: null, planPreview: null });
+    Object.assign(state, {
+      stage: "source",
+      source,
+      scan: null,
+      proposal: null,
+      approved: null,
+      planPreview: null,
+      applyResult: null,
+      undoResult: null,
+      mutation: "idle",
+    });
   } catch (error) {
     state.error = formatError(error);
   } finally {
@@ -417,6 +485,10 @@ async function initializeConfig(): Promise<void> {
 }
 
 async function advance(): Promise<void> {
+  if (state.stage === "apply" && (state.mutation === "applied" || state.mutation === "undone")) {
+    await selectSource();
+    return;
+  }
   if (!state.source || state.busy) return;
   setBusy(true);
   state.error = null;
@@ -444,6 +516,53 @@ async function advance(): Promise<void> {
   }
 }
 
+function openApplyConfirmation(): void {
+  if (!state.planPreview || state.planPreview.plan.entries.length === 0 || state.busy) return;
+  const undo = state.mutation === "applied" && state.applyResult !== null;
+  $("#confirm-kicker").textContent = undo ? "Undo confirmation" : "Final confirmation";
+  $("#confirm-title").textContent = undo ? "Restore moved files?" : "Apply reviewed moves?";
+  $("#confirm-copy").textContent = undo
+    ? "Undo restores only files recorded by this Apply session. New conflicts are left untouched and reported in the journal."
+    : "Temari will recheck every source fingerprint and destination before moving anything. Existing files are never overwritten.";
+  $("#confirm-details").innerHTML = undo
+    ? `<div><dt>Apply session</dt><dd>${escapeHtml(state.applyResult!.sessionId)}</dd></div><div><dt>Moved files</dt><dd>${state.applyResult!.movedFiles}</dd></div>`
+    : `<div><dt>Moves</dt><dd>${state.planPreview.plan.entries.length}</dd></div><div><dt>New folders</dt><dd>${state.planPreview.plan.directories.length}</dd></div><div class="digest"><dt>Exact Plan SHA-256</dt><dd>${escapeHtml(state.planPreview.sha256)}</dd></div>`;
+  dialogConfirm.textContent = undo ? "Undo moves" : "Apply moves";
+  dialogConfirm.dataset.action = undo ? "undo" : "apply";
+  confirmDialog.showModal();
+}
+
+async function confirmMutation(): Promise<void> {
+  const action = dialogConfirm.dataset.action;
+  confirmDialog.close();
+  if (!state.planPreview || state.busy) return;
+  setBusy(true);
+  state.error = null;
+  try {
+    if (action === "undo") {
+      if (!state.applyResult) throw new Error("There is no applied session to undo.");
+      state.mutation = "undoing";
+      state.stage = "apply";
+      render();
+      state.undoResult = await undoAppliedPlan(state.applyResult.sessionId);
+      state.mutation = "undone";
+    } else {
+      state.mutation = "applying";
+      state.stage = "apply";
+      render();
+      state.applyResult = await applyReviewedPlan(state.planPreview.sha256);
+      state.mutation = "applied";
+    }
+  } catch (error) {
+    state.error = formatError(error);
+    state.mutation = action === "undo" && state.applyResult ? "applied" : "idle";
+    state.stage = state.applyResult ? "apply" : "plan";
+  } finally {
+    setBusy(false);
+    render();
+  }
+}
+
 function syncFolderInputs(): void {
   if (!state.proposal) return;
   const folders: FolderProposal[] = [];
@@ -463,6 +582,8 @@ chooseSourceButton.addEventListener("click", selectSource);
 changeSourceButton.addEventListener("click", selectSource);
 chooseConfigButton.addEventListener("click", selectConfig);
 mainAction.addEventListener("click", advance);
+applyAction.addEventListener("click", openApplyConfirmation);
+dialogConfirm.addEventListener("click", confirmMutation);
 
 addFolderButton.addEventListener("click", () => {
   if (!state.proposal) return;

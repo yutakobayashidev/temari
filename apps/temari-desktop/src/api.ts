@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { ClassificationBasis, FolderSet, PlanPreview, Proposal, ScanPreview } from "./types";
+import type { ApplyResult, ClassificationBasis, FolderSet, PlanPreview, Proposal, ScanPreview, UndoResult } from "./types";
 
 const demoProposal: Proposal = {
   version: 2,
@@ -77,6 +77,7 @@ const demoPlan: PlanPreview = {
 };
 
 let demoApproved: FolderSet | null = null;
+let demoApplied: ApplyResult | null = null;
 
 function isTauri(): boolean {
   return "__TAURI_INTERNALS__" in window;
@@ -132,7 +133,10 @@ export async function scanSource(source: string): Promise<ScanPreview> {
 }
 
 export async function proposeStructure(source: string, configPath: string): Promise<Proposal> {
-  if (!isTauri()) return { ...structuredClone(demoProposal), source };
+  if (!isTauri()) {
+    demoApplied = null;
+    return { ...structuredClone(demoProposal), source };
+  }
   return invoke<Proposal>("propose_structure", {
     request: { configPath, source, recursiveRoots: [], maxFolders: 8 },
   });
@@ -182,4 +186,44 @@ export async function previewPlan(): Promise<PlanPreview> {
     return preview;
   }
   return invoke<PlanPreview>("preview_plan");
+}
+
+export async function applyReviewedPlan(planSha256: string): Promise<ApplyResult> {
+  if (!isTauri()) {
+    if (planSha256 !== demoPlan.sha256) throw new Error("The confirmed plan no longer matches the reviewed plan.");
+    if (demoApplied) throw new Error("The reviewed plan has already been applied.");
+    await new Promise((resolve) => window.setTimeout(resolve, 180));
+    demoApplied = {
+      state: "completed",
+      sessionId: "demo-apply-session",
+      planSha256,
+      plannedFiles: demoPlan.plan.entries.length,
+      movedFiles: demoPlan.plan.entries.length,
+      createdDirectories: demoPlan.plan.directories.length,
+      conflicts: 0,
+      runDirectory: "/Users/you/Library/Application Support/dev.yutakobayashidev.temari/workflows/demo",
+      planPath: "/Users/you/Library/Application Support/dev.yutakobayashidev.temari/workflows/demo/plan.json",
+      journalPath: "/Users/you/Library/Application Support/dev.yutakobayashidev.temari/workflows/demo/apply.json",
+    };
+    return structuredClone(demoApplied);
+  }
+  return invoke<ApplyResult>("apply_reviewed_plan", { request: { planSha256 } });
+}
+
+export async function undoAppliedPlan(applySessionId: string): Promise<UndoResult> {
+  if (!isTauri()) {
+    if (!demoApplied || demoApplied.sessionId !== applySessionId) throw new Error("There is no matching applied session to undo.");
+    await new Promise((resolve) => window.setTimeout(resolve, 180));
+    const result: UndoResult = {
+      state: "completed",
+      applySessionId,
+      restoredFiles: demoApplied.movedFiles,
+      removedDirectories: demoApplied.createdDirectories,
+      conflicts: 0,
+      journalPath: `${demoApplied.runDirectory}/undo.json`,
+    };
+    demoApplied = null;
+    return result;
+  }
+  return invoke<UndoResult>("undo_applied_plan", { request: { applySessionId } });
 }

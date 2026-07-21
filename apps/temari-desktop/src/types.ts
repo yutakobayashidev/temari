@@ -72,3 +72,25 @@ export type PlanPreview = {
   plan: Plan;
   sha256: string;
 };
+
+export type ApplyResult = {
+  state: "running" | "completed" | "failed" | "partial_failure";
+  sessionId: string;
+  planSha256: string;
+  plannedFiles: number;
+  movedFiles: number;
+  createdDirectories: number;
+  conflicts: number;
+  runDirectory: string;
+  planPath: string;
+  journalPath: string;
+};
+
+export type UndoResult = {
+  state: "running" | "completed" | "partial_failure";
+  applySessionId: string;
+  restoredFiles: number;
+  removedDirectories: number;
+  conflicts: number;
+  journalPath: string;
+};
