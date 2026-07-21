@@ -71,7 +71,7 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
 
-        /// Maximum number of folders the model may propose.
+        /// Maximum physical directories, including parent path prefixes.
         #[arg(long, default_value_t = 12)]
         max_folders: usize,
 
@@ -155,7 +155,7 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
 
-        /// Maximum number of folders the model may propose.
+        /// Maximum physical directories, including parent path prefixes.
         #[arg(long, default_value_t = 12)]
         max_folders: usize,
 

@@ -32,6 +32,8 @@ temari [global options] history list|show ...
 - Always scans regular files directly below the source. Each repeated `--include-subtree` adds one source-relative directory recursively; `.` selects the complete tree.
 - Never follows symlink files or directories. Rejects overlapping recursive roots and non-portable paths.
 - Sends a representative sample of at most 100 relative paths, extensions, and opaque file IDs.
+- Treats `--max-folders` as a ceiling for all generated physical directories, including implicit parent path prefixes. Generated paths have at most two components.
+- Prefers broad, reusable destinations and asks the model to group date, version, sequence, and half-year variants. A structurally invalid response receives at most one corrective retry.
 - Produces a version 2 `Proposal` containing the canonical source path, immutable `ScanScope`, sample count, relative hierarchy suggestions, and descriptions.
 - Does not create folders or assign executable destination paths.
 
@@ -39,7 +41,7 @@ temari [global options] history list|show ...
 
 - Read-only with respect to the organized source.
 - Previews the proposed hierarchy and asks for confirmation when stdin and stderr are terminals. Edit the proposal JSON before approval when hierarchy changes are needed.
-- Validates normalized relative paths and assigns opaque destination IDs.
+- Validates normalized relative paths and assigns opaque destination IDs. Generation limits do not constrain a hierarchy explicitly edited and approved by the user.
 - Adds deterministic `Others/*` destinations for PDF, spreadsheet, image, video, audio, archive, code, presentation, and miscellaneous fallbacks. Automatically added fallbacks are visible during approval but local-only during classification; an identically named user proposal is reused and remains model-visible.
 - Produces a version 3 `FolderSet` that preserves the approved scope and identifies model-visible and fallback destinations.
 - In non-interactive mode, fails unless `--accept-all` is supplied.

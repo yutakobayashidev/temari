@@ -64,6 +64,17 @@ If an apply journal remains `running` after a crash, reconcile and continue it e
 $ cargo run -p temari-cli -- resume downloads.apply.json
 ```
 
+## Desktop proof of concept
+
+`apps/temari-desktop` contains a Tauri 2 proof of concept for Linux and macOS. The native app uses `temari-core` to select and scan a source, request a folder proposal from the configured model, edit it, and approve it locally. It deliberately exposes no plan or apply command yet, so the preview cannot move files.
+
+```console
+$ corepack pnpm --dir apps/temari-desktop install
+$ corepack pnpm --dir apps/temari-desktop tauri dev
+```
+
+The model configuration path is editable in the window and defaults to `.temari.toml`. Running `pnpm dev` without Tauri opens an explicitly simulated browser preview for UI development; it does not access the filesystem or model. See [the desktop POC notes](docs/desktop-poc.md) for its command boundary and verification steps.
+
 ## Foreground monitoring
 
 Register an approved folder set, optionally add deterministic basename rules, then run a read-only check:
@@ -141,7 +152,7 @@ Commands:
 
 The workflow follows five explicit trust boundaries:
 
-1. `propose`: the model suggests a folder hierarchy from file-name metadata.
+1. `propose`: the model suggests a compact folder hierarchy from file-name metadata. Generated paths default to at most two components, and `--max-folders` bounds all physical directories including implicit parents.
 2. `approve`: the user edits and approves the proposal; local code assigns opaque destination IDs, validates every relative path, and adds visible local-only extension fallbacks.
 3. `plan`: local rules may select approved IDs before the model classifies remaining names; ambiguous files optionally use bounded extracted text, and unresolved files use approved local fallback IDs. The command writes a validated, read-only plan with its classification basis and optional rule ID per move.
 4. `apply`: after confirmation, local code creates only required approved directories and performs validated moves while atomically updating an audit journal.
