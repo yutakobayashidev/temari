@@ -48,7 +48,7 @@ temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PA
 - Uses deterministic approved fallback IDs when content is disabled, unsupported, oversized, empty, or cannot be extracted. Model and endpoint failures remain errors rather than silently falling back.
 - Rejects a `FolderSet` created for a different canonical source path.
 - Uses the scope stored in the `FolderSet`; callers cannot replace it at planning time. Approved destination subtrees are excluded from scanning.
-- Produces a version 3 `Plan` containing scope, relative source paths, approved folders, local SHA-256 and filesystem identities, required directories, collision-resolved destinations, classification basis, and optional reasoning.
+- Produces a version 4 `Plan` containing scope, relative source paths, approved folders, local SHA-256 and filesystem identities, required directories, collision-resolved destinations, classification basis, optional local rule ID, and optional reasoning.
 - Hashes are computed locally and are never sent to the model.
 - Extracted text and model connectivity are never written to the Plan.
 
@@ -59,6 +59,7 @@ temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PA
 - Requires `--yes` when no TTY is available.
 - Revalidates root containment, symlinks, fingerprints, destination types, permissions, and collisions immediately before each operation.
 - Revalidates every existing source-parent component before nested moves. Empty source directories are never removed.
+- Acquires an exclusive advisory lock on the canonical source before preflight and holds it through journal finalization.
 - Requires a new persistent `--out` path outside the organized source; `--out -` and existing paths are rejected.
 - Creates missing directories lazily, never overwrites, and atomically checkpoints `pending`, in-progress, and completed outcomes.
 - Finalizes an immutable `ApplySession`; partial failure remains honestly recorded and returns a failure exit.

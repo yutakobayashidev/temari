@@ -1,6 +1,7 @@
 use std::{collections::HashSet, fs, path::Path};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::Error;
 
@@ -302,6 +303,11 @@ impl FolderSet {
         }
         Ok(())
     }
+
+    pub fn sha256(&self) -> Result<String, Error> {
+        self.validate()?;
+        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(self)?)))
+    }
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, Error> {
@@ -421,5 +427,15 @@ mod tests {
             .retain(|folder| folder.fallback != Some(FallbackCategory::Images));
 
         assert!(folder_set.validate().is_err());
+    }
+
+    #[test]
+    fn folder_set_digest_is_stable_and_covers_approved_content() {
+        let folder_set = proposal(&["Documents"]).approve().unwrap();
+        assert_eq!(folder_set.sha256().unwrap(), folder_set.sha256().unwrap());
+
+        let mut changed = folder_set.clone();
+        changed.folders[0].description = "Changed description".into();
+        assert_ne!(folder_set.sha256().unwrap(), changed.sha256().unwrap());
     }
 }

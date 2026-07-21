@@ -35,6 +35,7 @@ fn write_plan(source: &Path, path: &Path) -> Plan {
             destination_id: "d000001".into(),
             reasoning: None,
             basis: ClassificationBasis::Name,
+            rule_id: None,
         }],
     )
     .unwrap();

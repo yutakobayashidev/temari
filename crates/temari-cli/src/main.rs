@@ -375,8 +375,8 @@ fn generate_plan(
     )?;
     if show_progress {
         eprintln!(
-            "Classification: {} by name, {} by content, {} by extension fallback",
-            summary.by_name, summary.by_content, summary.by_fallback
+            "Classification: {} by rule, {} by name, {} by content, {} by extension fallback",
+            summary.by_rule, summary.by_name, summary.by_content, summary.by_fallback
         );
     }
     Ok(build_plan(
@@ -812,6 +812,7 @@ fn render_plan(plan: &Plan, apply_path: &Path) -> Result<()> {
             ClassificationBasis::Name => "name",
             ClassificationBasis::Content => "content",
             ClassificationBasis::ExtensionFallback => "fallback",
+            ClassificationBasis::Rule => "rule",
         };
         eprintln!(
             "  [{basis}] move {} -> {}",
@@ -829,9 +830,18 @@ fn render_plan(plan: &Plan, apply_path: &Path) -> Result<()> {
         .iter()
         .filter(|entry| entry.classification_basis == ClassificationBasis::Content)
         .count();
-    let by_fallback = plan.entries.len() - by_name - by_content;
+    let by_fallback = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.classification_basis == ClassificationBasis::ExtensionFallback)
+        .count();
+    let by_rule = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.classification_basis == ClassificationBasis::Rule)
+        .count();
     eprintln!(
-        "Summary: {} move(s) ({by_name} name, {by_content} content, {by_fallback} fallback), up to {} new directorie(s), no overwrites",
+        "Summary: {} move(s) ({by_rule} rule, {by_name} name, {by_content} content, {by_fallback} fallback), up to {} new directorie(s), no overwrites",
         plan.entries.len(),
         plan.directories.len()
     );

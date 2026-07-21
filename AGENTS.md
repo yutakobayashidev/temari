@@ -15,6 +15,8 @@
 - Keep recursive scope explicit and artifact-bound. Root files are always in scope; traverse only approved `ScanScope` subtrees, never follow symlinks, and exclude approved destination subtrees from planning.
 - Treat `Proposal`, `FolderSet`, `Plan`, `ApplySession`, and `UndoSession` as separate versioned artifacts. Keep model connectivity out of those artifacts and approved folders out of application configuration.
 - Keep durable apply and undo state in atomic JSON journals. Add SQLite only when monitoring, cross-session queries, or GUI state require it; do not move immutable workflow artifacts into the database.
+- Serialize filesystem writers with an advisory lock on the canonical source directory. Monitoring may reuse a held `SourceLock`; never acquire the same source lock recursively.
+- Local rules match file basenames deterministically and select approved opaque IDs only. Persist the rule ID in the Plan; rules may target local-only approved fallbacks because they are user-authored, not model output.
 - Preserve the canonical `propose -> approve -> plan -> apply -> undo` command boundaries. The interactive `organize` command must orchestrate the same application services.
 - Keep `organize` as TTY-only orchestration; non-interactive callers use the primitive commands. Preserve both destination approval and exact apply confirmation.
 - Resume may update only a `running` ApplySession after conservative filesystem reconciliation. Completed, failed, and partial-failure sessions are immutable, and undo must reject a running session.

@@ -4,15 +4,18 @@ mod classification;
 mod config;
 mod extraction;
 mod filesystem;
+mod lock;
 mod model;
 mod plan;
+mod rules;
 mod scan;
+mod state;
 
 pub use apply::{
     ApplySession, ApplyState, DirectoryOutcome, DirectoryRecord, MoveOutcome, MoveRecord,
     UndoDirectoryOutcome, UndoDirectoryRecord, UndoMoveOutcome, UndoMoveRecord, UndoSession,
-    UndoState, apply_plan, preflight_apply, preflight_resume, preflight_undo, resume_apply_session,
-    undo_session,
+    UndoState, apply_plan, apply_plan_with_lock, preflight_apply, preflight_resume, preflight_undo,
+    resume_apply_session, resume_apply_session_with_lock, undo_session, undo_session_with_lock,
 };
 pub use artifact::{
     ApprovedFolder, FallbackCategory, FolderProposal, FolderSet, Proposal, ScanScope,
@@ -24,12 +27,15 @@ pub use classification::{
 pub use config::{Config, ContentPolicy, ExtractionConfig, ModelConfig, OcrConfig, PrivacyConfig};
 pub use extraction::LocalContentExtractor;
 pub use filesystem::{FileFingerprint, FsIdentity};
+pub use lock::SourceLock;
 pub use model::{
     Classification, ClassificationBasis, Classifier, ContentCandidate, FolderProposer,
     NameClassification, NameDecision, OpenAiCompatibleModel,
 };
 pub use plan::{Plan, PlanEntry, build_plan};
+pub use rules::{LocalRule, RuleMatch, RuleSet};
 pub use scan::{FileCandidate, scan_directory, select_representative_files};
+pub use state::{MonitorRecord, MonitoringRun, ProcessedFileRecord, RunState, StateStore};
 
 use thiserror::Error;
 
@@ -63,4 +69,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("model response was rejected: {0}")]
     InvalidModelResponse(String),
+    #[error("state database error: {0}")]
+    StateDatabase(#[from] rusqlite::Error),
+    #[error("invalid monitoring state: {0}")]
+    InvalidState(String),
 }

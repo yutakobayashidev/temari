@@ -48,6 +48,7 @@ pub struct PlanEntry {
     pub destination_path: String,
     pub reasoning: Option<String>,
     pub classification_basis: ClassificationBasis,
+    pub rule_id: Option<String>,
 }
 
 impl Plan {
@@ -62,9 +63,9 @@ impl Plan {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        if self.version != 3 {
+        if self.version != 4 {
             return Err(Error::InvalidArtifact(format!(
-                "unsupported plan version {}; expected 3",
+                "unsupported plan version {}; expected 4",
                 self.version
             )));
         }
@@ -176,6 +177,23 @@ impl Plan {
                     )));
                 }
                 _ => {}
+            }
+            match (entry.classification_basis, entry.rule_id.as_deref()) {
+                (ClassificationBasis::Rule, Some(rule_id))
+                    if !rule_id.trim().is_empty() && !rule_id.chars().any(char::is_control) => {}
+                (ClassificationBasis::Rule, _) => {
+                    return Err(Error::InvalidArtifact(format!(
+                        "rule-classified plan entry {:?} must contain a valid rule ID",
+                        entry.file_id
+                    )));
+                }
+                (_, None) => {}
+                (_, Some(_)) => {
+                    return Err(Error::InvalidArtifact(format!(
+                        "non-rule plan entry {:?} must not contain a rule ID",
+                        entry.file_id
+                    )));
+                }
             }
             if !destinations.insert(entry.destination_path.as_str()) {
                 return Err(Error::InvalidArtifact(format!(
@@ -312,6 +330,7 @@ pub fn build_plan(
             destination_path,
             reasoning: classification.reasoning,
             classification_basis: classification.basis,
+            rule_id: classification.rule_id,
         });
     }
 
@@ -326,7 +345,7 @@ pub fn build_plan(
         ));
     }
     let plan = Plan {
-        version: 3,
+        version: 4,
         source: source_text.to_owned(),
         source_identity,
         scope: scope.clone(),
@@ -511,6 +530,7 @@ mod tests {
             destination_id: destination_id.into(),
             reasoning: None,
             basis: ClassificationBasis::Name,
+            rule_id: None,
         }
     }
 
@@ -602,6 +622,34 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("expected 1"));
+    }
+
+    #[test]
+    fn records_and_validates_local_rule_identity() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("report.txt"), b"report").unwrap();
+        let folders = folders();
+        let plan = build_plan(
+            root.path(),
+            &ScanScope::default(),
+            &[file("f1", "report.txt")],
+            &folders,
+            vec![Classification {
+                file_id: "f1".into(),
+                destination_id: "d000001".into(),
+                reasoning: None,
+                basis: ClassificationBasis::Rule,
+                rule_id: Some("r1".into()),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(plan.version, 4);
+        assert_eq!(plan.entries[0].rule_id.as_deref(), Some("r1"));
+
+        let mut invalid = plan;
+        invalid.entries[0].rule_id = None;
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

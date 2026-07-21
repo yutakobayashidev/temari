@@ -36,11 +36,16 @@ impl NamePass {
     pub fn needs_content(&self) -> &[FileCandidate] {
         &self.needs_content
     }
+
+    pub fn extend_resolved(&mut self, classifications: impl IntoIterator<Item = Classification>) {
+        self.resolved.extend(classifications);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClassificationSummary {
     pub classifications: Vec<Classification>,
+    pub by_rule: usize,
     pub by_name: usize,
     pub by_content: usize,
     pub by_fallback: usize,
@@ -132,8 +137,6 @@ pub fn complete_classification<C: Classifier, E: ContentExtractor>(
         mut resolved,
         needs_content,
     } = name_pass;
-    let by_name = resolved.len();
-
     let mut extracted = Vec::new();
     let mut fallback_files = Vec::new();
     if options.content_decision == ContentDecision::Extract {
@@ -152,11 +155,9 @@ pub fn complete_classification<C: Classifier, E: ContentExtractor>(
         fallback_files = needs_content;
     }
 
-    let mut by_content = 0;
     for (index, batch) in extracted.chunks(options.content_batch_size).enumerate() {
         let mut classifications = classifier.classify_contents(batch, &model_folders)?;
         validate_content_batch(batch, &model_folders, &classifications)?;
-        by_content += classifications.len();
         resolved.append(&mut classifications);
         delay_between_batches(
             index,
@@ -181,14 +182,32 @@ pub fn complete_classification<C: Classifier, E: ContentExtractor>(
             destination_id: folder.id.clone(),
             reasoning: Some(format!("Local extension fallback for .{}", file.extension)),
             basis: ClassificationBasis::ExtensionFallback,
+            rule_id: None,
         });
     }
-    let by_fallback = resolved.len() - by_name - by_content;
     validate_complete(files, folders, &resolved)?;
     resolved.sort_by(|left, right| left.file_id.cmp(&right.file_id));
 
+    let by_rule = resolved
+        .iter()
+        .filter(|item| item.basis == ClassificationBasis::Rule)
+        .count();
+    let by_name = resolved
+        .iter()
+        .filter(|item| item.basis == ClassificationBasis::Name)
+        .count();
+    let by_content = resolved
+        .iter()
+        .filter(|item| item.basis == ClassificationBasis::Content)
+        .count();
+    let by_fallback = resolved
+        .iter()
+        .filter(|item| item.basis == ClassificationBasis::ExtensionFallback)
+        .count();
+
     Ok(ClassificationSummary {
         classifications: resolved,
+        by_rule,
         by_name,
         by_content,
         by_fallback,
@@ -234,6 +253,7 @@ fn validate_name_batch(
                     destination_id,
                     reasoning: classification.reasoning,
                     basis: ClassificationBasis::Name,
+                    rule_id: None,
                 });
             }
             NameDecision::NeedsContent => needs_content.push((*file).clone()),
@@ -446,6 +466,7 @@ mod tests {
                     destination_id: folders[0].id.clone(),
                     reasoning: None,
                     basis: ClassificationBasis::Content,
+                    rule_id: None,
                 })
                 .collect())
         }

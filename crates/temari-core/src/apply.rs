@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use crate::{
-    Error, FileFingerprint, FsIdentity, Plan,
+    Error, FileFingerprint, FsIdentity, Plan, SourceLock,
     artifact::normalize_relative_path,
     filesystem::{
         canonical_directory, checked_join, fingerprint, identity, io_error, path_exists,
@@ -268,6 +268,16 @@ impl UndoSession {
 }
 
 pub fn apply_plan(plan: &Plan, journal_path: &Path) -> Result<ApplySession, Error> {
+    let lock = SourceLock::acquire(Path::new(&plan.source))?;
+    apply_plan_with_lock(plan, journal_path, &lock)
+}
+
+pub fn apply_plan_with_lock(
+    plan: &Plan,
+    journal_path: &Path,
+    lock: &SourceLock,
+) -> Result<ApplySession, Error> {
+    lock.validate_source(&plan.source, &plan.source_identity)?;
     preflight_apply(plan, journal_path)?;
     let mut session = ApplySession {
         version: 2,
@@ -304,7 +314,17 @@ pub fn apply_plan(plan: &Plan, journal_path: &Path) -> Result<ApplySession, Erro
 }
 
 pub fn resume_apply_session(journal_path: &Path) -> Result<ApplySession, Error> {
+    let session = ApplySession::load(journal_path)?;
+    let lock = SourceLock::acquire(Path::new(&session.source))?;
+    resume_apply_session_with_lock(journal_path, &lock)
+}
+
+pub fn resume_apply_session_with_lock(
+    journal_path: &Path,
+    lock: &SourceLock,
+) -> Result<ApplySession, Error> {
     let mut session = ApplySession::load(journal_path)?;
+    lock.validate_source(&session.source, &session.source_identity)?;
     preflight_resume(&session, journal_path)?;
     reconcile_running_session(&mut session, journal_path)?;
     if session.state == ApplyState::Running {
@@ -390,6 +410,16 @@ fn continue_apply(session: &mut ApplySession, journal_path: &Path) -> Result<(),
 }
 
 pub fn undo_session(apply: &ApplySession, journal_path: &Path) -> Result<UndoSession, Error> {
+    let lock = SourceLock::acquire(Path::new(&apply.source))?;
+    undo_session_with_lock(apply, journal_path, &lock)
+}
+
+pub fn undo_session_with_lock(
+    apply: &ApplySession,
+    journal_path: &Path,
+    lock: &SourceLock,
+) -> Result<UndoSession, Error> {
+    lock.validate_source(&apply.source, &apply.source_identity)?;
     preflight_undo(apply, journal_path)?;
     let root = PathBuf::from(&apply.source);
     let mut undo = UndoSession {
@@ -1089,6 +1119,7 @@ mod tests {
                 destination_id: "d000001".into(),
                 reasoning: None,
                 basis: ClassificationBasis::Name,
+                rule_id: None,
             }],
         )
         .unwrap()
@@ -1125,6 +1156,7 @@ mod tests {
                 destination_id: "d000001".into(),
                 reasoning: None,
                 basis: ClassificationBasis::Name,
+                rule_id: None,
             }],
         )
         .unwrap()
@@ -1166,6 +1198,22 @@ mod tests {
         assert!(apply_plan(&plan, &journal).is_err());
         assert!(!journal.exists());
         assert!(!root.path().join("Documents").exists());
+    }
+
+    #[test]
+    fn rejects_competing_source_lock_and_accepts_an_existing_lock() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        let plan = plan(root.path());
+        let apply_path = journals.path().join("apply.json");
+        let lock = SourceLock::acquire(root.path()).unwrap();
+
+        let error = apply_plan(&plan, &apply_path).unwrap_err();
+        assert!(error.to_string().contains("already locked"));
+        assert!(!apply_path.exists());
+
+        let session = apply_plan_with_lock(&plan, &apply_path, &lock).unwrap();
+        assert_eq!(session.state, ApplyState::Completed);
     }
 
     #[test]

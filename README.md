@@ -13,6 +13,7 @@ Proposal, approval, and planning are read-only. Filesystem changes require a sep
 - Root-level files are always included. Recursive traversal is opt-in through artifact-bound source-relative subtrees, and approved destination subtrees are excluded to prevent reprocessing.
 - Plans contain local SHA-256, size, device, and inode fingerprints. These values and raw files are never sent to the model. Extracted text is neither logged nor persisted.
 - Apply revalidates the source root, fingerprints, real directory components, and unoccupied destinations before mutation. It never overwrites.
+- Apply, resume, and undo hold an exclusive advisory lock on the canonical source directory so competing writers fail before mutation.
 - Undo restores only recorded moves whose identity and content still match, and removes only session-created directories that remain empty.
 - Every model endpoint hostname must appear in an explicit allowlist.
 - API keys are read from a configured environment variable and are never stored in the configuration file.
@@ -113,7 +114,7 @@ The workflow follows five explicit trust boundaries:
 
 1. `propose`: the model suggests a folder hierarchy from file-name metadata.
 2. `approve`: the user edits and approves the proposal; local code assigns opaque destination IDs, validates every relative path, and adds visible local-only extension fallbacks.
-3. `plan`: the model classifies names into model-visible IDs, ambiguous files optionally use bounded extracted text, and unresolved files use approved local fallback IDs. The command writes a validated, read-only plan with a classification basis per move.
+3. `plan`: local rules may select approved IDs before the model classifies remaining names; ambiguous files optionally use bounded extracted text, and unresolved files use approved local fallback IDs. The command writes a validated, read-only plan with its classification basis and optional rule ID per move.
 4. `apply`: after confirmation, local code creates only required approved directories and performs validated moves while atomically updating an audit journal.
 5. `undo`: local code conservatively reverses recorded moves and removes only unchanged, empty directories created by that apply session.
 

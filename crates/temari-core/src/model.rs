@@ -13,6 +13,8 @@ pub struct Classification {
     #[serde(default)]
     pub reasoning: Option<String>,
     pub basis: ClassificationBasis,
+    #[serde(default)]
+    pub rule_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -21,6 +23,7 @@ pub enum ClassificationBasis {
     Name,
     Content,
     ExtensionFallback,
+    Rule,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -226,6 +229,7 @@ impl Classifier for OpenAiCompatibleModel {
                 destination_id: classification.destination_id,
                 reasoning: classification.reasoning,
                 basis: ClassificationBasis::Content,
+                rule_id: None,
             })
             .collect())
     }
