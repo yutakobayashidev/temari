@@ -7,6 +7,7 @@ mod filesystem;
 mod lock;
 mod managed;
 mod managed_cycle;
+mod managed_service;
 mod model;
 mod monitor;
 mod plan;
@@ -39,16 +40,20 @@ pub use managed::{
     ManagedEntryFingerprint, ManagedMoveOutcome, ManagedMoveRecord, ManagedSetupMove,
     ManagedSetupPlan, ManagedSetupSession, ManagedSetupState, ManagedSetupUndoSession,
     ManagedSetupUndoState, ManagedUndoAreaOutcome, ManagedUndoAreaRecord, ManagedUndoMoveOutcome,
-    ManagedUndoMoveRecord, apply_managed_setup, apply_managed_setup_with_lock,
-    build_managed_setup_plan, fingerprint_directory, preflight_managed_resume,
-    preflight_managed_setup, preflight_managed_undo, resume_managed_setup,
-    resume_managed_setup_with_lock, undo_managed_setup, undo_managed_setup_with_lock,
+    ManagedUndoMoveRecord, apply_managed_directory_adoption, apply_managed_setup,
+    apply_managed_setup_with_lock, build_managed_directory_adoption_plan, build_managed_setup_plan,
+    fingerprint_directory, preflight_managed_resume, preflight_managed_setup,
+    preflight_managed_undo, resume_managed_setup, resume_managed_setup_with_lock,
+    undo_managed_directory_adoption, undo_managed_setup, undo_managed_setup_with_lock,
 };
 pub use managed_cycle::{
     INBOX_DIRECTORY, KEPT_DIRECTORY, LIBRARY_DIRECTORY, ManagedReprocessArea,
     ManagedReprocessSelection, STAGE_TO_INBOX_RULE_ID, build_reprocess_to_inbox_plan,
     build_stage_to_inbox_plan, filter_inbox_candidates, inbox_file_candidates, library_folder_set,
     reprocess_file_candidates, root_file_candidates,
+};
+pub use managed_service::{
+    ManagedActivationResult, ManagedCycleResult, ManagedDirectoryAdoption, ManagedService,
 };
 pub use model::{
     Classification, ClassificationBasis, Classifier, ContentCandidate, FolderProposer,

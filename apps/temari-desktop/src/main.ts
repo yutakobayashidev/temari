@@ -1,426 +1,87 @@
 import "./styles.css";
-import { applyReviewedPlan, approveStructure, chooseConfig, chooseSource, defaultConfigLocation, previewPlan, proposeStructure, scanSource, undoAppliedPlan } from "./api";
-import type { ApplyResult, ClassificationBasis, FolderProposal, FolderSet, PlanPreview, Proposal, ScanPreview, UndoResult } from "./types";
+import {
+  applyManagedWorkspace,
+  chooseConfig,
+  chooseSource,
+  chooseTemariExecutable,
+  defaultConfigLocation,
+  disableManagedSchedule,
+  enableManagedSchedule,
+  getManagedHistory,
+  getManagedSchedule,
+  getManagedWorkspace,
+  listManagedWorkspaces,
+  previewManagedWorkspace,
+  proposeManagedWorkspace,
+  reprocessManagedFiles,
+  runManagedWorkspace,
+  setManagedWorkspaceEnabled,
+  undoManagedMove,
+  undoManagedRun,
+} from "./api";
+import type {
+  ManagedMove,
+  ManagedWorkspace,
+  ManagedWorkspaceStatus,
+  ReprocessArea,
+  ScheduleStatus,
+  SetupPreview,
+  SetupProposal,
+} from "./types";
 
-type Stage = "source" | "scan" | "shape" | "approve" | "plan" | "apply";
-type Mutation = "idle" | "applying" | "applied" | "undoing" | "undone";
+type SetupStep = "source" | "structure" | "preview";
+type Notice = { tone: "success" | "error"; message: string };
+type PendingConfirmation = {
+  title: string;
+  copy: string;
+  details: Array<[string, string]>;
+  confirmLabel: string;
+  action: () => Promise<void>;
+};
 
 type AppState = {
-  stage: Stage;
-  source: string | null;
-  scan: ScanPreview | null;
-  proposal: Proposal | null;
-  approved: FolderSet | null;
-  planPreview: PlanPreview | null;
-  applyResult: ApplyResult | null;
-  undoResult: UndoResult | null;
-  mutation: Mutation;
-  busy: boolean;
-  error: string | null;
+  workspaces: ManagedWorkspace[];
+  selectedId: string | null;
+  status: ManagedWorkspaceStatus | null;
+  schedule: ScheduleStatus | null;
+  history: ManagedMove[];
   configPath: string;
   defaultConfigPath: string;
+  scheduleExecutablePath: string;
+  busy: boolean;
+  notice: Notice | null;
+  setupOpen: boolean;
+  setupStep: SetupStep;
+  setupSource: string;
+  proposal: SetupProposal | null;
+  setupPreview: SetupPreview | null;
+  reprocessOpen: boolean;
+  pendingConfirmation: PendingConfirmation | null;
 };
 
 const state: AppState = {
-  stage: "source",
-  source: null,
-  scan: null,
-  proposal: null,
-  approved: null,
-  planPreview: null,
-  applyResult: null,
-  undoResult: null,
-  mutation: "idle",
-  busy: false,
-  error: null,
+  workspaces: [],
+  selectedId: null,
+  status: null,
+  schedule: null,
+  history: [],
   configPath: "",
   defaultConfigPath: "",
+  scheduleExecutablePath: "",
+  busy: true,
+  notice: null,
+  setupOpen: false,
+  setupStep: "source",
+  setupSource: "",
+  proposal: null,
+  setupPreview: null,
+  reprocessOpen: false,
+  pendingConfirmation: null,
 };
 
-const app = document.querySelector<HTMLDivElement>("#app");
-if (!app) throw new Error("App root not found");
-
-app.innerHTML = `
-  <div class="shell">
-    <header class="topbar">
-      <a class="wordmark" href="#" aria-label="Temari home">
-        <span class="wordmark-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-        <span>temari</span>
-      </a>
-      <div class="privacy-note"><span class="privacy-dot" aria-hidden="true"></span> Local-first session</div>
-    </header>
-
-    <aside class="stage-rail" aria-label="Organization stages">
-      <p class="rail-label">Workflow</p>
-      <ol>
-        <li data-stage="source"><span>1</span><div><strong>Source</strong><small>Choose a folder</small></div></li>
-        <li data-stage="scan"><span>2</span><div><strong>Scan</strong><small>Read names locally</small></div></li>
-        <li data-stage="shape"><span>3</span><div><strong>Shape</strong><small>Review the structure</small></div></li>
-        <li data-stage="approve"><span>4</span><div><strong>Approve</strong><small>Trust the destinations</small></div></li>
-        <li data-stage="plan"><span>5</span><div><strong>Plan</strong><small>Review every move</small></div></li>
-        <li data-stage="apply"><span>6</span><div><strong>Apply</strong><small>Move with a journal</small></div></li>
-      </ol>
-      <div class="local-boundary">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 4.5 5.2v5.9c0 4.9 3.1 9.4 7.5 10.9 4.4-1.5 7.5-6 7.5-10.9V5.2L12 2Zm0 3.1 4.5 1.9v4.1c0 3.4-1.8 6.6-4.5 7.8-2.7-1.2-4.5-4.4-4.5-7.8V7L12 5.1Z"/></svg>
-        <p><strong>Your boundary</strong>Names stay local until you request a proposal.</p>
-      </div>
-    </aside>
-
-    <main class="workspace">
-      <section class="canvas" aria-labelledby="workspace-title">
-        <div class="canvas-heading">
-          <div>
-            <p class="eyebrow" id="stage-kicker">Start here</p>
-            <h1 id="workspace-title">Shape a place for everything.</h1>
-          </div>
-          <div class="file-count" id="file-count" hidden><strong>0</strong><span>files considered</span></div>
-        </div>
-        <div class="thread-stage" id="thread-stage">
-          <svg class="thread-orbit" viewBox="0 0 640 560" role="img" aria-label="Proposed folder structure">
-            <defs>
-              <filter id="soft"><feGaussianBlur stdDeviation="0.7" /></filter>
-            </defs>
-            <circle class="orbit orbit-a" cx="320" cy="280" r="198" />
-            <circle class="orbit orbit-b" cx="320" cy="280" r="145" />
-            <ellipse class="thread thread-a" cx="320" cy="280" rx="220" ry="100" transform="rotate(24 320 280)" />
-            <ellipse class="thread thread-b" cx="320" cy="280" rx="214" ry="112" transform="rotate(-31 320 280)" />
-            <ellipse class="thread thread-c" cx="320" cy="280" rx="114" ry="222" transform="rotate(61 320 280)" />
-          </svg>
-          <div class="center-action" id="center-action">
-            <button class="source-button" id="choose-source" type="button">
-              <span class="button-icon" aria-hidden="true">⌁</span>
-              <span><strong>Choose a folder</strong><small>Nothing changes on disk</small></span>
-            </button>
-          </div>
-          <div class="folder-nodes" id="folder-nodes"></div>
-        </div>
-        <div class="source-strip" id="source-strip" hidden>
-          <span class="source-icon" aria-hidden="true">⌂</span>
-          <span><small>Source</small><strong id="source-path"></strong></span>
-          <button id="change-source" class="text-button" type="button">Change</button>
-        </div>
-        <div class="config-strip" id="config-strip" hidden>
-          <label for="config-path">Model config</label>
-          <input id="config-path" readonly placeholder="No configuration selected" aria-describedby="config-help" />
-          <button id="choose-config" class="text-button" type="button">Choose</button>
-          <small id="config-help">Select the TOML file used for model access.</small>
-        </div>
-      </section>
-
-      <aside class="review" aria-labelledby="review-title">
-        <div class="review-header">
-          <p class="eyebrow">Review panel</p>
-          <h2 id="review-title">No proposal yet</h2>
-          <p id="review-copy">Choose a folder, inspect the local scan, then ask your configured model for a structure.</p>
-        </div>
-        <div class="scan-summary" id="scan-summary" hidden></div>
-        <form class="folder-editor" id="folder-editor" hidden>
-          <div class="editor-heading"><span>Destinations</span><button class="text-button" id="add-folder" type="button">+ Add folder</button></div>
-          <div id="folder-fields"></div>
-        </form>
-        <section class="plan-preview" id="plan-preview" aria-label="Move plan" hidden>
-          <div class="plan-summary" id="plan-summary"></div>
-          <div class="plan-entries" id="plan-entries"></div>
-          <details class="directory-details" id="directory-details">
-            <summary>Folders to create</summary>
-            <ul id="directory-list"></ul>
-          </details>
-        </section>
-        <div class="status-message" id="status-message" role="status" aria-live="polite" hidden></div>
-        <div class="review-actions">
-          <button class="primary-action" id="main-action" type="button" disabled>Select a source</button>
-          <button class="apply-action" id="apply-action" type="button" disabled>
-            <span>Apply moves</span><small>Review &amp; confirm</small>
-          </button>
-        </div>
-      </aside>
-    </main>
-  </div>
-  <dialog class="confirm-dialog" id="confirm-dialog" aria-labelledby="confirm-title">
-    <form method="dialog">
-      <button class="dialog-close" value="cancel" aria-label="Cancel">×</button>
-      <p class="eyebrow" id="confirm-kicker">Final confirmation</p>
-      <h2 id="confirm-title">Apply reviewed moves?</h2>
-      <p id="confirm-copy"></p>
-      <dl id="confirm-details"></dl>
-      <div class="dialog-actions">
-        <button class="dialog-cancel" value="cancel" autofocus>Cancel</button>
-        <button class="dialog-confirm" id="dialog-confirm" type="button">Apply moves</button>
-      </div>
-    </form>
-  </dialog>
-`;
-
-const $ = <T extends Element>(selector: string): T => {
-  const element = document.querySelector<T>(selector);
-  if (!element) throw new Error(`Missing element: ${selector}`);
-  return element;
-};
-
-const mainAction = $("#main-action") as HTMLButtonElement;
-const chooseSourceButton = $("#choose-source") as HTMLButtonElement;
-const changeSourceButton = $("#change-source") as HTMLButtonElement;
-const chooseConfigButton = $("#choose-config") as HTMLButtonElement;
-const addFolderButton = $("#add-folder") as HTMLButtonElement;
-const configPathInput = $("#config-path") as HTMLInputElement;
-const applyAction = $("#apply-action") as HTMLButtonElement;
-const confirmDialog = $("#confirm-dialog") as HTMLDialogElement;
-const dialogConfirm = $("#dialog-confirm") as HTMLButtonElement;
-
-function setBusy(busy: boolean): void {
-  state.busy = busy;
-  mainAction.disabled = busy;
-  chooseSourceButton.disabled = busy;
-  changeSourceButton.disabled = busy;
-  chooseConfigButton.disabled = busy;
-  applyAction.disabled = busy;
-  mainAction.classList.toggle("is-busy", busy);
-}
-
-function basename(path: string): string {
-  return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
-}
-
-function render(): void {
-  document.querySelectorAll<HTMLElement>("[data-stage]").forEach((item) => {
-    const stages: Stage[] = ["source", "scan", "shape", "approve", "plan", "apply"];
-    const itemStage = item.dataset.stage as Stage;
-    item.classList.toggle("active", itemStage === state.stage);
-    item.classList.toggle("complete", stages.indexOf(itemStage) < stages.indexOf(state.stage));
-  });
-
-  const titles: Record<Stage, [string, string]> = {
-    source: ["Start here", "Shape a place for everything."],
-    scan: ["Local inventory", "See the loose threads."],
-    shape: ["Proposed structure", "Gather files into calm groups."],
-    approve: ["Locally approved", "Your structure is ready."],
-    plan: ["Read-only plan", "Follow every thread before it moves."],
-    apply: state.mutation === "undone" ? ["Undo complete", "Everything is back in place."] : ["Journaled apply", "Every move has a way home."],
-  };
-  $("#stage-kicker").textContent = titles[state.stage][0];
-  $("#workspace-title").textContent = titles[state.stage][1];
-
-  const hasSource = state.source !== null;
-  ($("#source-strip") as HTMLElement).hidden = !hasSource;
-  ($("#center-action") as HTMLElement).hidden = hasSource;
-  if (state.source) $("#source-path").textContent = state.source;
-
-  ($("#config-strip") as HTMLElement).hidden = !hasSource;
-  configPathInput.value = state.configPath;
-  configPathInput.title = state.configPath;
-  chooseConfigButton.textContent = state.configPath ? "Change" : "Choose";
-  $("#config-help").textContent = state.configPath
-    ? `Loaded for this session: ${state.configPath}`
-    : state.defaultConfigPath
-      ? `No config found at ${state.defaultConfigPath}`
-      : "Checking the standard config location…";
-  const count = state.proposal?.files_considered ?? state.scan?.fileCount;
-  const countBox = $("#file-count") as HTMLElement;
-  countBox.hidden = count === undefined;
-  if (count !== undefined) countBox.querySelector("strong")!.textContent = String(count);
-
-  renderScan();
-  renderEditor();
-  renderPlan();
-  renderNodes();
-  renderReviewText();
-  renderAction();
-  renderStatus();
-}
-
-function renderPlan(): void {
-  const preview = $("#plan-preview") as HTMLElement;
-  preview.hidden = state.planPreview === null;
-  if (!state.planPreview) return;
-
-  const { plan, sha256 } = state.planPreview;
-  const moveCount = plan.entries.length;
-  $("#plan-summary").innerHTML = `
-    <div><strong>${moveCount}</strong><span>Moves</span></div>
-    <div><strong>${plan.directories.length}</strong><span>New folders</span></div>
-    <div><strong>Safe</strong><span>Rename collisions</span></div>`;
-
-  const entries = $("#plan-entries");
-  if (moveCount === 0) {
-    entries.innerHTML = `<div class="plan-empty"><strong>No moves needed</strong><span>Every in-scope file is already inside an approved destination.</span></div>`;
-  } else {
-    entries.innerHTML = plan.entries
-      .map(
-        (entry) => `
-          <article class="plan-entry" data-destination-id="${escapeAttribute(entry.destination_id)}" tabindex="-1">
-            <div class="move-path source-move"><span>From</span><strong>${escapeHtml(entry.source_path)}</strong></div>
-            <span class="move-arrow" aria-hidden="true">↓</span>
-            <div class="move-path destination-move"><span>To</span><strong>${escapeHtml(entry.destination_path)}</strong></div>
-            <span class="basis-chip">${basisLabel(entry.classification_basis)}</span>
-          </article>`,
-      )
-      .join("");
-  }
-
-  const details = $("#directory-details") as HTMLDetailsElement;
-  details.hidden = plan.directories.length === 0;
-  details.querySelector("summary")!.textContent = `Folders to create (${plan.directories.length})`;
-  $("#directory-list").innerHTML = plan.directories.map((path) => `<li>${escapeHtml(path)}</li>`).join("");
-  details.title = `Plan ${sha256}`;
-}
-
-function basisLabel(basis: ClassificationBasis): string {
-  const labels: Record<ClassificationBasis, string> = {
-    name: "Name",
-    content: "Content",
-    extension_fallback: "Fallback",
-    rule: "Rule",
-  };
-  return labels[basis];
-}
-
-function renderScan(): void {
-  const summary = $("#scan-summary") as HTMLElement;
-  summary.hidden = state.scan === null || state.proposal !== null;
-  if (!state.scan) return;
-  const extensions = Object.entries(state.scan.extensionCounts)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 6)
-    .map(([extension, count]) => `<li><span>.${escapeHtml(extension)}</span><strong>${count}</strong></li>`)
-    .join("");
-  summary.innerHTML = `<div class="scan-total"><strong>${state.scan.fileCount}</strong><span>files found in ${escapeHtml(basename(state.scan.source))}</span></div><ul>${extensions}</ul>`;
-}
-
-function renderEditor(): void {
-  const editor = $("#folder-editor") as HTMLElement;
-  editor.hidden = state.proposal === null || state.approved !== null;
-  if (!state.proposal || state.approved) return;
-  $("#folder-fields").innerHTML = state.proposal.folders
-    .map(
-      (folder, index) => `
-        <fieldset class="folder-field" data-folder-index="${index}">
-          <legend>Destination ${index + 1}</legend>
-          <span class="folder-glyph" aria-hidden="true"></span>
-          <label><span>Path</span><input name="path" value="${escapeAttribute(folder.path)}" aria-label="Destination ${index + 1} path" /></label>
-          <label><span>Purpose</span><input name="description" value="${escapeAttribute(folder.description)}" aria-label="Destination ${index + 1} purpose" /></label>
-          <button class="remove-folder" type="button" aria-label="Remove ${escapeAttribute(folder.path)}">×</button>
-        </fieldset>`,
-    )
-    .join("");
-}
-
-function renderNodes(): void {
-  const nodes = $("#folder-nodes");
-  const folders = state.proposal?.folders ?? [];
-  const approvedByPath = new Map(state.approved?.folders.map((folder) => [folder.path, folder.id]) ?? []);
-  const moveCounts = new Map<string, number>();
-  for (const entry of state.planPreview?.plan.entries ?? []) {
-    moveCounts.set(entry.destination_id, (moveCounts.get(entry.destination_id) ?? 0) + 1);
-  }
-  nodes.innerHTML = folders
-    .map((folder, index) => {
-      const angle = -Math.PI / 2 + (index / Math.max(folders.length, 1)) * Math.PI * 2;
-      const radius = folders.length > 6 ? 43 : 40;
-      const x = 50 + Math.cos(angle) * radius;
-      const y = 50 + Math.sin(angle) * radius;
-      const destinationId = approvedByPath.get(folder.path);
-      const count = destinationId ? moveCounts.get(destinationId) : undefined;
-      const badge = count === undefined ? "" : `<b aria-label="${count} moves">${count}</b>`;
-      return `<button class="folder-node" style="--x:${x}%;--y:${y}%;--delay:${index * 45}ms" data-focus-folder="${index}"${destinationId ? ` data-destination-id="${escapeAttribute(destinationId)}"` : ""} type="button"><i aria-hidden="true"></i><span>${escapeHtml(folder.path)}</span>${badge}</button>`;
-    })
-    .join("");
-  $("#thread-stage").classList.toggle("has-proposal", folders.length > 0);
-}
-
-function renderReviewText(): void {
-  const title = $("#review-title");
-  const copy = $("#review-copy");
-  if (state.undoResult) {
-    title.textContent = state.undoResult.state === "completed" ? "Moves undone" : "Undo needs attention";
-    copy.textContent = `${state.undoResult.restoredFiles} files were restored. The undo journal records the exact result.`;
-  } else if (state.applyResult) {
-    title.textContent = state.applyResult.state === "completed" ? "Files organized" : "Apply needs attention";
-    copy.textContent = `${state.applyResult.movedFiles} of ${state.applyResult.plannedFiles} reviewed moves completed. The Plan remains visible below.`;
-  } else if (state.approved) {
-    if (state.planPreview) {
-      if (state.planPreview.plan.entries.length === 0) {
-        title.textContent = "No moves needed";
-        copy.textContent = "Every in-scope file is already inside an approved destination.";
-      } else {
-        title.textContent = "Review every move";
-        copy.textContent = "This plan is read-only. Check each source and destination before files can change.";
-      }
-    } else {
-      title.textContent = "Destinations approved";
-      copy.textContent = "The trusted destinations are ready. Preview the exact file moves next.";
-    }
-  } else if (state.proposal) {
-    title.textContent = "Tune the proposal";
-    copy.textContent = "Rename, regroup, or remove destinations. Approval validates paths and assigns local destination IDs.";
-  } else if (state.scan) {
-    title.textContent = state.configPath ? "Inventory ready" : "Choose model access";
-    copy.textContent = state.configPath
-      ? "Only file names and extensions were inspected. Request a proposal when this scope looks right."
-      : "Choose the TOML configuration used to request a folder structure.";
-  } else if (state.source) {
-    title.textContent = "Ready to scan";
-    copy.textContent = "The scan is read-only and stays at the top level for this preview.";
-  } else {
-    title.textContent = "No proposal yet";
-    copy.textContent = "Choose a folder, inspect the local scan, then ask your configured model for a structure.";
-  }
-}
-
-function renderAction(): void {
-  const labels: Record<Stage, string> = {
-    source: state.source ? "Scan this folder" : "Select a source",
-    scan: "Request a structure",
-    shape: "Approve destinations",
-    approve: "Preview moves",
-    plan: "Plan ready",
-    apply: "Organize another folder",
-  };
-  mainAction.textContent = labels[state.stage];
-  mainAction.disabled = state.busy
-    || !state.source
-    || (state.stage === "plan")
-    || (state.stage === "apply" && state.mutation !== "applied" && state.mutation !== "undone")
-    || (state.stage === "scan" && !state.configPath);
-  const moveCount = state.planPreview?.plan.entries.length;
-  const label = applyAction.querySelector("span")!;
-  const hint = applyAction.querySelector("small")!;
-  if (state.mutation === "applied") {
-    label.textContent = "Undo applied moves";
-    hint.textContent = "Review & confirm";
-  } else if (state.mutation === "applying") {
-    label.textContent = "Applying…";
-    hint.textContent = "Writing journal";
-  } else if (state.mutation === "undoing") {
-    label.textContent = "Undoing…";
-    hint.textContent = "Writing journal";
-  } else if (state.mutation === "undone") {
-    label.textContent = "Moves undone";
-    hint.textContent = "Journal complete";
-  } else {
-    label.textContent = moveCount === undefined ? "Apply moves" : `Apply ${moveCount} moves`;
-    hint.textContent = "Review & confirm";
-  }
-  applyAction.disabled = state.busy
-    || state.mutation === "undone"
-    || !state.planPreview
-    || state.planPreview.plan.entries.length === 0;
-  applyAction.classList.toggle("is-undo", state.mutation === "applied");
-}
-
-function renderStatus(): void {
-  const status = $("#status-message") as HTMLElement;
-  status.hidden = !state.error && !state.approved && !state.applyResult && !state.undoResult;
-  status.classList.toggle("error", state.error !== null);
-  status.textContent = state.error ?? (state.undoResult
-    ? `${state.undoResult.state === "completed" ? "Undo complete" : "Undo partially completed"}: ${state.undoResult.restoredFiles} files restored. Journal: ${state.undoResult.journalPath}`
-    : state.applyResult
-      ? `${state.applyResult.state === "completed" ? "Apply complete" : "Apply partially completed"}: ${state.applyResult.movedFiles}/${state.applyResult.plannedFiles} files moved. Journal: ${state.applyResult.journalPath}`
-      : state.planPreview
-    ? `Plan ready. ${state.planPreview.plan.entries.length} moves and ${state.planPreview.plan.directories.length} folders to create. Nothing changed on disk.`
-    : state.approved
-      ? "Destinations approved. Preview the moves before any files can change."
-      : "");
-}
+const appElement = document.querySelector<HTMLDivElement>("#app");
+if (!appElement) throw new Error("App root not found");
+const app: HTMLDivElement = appElement;
 
 function escapeHtml(value: string): string {
   const node = document.createElement("span");
@@ -432,192 +93,524 @@ function escapeAttribute(value: string): string {
   return escapeHtml(value).replaceAll('"', "&quot;");
 }
 
-async function selectSource(): Promise<void> {
-  setBusy(true);
-  state.error = null;
-  try {
-    const source = await chooseSource();
-    if (!source) return;
-    Object.assign(state, {
-      stage: "source",
-      source,
-      scan: null,
-      proposal: null,
-      approved: null,
-      planPreview: null,
-      applyResult: null,
-      undoResult: null,
-      mutation: "idle",
-    });
-  } catch (error) {
-    state.error = formatError(error);
-  } finally {
-    setBusy(false);
-    render();
-  }
+function basename(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
 }
 
-async function selectConfig(): Promise<void> {
-  if (state.busy) return;
-  setBusy(true);
-  state.error = null;
-  try {
-    const configPath = await chooseConfig();
-    if (configPath) state.configPath = configPath;
-  } catch (error) {
-    state.error = formatError(error);
-  } finally {
-    setBusy(false);
-    render();
-  }
+function formatTime(timestamp: number | null): string {
+  if (!timestamp) return "Not yet";
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(timestamp);
 }
 
-async function initializeConfig(): Promise<void> {
-  try {
-    const location = await defaultConfigLocation();
-    state.defaultConfigPath = location.defaultPath;
-    if (!state.configPath && location.path) state.configPath = location.path;
-  } catch (error) {
-    state.error = formatError(error);
-  } finally {
-    render();
-  }
-}
-
-async function advance(): Promise<void> {
-  if (state.stage === "apply" && (state.mutation === "applied" || state.mutation === "undone")) {
-    await selectSource();
-    return;
-  }
-  if (!state.source || state.busy) return;
-  setBusy(true);
-  state.error = null;
-  try {
-    if (state.stage === "source") {
-      state.scan = await scanSource(state.source);
-      state.stage = "scan";
-    } else if (state.stage === "scan") {
-      if (!state.configPath) throw new Error("Choose the model configuration file in the app.");
-      state.proposal = await proposeStructure(state.source, state.configPath);
-      state.stage = "shape";
-    } else if (state.stage === "shape" && state.proposal) {
-      syncFolderInputs();
-      state.approved = await approveStructure(state.proposal);
-      state.stage = "approve";
-    } else if (state.stage === "approve" && state.approved) {
-      state.planPreview = await previewPlan();
-      state.stage = "plan";
-    }
-  } catch (error) {
-    state.error = formatError(error);
-  } finally {
-    setBusy(false);
-    render();
-  }
-}
-
-function openApplyConfirmation(): void {
-  if (!state.planPreview || state.planPreview.plan.entries.length === 0 || state.busy) return;
-  const undo = state.mutation === "applied" && state.applyResult !== null;
-  $("#confirm-kicker").textContent = undo ? "Undo confirmation" : "Final confirmation";
-  $("#confirm-title").textContent = undo ? "Restore moved files?" : "Apply reviewed moves?";
-  $("#confirm-copy").textContent = undo
-    ? "Undo restores only files recorded by this Apply session. New conflicts are left untouched and reported in the journal."
-    : "Temari will recheck every source fingerprint and destination before moving anything. Existing files are never overwritten.";
-  $("#confirm-details").innerHTML = undo
-    ? `<div><dt>Apply session</dt><dd>${escapeHtml(state.applyResult!.sessionId)}</dd></div><div><dt>Moved files</dt><dd>${state.applyResult!.movedFiles}</dd></div>`
-    : `<div><dt>Moves</dt><dd>${state.planPreview.plan.entries.length}</dd></div><div><dt>New folders</dt><dd>${state.planPreview.plan.directories.length}</dd></div><div class="digest"><dt>Exact Plan SHA-256</dt><dd>${escapeHtml(state.planPreview.sha256)}</dd></div>`;
-  dialogConfirm.textContent = undo ? "Undo moves" : "Apply moves";
-  dialogConfirm.dataset.action = undo ? "undo" : "apply";
-  confirmDialog.showModal();
-}
-
-async function confirmMutation(): Promise<void> {
-  const action = dialogConfirm.dataset.action;
-  confirmDialog.close();
-  if (!state.planPreview || state.busy) return;
-  setBusy(true);
-  state.error = null;
-  try {
-    if (action === "undo") {
-      if (!state.applyResult) throw new Error("There is no applied session to undo.");
-      state.mutation = "undoing";
-      state.stage = "apply";
-      render();
-      state.undoResult = await undoAppliedPlan(state.applyResult.sessionId);
-      state.mutation = "undone";
-    } else {
-      state.mutation = "applying";
-      state.stage = "apply";
-      render();
-      state.applyResult = await applyReviewedPlan(state.planPreview.sha256);
-      state.mutation = "applied";
-    }
-  } catch (error) {
-    state.error = formatError(error);
-    state.mutation = action === "undo" && state.applyResult ? "applied" : "idle";
-    state.stage = state.applyResult ? "apply" : "plan";
-  } finally {
-    setBusy(false);
-    render();
-  }
-}
-
-function syncFolderInputs(): void {
-  if (!state.proposal) return;
-  const folders: FolderProposal[] = [];
-  document.querySelectorAll<HTMLFieldSetElement>(".folder-field").forEach((field) => {
-    const path = field.querySelector<HTMLInputElement>('input[name="path"]')?.value.trim() ?? "";
-    const description = field.querySelector<HTMLInputElement>('input[name="description"]')?.value.trim() ?? "";
-    folders.push({ path, description });
-  });
-  state.proposal.folders = folders;
+function formatDuration(seconds: number): string {
+  if (seconds % 86_400 === 0) return `${seconds / 86_400} days`;
+  if (seconds % 3_600 === 0) return `${seconds / 3_600} hours`;
+  if (seconds % 60 === 0) return `${seconds / 60} minutes`;
+  return `${seconds} seconds`;
 }
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-chooseSourceButton.addEventListener("click", selectSource);
-changeSourceButton.addEventListener("click", selectSource);
-chooseConfigButton.addEventListener("click", selectConfig);
-mainAction.addEventListener("click", advance);
-applyAction.addEventListener("click", openApplyConfirmation);
-dialogConfirm.addEventListener("click", confirmMutation);
-
-addFolderButton.addEventListener("click", () => {
-  if (!state.proposal) return;
-  syncFolderInputs();
-  state.proposal.folders.push({ path: "New folder", description: "Describe what belongs here" });
-  render();
-  document.querySelector<HTMLInputElement>('.folder-field:last-child input[name="path"]')?.select();
-});
-
-$("#folder-fields").addEventListener("input", () => {
-  syncFolderInputs();
-  renderNodes();
-});
-
-$("#folder-fields").addEventListener("click", (event) => {
-  const button = (event.target as HTMLElement).closest<HTMLButtonElement>(".remove-folder");
-  if (!button || !state.proposal) return;
-  const field = button.closest<HTMLFieldSetElement>(".folder-field");
-  const index = Number(field?.dataset.folderIndex);
-  syncFolderInputs();
-  state.proposal.folders.splice(index, 1);
-  render();
-});
-
-$("#folder-nodes").addEventListener("click", (event) => {
-  const node = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-focus-folder]");
-  if (!node) return;
-  const index = Number(node.dataset.focusFolder);
-  if (state.planPreview && node.dataset.destinationId) {
-    document.querySelector<HTMLElement>(`.plan-entry[data-destination-id="${CSS.escape(node.dataset.destinationId)}"]`)?.focus();
-  } else {
-    document.querySelector<HTMLInputElement>(`.folder-field[data-folder-index="${index}"] input[name="path"]`)?.focus();
+async function loadSchedule(workspaceId: string): Promise<ScheduleStatus | null> {
+  try {
+    return await getManagedSchedule(workspaceId);
+  } catch {
+    return null;
   }
-});
+}
+
+function healthLabel(status: ManagedWorkspaceStatus): string {
+  if (status.health === "attention") return "Needs attention";
+  if (status.health === "disabled") return "Paused";
+  return "Watching";
+}
+
+function historyRows(): string {
+  if (state.history.length === 0) {
+    return `<div class="empty-state"><strong>No moves yet</strong><span>Run this workspace to start a reversible move history.</span></div>`;
+  }
+  return state.history.map((move) => `
+    <article class="move-row ${move.undone ? "is-undone" : ""}">
+      <div class="move-time">${escapeHtml(formatTime(move.finishedUnixMs))}</div>
+      <div class="move-paths">
+        <strong>${escapeHtml(move.sourcePath)}</strong>
+        <span aria-hidden="true">→</span>
+        <strong>${escapeHtml(move.destinationPath)}</strong>
+      </div>
+      <span class="move-kind">${move.kind === "classify" ? "Classified" : move.kind === "adopt" ? "Kept" : "Staged"}</span>
+      ${move.undone
+        ? `<span class="undo-state">Undone</span>`
+        : move.kind === "adopt"
+          ? `<span class="undo-state">Undo by run</span>`
+          : `<button class="quiet-button" data-undo-file="${escapeAttribute(move.moveId)}" data-run-id="${escapeAttribute(move.sessionId)}" type="button">Undo</button>`}
+    </article>`).join("");
+}
+
+function workspaceNavigation(): string {
+  if (state.workspaces.length === 0) {
+    return `<div class="workspace-empty">No folders are managed yet.</div>`;
+  }
+  return state.workspaces.map((workspace) => `
+    <button class="workspace-link ${workspace.id === state.selectedId ? "is-selected" : ""}" data-workspace-id="${escapeAttribute(workspace.id)}" type="button">
+      <span class="folder-tab" aria-hidden="true"></span>
+      <span><strong>${escapeHtml(basename(workspace.source))}</strong><small>${workspace.enabled ? "Watching" : "Paused"}</small></span>
+      <i class="health-pin ${workspace.enabled ? "" : "is-paused"}" aria-hidden="true"></i>
+    </button>`).join("");
+}
+
+function dashboard(): string {
+  if (!state.status) {
+    return `<main class="empty-dashboard">
+      <div class="empty-orbit" aria-hidden="true"><i></i><i></i><i></i></div>
+      <p class="eyebrow">Private by default</p>
+      <h1>Give loose files<br>a quiet place to land.</h1>
+      <p>Each folder gets a protected area, a short waiting room, and an organized library.</p>
+      ${state.notice ? `<div class="notice is-${state.notice.tone}" role="status">${escapeHtml(state.notice.message)}</div>` : ""}
+      <button class="primary-button" data-open-setup type="button">Add your first folder</button>
+    </main>`;
+  }
+
+  const { workspace, inbox } = state.status;
+  const classified = state.history.filter((move) => move.kind === "classify" && !move.undone).length;
+  const keptNote = "Folders and files you choose to leave alone";
+  const inboxNote = inbox.nextEligibleUnixMs
+    ? `Next review ${formatTime(inbox.nextEligibleUnixMs)}`
+    : "Nothing is waiting for review";
+  const scheduleOn = state.schedule?.installed && state.schedule.enabled;
+  const latestRuns = [...new Set(state.history.filter((move) => !move.undone).map((move) => move.sessionId))].slice(0, 3);
+
+  return `<main class="dashboard">
+    <header class="workspace-header">
+      <div>
+        <div class="health-line"><span class="health-badge is-${state.status.health}">${healthLabel(state.status)}</span><span>${escapeHtml(workspace.source)}</span></div>
+        <h1>${escapeHtml(basename(workspace.source))}</h1>
+        <p>Files wait ${escapeHtml(formatDuration(workspace.retentionSeconds))} before organization.</p>
+      </div>
+      <button class="run-button" id="run-now" type="button" ${state.busy || !workspace.enabled ? "disabled" : ""}>
+        <span class="run-mark" aria-hidden="true">↻</span>
+        <span><strong>${state.busy ? "Working…" : "Run now"}</strong><small>Review, then move</small></span>
+      </button>
+    </header>
+
+    ${state.notice ? `<div class="notice is-${state.notice.tone}" role="status">${escapeHtml(state.notice.message)}</div>` : ""}
+    ${state.status.issues.length ? `<div class="issue-list"><strong>Needs attention</strong>${state.status.issues.map((issue) => `<span>${escapeHtml(issue)}</span>`).join("")}</div>` : ""}
+
+    <section class="areas" aria-labelledby="areas-title">
+      <div class="section-heading"><div><p class="eyebrow">Workspace flow</p><h2 id="areas-title">Three places, one clear boundary</h2></div><span>Root → Inbox → Library</span></div>
+      <div class="area-flow">
+        <article class="area-card area-kept">
+          <div class="area-index">K</div>
+          <div><p>Leave alone</p><h3>Kept</h3><span>${keptNote}</span></div>
+          <strong class="area-value">Protected</strong>
+        </article>
+        <span class="flow-thread" aria-hidden="true"></span>
+        <article class="area-card area-inbox">
+          <div class="area-index">I</div>
+          <div><p>Wait here</p><h3>Inbox</h3><span>${escapeHtml(inboxNote)}</span></div>
+          <strong class="area-value">${inbox.physicalFiles}</strong>
+          <small class="area-detail">${inbox.eligibleNow} ready now</small>
+        </article>
+        <span class="flow-thread" aria-hidden="true"></span>
+        <article class="area-card area-library">
+          <div class="area-index">L</div>
+          <div><p>Organized by meaning</p><h3>Library</h3><span>Approved destinations only</span></div>
+          <strong class="area-value">${classified || inbox.indexedMoved}</strong>
+          <small class="area-detail">recently indexed</small>
+        </article>
+      </div>
+    </section>
+
+    <div class="dashboard-grid">
+      <section class="history-panel" aria-labelledby="history-title">
+        <div class="section-heading compact"><div><p class="eyebrow">Recent moves</p><h2 id="history-title">Every move has a way back</h2></div></div>
+        <div class="move-list">${historyRows()}</div>
+        ${latestRuns.length ? `<div class="session-undo"><span>Undo a complete run</span>${latestRuns.map((runId) => `<button class="text-button" data-undo-run="${escapeAttribute(runId)}" type="button">${escapeHtml(runId)}</button>`).join("")}</div>` : ""}
+      </section>
+
+      <aside class="control-panel">
+        <section>
+          <div class="control-heading"><div><p class="eyebrow">Timing</p><h2>Waiting room</h2></div></div>
+          <label class="field"><span>Keep new files in Inbox</span><select id="retention-days" disabled>
+            ${[1, 2, 3, 5, 7, 14].map((days) => `<option value="${days}" ${workspace.retentionSeconds === days * 86_400 ? "selected" : ""}>${days} ${days === 1 ? "day" : "days"}</option>`).join("")}
+          </select></label>
+          <label class="field"><span>Wait until unchanged</span><select id="settle-seconds" disabled>
+            ${[10, 30, 60, 300].map((seconds) => `<option value="${seconds}" ${workspace.settleSeconds === seconds ? "selected" : ""}>${formatDuration(seconds)}</option>`).join("")}
+          </select></label>
+          <label class="toggle-row"><span><strong>Watch this folder</strong><small>Allow scheduled and manual runs</small></span><input id="workspace-enabled" type="checkbox" ${workspace.enabled ? "checked" : ""} /></label>
+          <p class="field-note">Timing is shown here; edit it with the managed CLI for now.</p>
+          <button class="secondary-button" id="save-settings" type="button">Save watch state</button>
+        </section>
+
+        <section>
+          <div class="control-heading"><div><p class="eyebrow">Schedule</p><h2>${scheduleOn ? "Runs automatically" : "Runs manually"}</h2></div><span class="schedule-light ${scheduleOn ? "is-on" : ""}"></span></div>
+          <label class="field"><span>Check every</span><select id="schedule-interval">
+            ${[[300, "5 minutes"], [900, "15 minutes"], [1800, "30 minutes"], [3600, "1 hour"]].map(([seconds, label]) => `<option value="${seconds}" ${state.schedule?.intervalSeconds === seconds ? "selected" : ""}>${label}</option>`).join("")}
+          </select></label>
+          ${scheduleOn ? "" : `<label class="picker-field compact"><span>Temari CLI executable</span><div><input id="schedule-executable" readonly value="${escapeAttribute(state.scheduleExecutablePath)}" placeholder="Choose a stable CLI path" /><button id="pick-schedule-executable" type="button">Choose</button></div></label><p class="field-note">Use an absolute launcher path outside the Nix store.</p>`}
+          <button class="secondary-button" id="toggle-schedule" type="button" ${!scheduleOn && !state.scheduleExecutablePath ? "disabled" : ""}>${scheduleOn ? "Turn off schedule" : "Turn on schedule"}</button>
+        </section>
+
+        <section>
+          <div class="control-heading"><div><p class="eyebrow">Send back through Inbox</p><h2>Reprocess files</h2></div></div>
+          <p class="control-copy">Select files from Kept or Library. Temari creates a reviewed move back to Inbox first.</p>
+          <button class="secondary-button" id="open-reprocess" type="button">Choose files to reprocess</button>
+        </section>
+      </aside>
+    </div>
+  </main>`;
+}
+
+function setupDialog(): string {
+  if (!state.setupOpen) return "";
+  const sourceStep = state.setupStep === "source";
+  const structureStep = state.setupStep === "structure" && state.proposal;
+  const previewStep = state.setupStep === "preview" && state.setupPreview;
+  return `<dialog class="sheet-dialog" id="setup-dialog" open aria-labelledby="setup-title">
+    <div class="sheet-backdrop" data-close-setup></div>
+    <section class="sheet-card">
+      <button class="dialog-close" data-close-setup aria-label="Close" type="button">×</button>
+      <p class="eyebrow">Add a managed folder · ${sourceStep ? "1" : structureStep ? "2" : "3"} of 3</p>
+      <h2 id="setup-title">${sourceStep ? "Choose one folder" : structureStep ? "Approve its Library" : "Review the exact setup"}</h2>
+      ${sourceStep ? `
+        <p>Each folder stays independent and gets its own Kept, Inbox, and Library.</p>
+        <label class="picker-field"><span>Folder</span><div><input id="setup-source" readonly value="${escapeAttribute(state.setupSource)}" placeholder="No folder selected" /><button id="pick-setup-source" type="button">Choose</button></div></label>
+        <label class="picker-field"><span>Model configuration</span><div><input id="setup-config" readonly value="${escapeAttribute(state.configPath)}" placeholder="No configuration selected" /><button id="pick-setup-config" type="button">Choose</button></div></label>
+        <button class="primary-button full" id="propose-workspace" type="button" ${!state.setupSource || !state.configPath || state.busy ? "disabled" : ""}>${state.busy ? "Reading file names…" : "Propose a Library"}</button>` : ""}
+      ${structureStep ? `
+        <p>${state.proposal!.filesConsidered} file names informed this proposal. Edit every destination before approval.</p>
+        <div class="folder-proposal" id="setup-folders">${state.proposal!.folders.map((folder, index) => `
+          <fieldset data-folder-index="${index}"><legend>Destination ${index + 1}</legend><input name="path" value="${escapeAttribute(folder.path)}" aria-label="Destination path" /><input name="description" value="${escapeAttribute(folder.description)}" aria-label="Destination purpose" /></fieldset>`).join("")}</div>
+        <div class="setup-timing"><label>Inbox retention<select id="setup-retention"><option value="1">1 day</option><option value="3" selected>3 days</option><option value="7">7 days</option></select></label><label>Stable for<select id="setup-settle"><option value="30" selected>30 seconds</option><option value="60">1 minute</option><option value="300">5 minutes</option></select></label></div>
+        <button class="primary-button full" id="preview-workspace" type="button" ${state.busy ? "disabled" : ""}>${state.busy ? "Building setup…" : "Preview exact setup"}</button>` : ""}
+      ${previewStep ? `
+        <p>Nothing has moved. Directories go to Kept; loose files go to Inbox before classification.</p>
+        <div class="setup-summary"><div><strong>${state.setupPreview!.directories.length}</strong><span>Folders created</span></div><div><strong>${state.setupPreview!.moves.length}</strong><span>Initial moves</span></div></div>
+        <div class="setup-moves">${state.setupPreview!.moves.map((move) => `<div><span>${escapeHtml(move.sourcePath)}</span><b>→</b><strong>${escapeHtml(move.destinationPath)}</strong></div>`).join("")}</div>
+        <button class="primary-button full" id="apply-workspace" type="button">Apply this setup</button>` : ""}
+    </section>
+  </dialog>`;
+}
+
+function reprocessDialog(): string {
+  if (!state.reprocessOpen) return "";
+  return `<dialog class="small-dialog" id="reprocess-dialog" open aria-labelledby="reprocess-title">
+    <form id="reprocess-form">
+      <button class="dialog-close" data-close-reprocess aria-label="Close" type="button">×</button>
+      <p class="eyebrow">Reviewed return to Inbox</p><h2 id="reprocess-title">Reprocess files</h2>
+      <label class="field"><span>Current area</span><select id="reprocess-area"><option value="library">Library</option><option value="kept">Kept</option></select></label>
+      <label class="field"><span>Area-relative paths</span><textarea id="reprocess-paths" placeholder="Work/old-report.pdf&#10;Images/reference.png" required></textarea><small>One file or directory per line. Kept requires explicit paths.</small></label>
+      <button class="primary-button full" type="submit">Review reprocessing</button>
+    </form>
+  </dialog>`;
+}
+
+function confirmationDialog(): string {
+  const confirmation = state.pendingConfirmation;
+  if (!confirmation) return "";
+  return `<dialog class="small-dialog confirmation" id="confirmation-dialog" open aria-labelledby="confirmation-title">
+    <section>
+      <button class="dialog-close" data-cancel-confirmation aria-label="Cancel" type="button">×</button>
+      <p class="eyebrow">Filesystem confirmation</p><h2 id="confirmation-title">${escapeHtml(confirmation.title)}</h2><p>${escapeHtml(confirmation.copy)}</p>
+      <dl>${confirmation.details.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>
+      <div class="dialog-actions"><button class="secondary-button" data-cancel-confirmation type="button">Cancel</button><button class="danger-button" id="confirm-action" type="button">${escapeHtml(confirmation.confirmLabel)}</button></div>
+    </section>
+  </dialog>`;
+}
+
+function render(): void {
+  app.innerHTML = `<div class="app-shell">
+    <header class="topbar">
+      <a class="wordmark" href="#" aria-label="Temari home"><span class="wordmark-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>temari</span></a>
+      <div class="privacy-note"><span></span>Local-first · No telemetry</div>
+    </header>
+    <aside class="workspace-rail">
+      <div class="rail-heading"><p>Managed folders</p><button data-open-setup type="button" aria-label="Add a folder">+</button></div>
+      <nav aria-label="Managed folders">${workspaceNavigation()}</nav>
+      <div class="rail-boundary"><span aria-hidden="true">⌾</span><p><strong>Your boundary</strong>Only approved text reaches your configured model.</p></div>
+    </aside>
+    ${state.busy && !state.status && state.workspaces.length === 0 ? `<main class="loading-state">Loading managed folders…</main>` : dashboard()}
+  </div>${setupDialog()}${reprocessDialog()}${confirmationDialog()}`;
+  bindEvents();
+}
+
+function setBusy(busy: boolean): void {
+  state.busy = busy;
+  render();
+}
+
+async function loadWorkspace(id: string): Promise<void> {
+  state.selectedId = id;
+  state.notice = null;
+  setBusy(true);
+  try {
+    [state.status, state.schedule, state.history] = await Promise.all([
+      getManagedWorkspace(id),
+      loadSchedule(id),
+      getManagedHistory(id),
+    ]);
+  } catch (error) {
+    state.notice = { tone: "error", message: formatError(error) };
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
+async function refreshSelected(message?: string): Promise<void> {
+  if (!state.selectedId) return;
+  const id = state.selectedId;
+  [state.workspaces, state.status, state.schedule, state.history] = await Promise.all([
+    listManagedWorkspaces(),
+    getManagedWorkspace(id),
+    loadSchedule(id),
+    getManagedHistory(id),
+  ]);
+  if (message) state.notice = { tone: "success", message };
+}
+
+function askForConfirmation(confirmation: PendingConfirmation): void {
+  state.pendingConfirmation = confirmation;
+  render();
+}
+
+async function performConfirmation(): Promise<void> {
+  const confirmation = state.pendingConfirmation;
+  if (!confirmation || state.busy) return;
+  state.pendingConfirmation = null;
+  setBusy(true);
+  try {
+    await confirmation.action();
+  } catch (error) {
+    state.notice = { tone: "error", message: formatError(error) };
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
+function syncProposal(): void {
+  if (!state.proposal) return;
+  state.proposal.folders = [...document.querySelectorAll<HTMLFieldSetElement>("#setup-folders fieldset")].map((field) => ({
+    path: field.querySelector<HTMLInputElement>('input[name="path"]')?.value.trim() ?? "",
+    description: field.querySelector<HTMLInputElement>('input[name="description"]')?.value.trim() ?? "",
+  }));
+}
+
+function bindEvents(): void {
+  document.querySelectorAll<HTMLElement>("[data-open-setup]").forEach((button) => button.addEventListener("click", () => {
+    state.setupOpen = true;
+    state.setupStep = "source";
+    state.setupSource = "";
+    state.proposal = null;
+    state.setupPreview = null;
+    render();
+  }));
+  document.querySelectorAll<HTMLElement>("[data-close-setup]").forEach((button) => button.addEventListener("click", () => {
+    state.setupOpen = false;
+    render();
+  }));
+  document.querySelectorAll<HTMLButtonElement>("[data-workspace-id]").forEach((button) => button.addEventListener("click", () => void loadWorkspace(button.dataset.workspaceId!)));
+
+  document.querySelector("#pick-setup-source")?.addEventListener("click", async () => {
+    const source = await chooseSource();
+    if (source) state.setupSource = source;
+    render();
+  });
+  document.querySelector("#pick-setup-config")?.addEventListener("click", async () => {
+    const config = await chooseConfig();
+    if (config) state.configPath = config;
+    render();
+  });
+  document.querySelector("#propose-workspace")?.addEventListener("click", async () => {
+    setBusy(true);
+    try {
+      state.proposal = await proposeManagedWorkspace(state.setupSource, state.configPath);
+      state.setupStep = "structure";
+    } catch (error) {
+      state.notice = { tone: "error", message: formatError(error) };
+    } finally {
+      state.busy = false;
+      render();
+    }
+  });
+  document.querySelector("#preview-workspace")?.addEventListener("click", async () => {
+    if (!state.proposal) return;
+    syncProposal();
+    const retentionDays = Number((document.querySelector("#setup-retention") as HTMLSelectElement).value);
+    const settleSeconds = Number((document.querySelector("#setup-settle") as HTMLSelectElement).value);
+    setBusy(true);
+    try {
+      state.setupPreview = await previewManagedWorkspace(state.proposal, retentionDays * 86_400, settleSeconds);
+      state.setupStep = "preview";
+    } catch (error) {
+      state.notice = { tone: "error", message: formatError(error) };
+    } finally {
+      state.busy = false;
+      render();
+    }
+  });
+  document.querySelector("#apply-workspace")?.addEventListener("click", () => {
+    if (!state.setupPreview) return;
+    const preview = state.setupPreview;
+    state.setupOpen = false;
+    askForConfirmation({
+      title: `Set up ${basename(preview.source)}?`,
+      copy: "Temari will create Kept, Inbox, and Library, then perform only the moves shown in the reviewed setup.",
+      details: [["Folder", preview.source], ["Initial moves", String(preview.moves.length)], ["Directories", String(preview.directories.length)]],
+      confirmLabel: "Apply reviewed setup",
+      action: async () => {
+        const result = await applyManagedWorkspace(preview.token);
+        state.workspaces = await listManagedWorkspaces();
+        state.selectedId = result.workspace.id;
+        state.status = result;
+        state.schedule = await loadSchedule(result.workspace.id);
+        state.history = [];
+        state.notice = { tone: "success", message: "Managed folder created. Its initial moves are journaled." };
+      },
+    });
+  });
+
+  document.querySelector("#run-now")?.addEventListener("click", () => {
+    if (!state.status) return;
+    const workspace = state.status.workspace;
+    askForConfirmation({
+      title: `Run ${basename(workspace.source)} now?`,
+      copy: "Loose root files will move to Inbox. Eligible Inbox files will move only to approved Library destinations.",
+      details: [["Folder", workspace.source], ["Ready now", String(state.status!.inbox.eligibleNow)], ["Collision policy", "Rename safely"]],
+      confirmLabel: "Run and apply moves",
+      action: async () => {
+        const result = await runManagedWorkspace(workspace.id);
+        const staged = (result.directoryAdoption?.moveCount ?? 0)
+          + result.runs.filter((run) => run.kind === "stage").reduce((total, run) => total + run.moveCount, 0);
+        const classified = result.runs.filter((run) => run.kind === "classify").reduce((total, run) => total + run.moveCount, 0);
+        await refreshSelected(`${staged} staged and ${classified} classified.`);
+      },
+    });
+  });
+
+  document.querySelector("#save-settings")?.addEventListener("click", async () => {
+    if (!state.status) return;
+    const enabled = (document.querySelector("#workspace-enabled") as HTMLInputElement).checked;
+    setBusy(true);
+    try {
+      await setManagedWorkspaceEnabled(state.status.workspace.id, enabled);
+      state.status = await getManagedWorkspace(state.status.workspace.id);
+      state.workspaces = await listManagedWorkspaces();
+      state.notice = { tone: "success", message: "Workspace watch state saved." };
+    } catch (error) {
+      state.notice = { tone: "error", message: formatError(error) };
+    } finally { state.busy = false; render(); }
+  });
+
+  document.querySelector("#pick-schedule-executable")?.addEventListener("click", async () => {
+    try {
+      const executable = await chooseTemariExecutable();
+      if (executable) state.scheduleExecutablePath = executable;
+    } catch (error) {
+      state.notice = { tone: "error", message: formatError(error) };
+    }
+    render();
+  });
+
+  document.querySelector("#toggle-schedule")?.addEventListener("click", async () => {
+    if (!state.status) return;
+    const scheduleOn = state.schedule?.installed && state.schedule.enabled;
+    const interval = Number((document.querySelector("#schedule-interval") as HTMLSelectElement).value);
+    setBusy(true);
+    try {
+      state.schedule = scheduleOn
+        ? await disableManagedSchedule(state.status.workspace.id)
+        : await enableManagedSchedule(state.status.workspace.id, interval, state.scheduleExecutablePath);
+      state.notice = { tone: "success", message: scheduleOn ? "Automatic runs turned off." : "Automatic runs turned on." };
+    } catch (error) {
+      state.notice = { tone: "error", message: formatError(error) };
+    } finally { state.busy = false; render(); }
+  });
+
+  document.querySelector("#open-reprocess")?.addEventListener("click", () => { state.reprocessOpen = true; render(); });
+  document.querySelectorAll("[data-close-reprocess]").forEach((button) => button.addEventListener("click", () => { state.reprocessOpen = false; render(); }));
+  document.querySelector("#reprocess-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (!state.status) return;
+    const area = (document.querySelector("#reprocess-area") as HTMLSelectElement).value as ReprocessArea;
+    const paths = (document.querySelector("#reprocess-paths") as HTMLTextAreaElement).value.split("\n").map((path) => path.trim()).filter(Boolean);
+    if (paths.length === 0) return;
+    const workspaceId = state.status.workspace.id;
+    state.reprocessOpen = false;
+    askForConfirmation({
+      title: `Return ${paths.length} selection${paths.length === 1 ? "" : "s"} to Inbox?`,
+      copy: "This reviewed step does not classify directly from Kept or Library. A later run handles eligible Inbox files.",
+      details: [["From", area === "kept" ? "Kept" : "Library"], ["Selections", paths.join(", ")]],
+      confirmLabel: "Apply return to Inbox",
+      action: async () => {
+        const result = await reprocessManagedFiles(workspaceId, area, paths);
+        const moved = result.runs.reduce((total, run) => total + run.moveCount, 0);
+        await refreshSelected(`${moved} selection${moved === 1 ? "" : "s"} returned to Inbox.`);
+      },
+    });
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-undo-file]").forEach((button) => button.addEventListener("click", () => {
+    if (!state.status) return;
+    const workspaceId = state.status.workspace.id;
+    const runId = button.dataset.runId!;
+    const fileId = button.dataset.undoFile!;
+    const move = state.history.find((item) => item.sessionId === runId && item.moveId === fileId)!;
+    askForConfirmation({
+      title: `Undo ${basename(move.destinationPath)}?`,
+      copy: "Only this recorded move will be restored. New conflicts are left untouched and reported.",
+      details: [["From", move.destinationPath], ["Back to", move.sourcePath], ["Run", runId]],
+      confirmLabel: "Undo this move",
+      action: async () => { const result = await undoManagedMove(workspaceId, runId, fileId); await refreshSelected(`${result.restoredFiles} move undone.`); },
+    });
+  }));
+
+  document.querySelectorAll<HTMLButtonElement>("[data-undo-run]").forEach((button) => button.addEventListener("click", () => {
+    if (!state.status) return;
+    const workspaceId = state.status.workspace.id;
+    const runId = button.dataset.undoRun!;
+    const moveCount = state.history.filter((move) => move.sessionId === runId && !move.undone).length;
+    askForConfirmation({
+      title: `Undo run ${runId}?`,
+      copy: "Every still-active move from this run will be restored conservatively. New conflicts are left in place.",
+      details: [["Run", runId], ["Active moves", String(moveCount)]],
+      confirmLabel: "Undo complete run",
+      action: async () => { const result = await undoManagedRun(workspaceId, runId); await refreshSelected(`${result.restoredFiles} moves undone.`); },
+    });
+  }));
+
+  document.querySelectorAll("[data-cancel-confirmation]").forEach((button) => button.addEventListener("click", () => { state.pendingConfirmation = null; render(); }));
+  document.querySelector("#confirm-action")?.addEventListener("click", () => void performConfirmation());
+}
+
+async function initialize(): Promise<void> {
+  try {
+    const [location, workspaces] = await Promise.all([defaultConfigLocation(), listManagedWorkspaces()]);
+    state.defaultConfigPath = location.defaultPath;
+    state.configPath = location.path ?? "";
+    state.workspaces = workspaces;
+    if (workspaces.length > 0) {
+      state.selectedId = workspaces[0].id;
+      [state.status, state.schedule, state.history] = await Promise.all([
+        getManagedWorkspace(workspaces[0].id),
+        loadSchedule(workspaces[0].id),
+        getManagedHistory(workspaces[0].id),
+      ]);
+    }
+  } catch (error) {
+    state.notice = { tone: "error", message: formatError(error) };
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
 
 render();
-void initializeConfig();
+void initialize();

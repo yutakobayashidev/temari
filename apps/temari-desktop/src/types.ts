@@ -1,96 +1,99 @@
-export type FolderProposal = {
-  path: string;
-  description: string;
-};
+export type WorkspaceHealth = "healthy" | "disabled" | "attention";
 
-export type Proposal = {
-  version: number;
-  source: string;
-  scope: { recursive_roots: string[] };
-  files_considered: number;
-  folders: FolderProposal[];
-};
-
-export type ScanPreview = {
-  source: string;
-  scope: { recursive_roots: string[] };
-  fileCount: number;
-  sampledFiles: Array<{ id: string; source_path: string; extension: string }>;
-  extensionCounts: Record<string, number>;
-};
-
-export type ApprovedFolder = FolderProposal & {
+export type ManagedWorkspace = {
   id: string;
-  model_visible: boolean;
-  fallback: string | null;
-};
-
-export type FolderSet = {
-  version: number;
   source: string;
-  scope: { recursive_roots: string[] };
-  folders: ApprovedFolder[];
+  retentionSeconds: number;
+  settleSeconds: number;
+  enabled: boolean;
+  createdUnixMs: number;
+  updatedUnixMs: number;
 };
 
-export type ClassificationBasis = "name" | "content" | "extension_fallback" | "rule";
-
-export type FsIdentity = {
-  device: number;
-  inode: number;
+export type InboxSummary = {
+  physicalFiles: number;
+  indexedPending: number;
+  indexedPlanned: number;
+  indexedMoved: number;
+  eligibleNow: number;
+  nextEligibleUnixMs: number | null;
 };
 
-export type FileFingerprint = {
-  identity: FsIdentity;
-  size: number;
-  sha256: string;
+export type ManagedRun = {
+  id: string;
+  kind: "setup" | "adopt" | "stage" | "classify";
+  state: "planning" | "planned" | "applying" | "completed" | "noop" | "needs_resume" | "failed";
+  moveCount: number;
+  startedUnixMs: number;
+  finishedUnixMs: number | null;
+  error: string | null;
 };
 
-export type PlanEntry = {
-  file_id: string;
-  source_path: string;
-  source_fingerprint: FileFingerprint;
-  destination_id: string;
-  requested_destination: string;
-  destination_path: string;
-  reasoning: string | null;
-  classification_basis: ClassificationBasis;
-  rule_id: string | null;
+export type ManagedWorkspaceStatus = {
+  health: WorkspaceHealth;
+  issues: string[];
+  workspace: ManagedWorkspace;
+  inbox: InboxSummary;
+  runs: {
+    total: number;
+    actionable: ManagedRun[];
+  };
 };
 
-export type Plan = {
-  version: number;
-  source: string;
-  source_identity: FsIdentity;
-  scope: { recursive_roots: string[] };
-  collision_policy: "rename";
-  folders: ApprovedFolder[];
-  directories: string[];
-  entries: PlanEntry[];
-};
-
-export type PlanPreview = {
-  plan: Plan;
-  sha256: string;
-};
-
-export type ApplyResult = {
-  state: "running" | "completed" | "failed" | "partial_failure";
+export type ManagedMove = {
   sessionId: string;
-  planSha256: string;
-  plannedFiles: number;
-  movedFiles: number;
-  createdDirectories: number;
-  conflicts: number;
-  runDirectory: string;
-  planPath: string;
-  journalPath: string;
+  kind: "adopt" | "stage" | "classify";
+  moveId: string;
+  sourcePath: string;
+  destinationPath: string;
+  undone: boolean;
+  undoOutcome: string | null;
+  finishedUnixMs: number | null;
+};
+
+export type ScheduleStatus = {
+  platform: "systemd" | "launchd";
+  installed: boolean;
+  enabled: boolean;
+  active: boolean;
+  intervalSeconds: number | null;
+};
+
+export type SetupProposal = {
+  token: string;
+  source: string;
+  filesConsidered: number;
+  folders: Array<{ path: string; description: string }>;
+};
+
+export type SetupPreview = {
+  token: string;
+  source: string;
+  directories: string[];
+  moves: Array<{
+    sourcePath: string;
+    destinationPath: string;
+    area: "kept" | "inbox";
+  }>;
+};
+
+export type ManagedRunResult = {
+  workspaceId: string;
+  artifactDirectory: string;
+  directoryAdoption: null | {
+    planPath: string;
+    applyPath: string | null;
+    moveCount: number;
+  };
+  runs: ManagedRun[];
 };
 
 export type UndoResult = {
-  state: "running" | "completed" | "partial_failure";
-  applySessionId: string;
+  runId: string;
   restoredFiles: number;
-  removedDirectories: number;
   conflicts: number;
+  state: "completed" | "partial_failure";
   journalPath: string;
 };
+
+export type ReprocessArea = "kept" | "library";

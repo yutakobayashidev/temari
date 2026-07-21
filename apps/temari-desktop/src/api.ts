@@ -1,110 +1,103 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { ApplyResult, ClassificationBasis, FolderSet, PlanPreview, Proposal, ScanPreview, UndoResult } from "./types";
+import type {
+  ManagedMove,
+  ManagedRunResult,
+  ManagedWorkspace,
+  ManagedWorkspaceStatus,
+  ReprocessArea,
+  ScheduleStatus,
+  SetupPreview,
+  SetupProposal,
+  UndoResult,
+} from "./types";
 
-const demoProposal: Proposal = {
-  version: 2,
-  source: "/Users/you/Downloads",
-  scope: { recursive_roots: [] },
-  files_considered: 18,
-  folders: [
-    { path: "Documents/Work", description: "Project notes, briefs, and reference documents" },
-    { path: "Documents/Personal", description: "Receipts, forms, and personal records" },
-    { path: "Media/Images", description: "Photos, screenshots, and visual assets" },
-    { path: "Media/Audio", description: "Music, recordings, and audio exports" },
-    { path: "Packages", description: "Archives, installers, and disk images" },
-  ],
-};
+export type ConfigLocation = { path: string | null; defaultPath: string };
 
-const demoMoves: Array<[string, string, string, ClassificationBasis]> = [
-  ["project-brief.pdf", "d0001", "Documents/Work/project-brief.pdf", "name"],
-  ["meeting-notes.md", "d0001", "Documents/Work/meeting-notes.md", "name"],
-  ["roadmap-q3.pdf", "d0001", "Documents/Work/roadmap-q3.pdf", "content"],
-  ["research-links.md", "d0001", "Documents/Work/research-links.md", "name"],
-  ["receipt-june.pdf", "d0002", "Documents/Personal/receipt-june.pdf", "name"],
-  ["tax-form.pdf", "d0002", "Documents/Personal/tax-form.pdf", "content"],
-  ["travel-booking.pdf", "d0002", "Documents/Personal/travel-booking.pdf", "name"],
-  ["screenshot-001.png", "d0003", "Media/Images/screenshot-001.png", "name"],
-  ["screenshot-002.png", "d0003", "Media/Images/screenshot-002.png", "name"],
-  ["portrait.png", "d0003", "Media/Images/portrait.png", "content"],
-  ["diagram-export.png", "d0003", "Media/Images/diagram-export.png", "name"],
-  ["voice-note-01.mp3", "d0004", "Media/Audio/voice-note-01.mp3", "name"],
-  ["interview.mp3", "d0004", "Media/Audio/interview.mp3", "content"],
-  ["ambient-loop.wav", "d0004", "Media/Audio/ambient-loop.wav", "extension_fallback"],
-  ["source-bundle.zip", "d0005", "Packages/source-bundle.zip", "name"],
-  ["temari-linux.tar.gz", "d0005", "Packages/temari-linux.tar.gz", "name"],
-  ["utilities.zip", "d0005", "Packages/utilities.zip", "extension_fallback"],
-  ["installer.dmg", "d0005", "Packages/installer.dmg", "extension_fallback"],
+const now = Date.now();
+const demoWorkspaces: ManagedWorkspace[] = [
+  {
+    id: "workspace-downloads",
+    source: "/Users/you/Downloads",
+    retentionSeconds: 259_200,
+    settleSeconds: 30,
+    enabled: true,
+    createdUnixMs: now - 12 * 86_400_000,
+    updatedUnixMs: now - 18 * 60_000,
+  },
+  {
+    id: "workspace-desktop",
+    source: "/Users/you/Desktop",
+    retentionSeconds: 259_200,
+    settleSeconds: 30,
+    enabled: false,
+    createdUnixMs: now - 4 * 86_400_000,
+    updatedUnixMs: now - 2 * 86_400_000,
+  },
 ];
 
-const demoFolders: FolderSet["folders"] = demoProposal.folders.map((folder, index) => ({
-  ...folder,
-  id: `d${String(index + 1).padStart(4, "0")}`,
-  model_visible: true,
-  fallback: null,
-}));
-
-const demoPlan: PlanPreview = {
-  sha256: "6a122287a651db254964911b346f5c28ecf20434729971d9ea601c83c36630c8",
-  plan: {
-    version: 4,
-    source: demoProposal.source,
-    source_identity: { device: 1, inode: 42 },
-    scope: demoProposal.scope,
-    collision_policy: "rename",
-    folders: demoFolders,
-    directories: [
-      "Documents",
-      "Media",
-      "Packages",
-      "Documents/Personal",
-      "Documents/Work",
-      "Media/Audio",
-      "Media/Images",
-    ],
-    entries: demoMoves.map(([sourcePath, destinationId, destinationPath, basis], index) => ({
-      file_id: `f${String(index + 1).padStart(6, "0")}`,
-      source_path: sourcePath,
-      source_fingerprint: { identity: { device: 1, inode: 100 + index }, size: 1024 + index, sha256: "0".repeat(64) },
-      destination_id: destinationId,
-      requested_destination: destinationPath,
-      destination_path: destinationPath,
-      reasoning: null,
-      classification_basis: basis,
-      rule_id: null,
-    })),
+let demoHistory: ManagedMove[] = [
+  {
+    sessionId: "run-20260722-01",
+    kind: "classify",
+    moveId: "f0001",
+    sourcePath: "Inbox/quarterly-notes.pdf",
+    destinationPath: "Library/Work/quarterly-notes.pdf",
+    undone: false,
+    undoOutcome: null,
+    finishedUnixMs: now - 18 * 60_000,
   },
-};
+  {
+    sessionId: "run-20260721-04",
+    kind: "stage",
+    moveId: "f0002",
+    sourcePath: "receipt-july.pdf",
+    destinationPath: "Inbox/receipt-july.pdf",
+    undone: false,
+    undoOutcome: null,
+    finishedUnixMs: now - 28 * 60 * 60_000,
+  },
+  {
+    sessionId: "run-20260720-02",
+    kind: "classify",
+    moveId: "f0003",
+    sourcePath: "Inbox/screenshot-1842.png",
+    destinationPath: "Library/Images/Screenshots/screenshot-1842.png",
+    undone: true,
+    undoOutcome: "restored",
+    finishedUnixMs: now - 2 * 86_400_000,
+  },
+];
 
-let demoApproved: FolderSet | null = null;
-let demoApplied: ApplyResult | null = null;
+let demoSchedule: ScheduleStatus = {
+  platform: "launchd",
+  installed: true,
+  enabled: true,
+  active: false,
+  intervalSeconds: 900,
+};
 
 function isTauri(): boolean {
   return "__TAURI_INTERNALS__" in window;
 }
 
-export type ConfigLocation = {
-  path: string | null;
-  defaultPath: string;
-};
+function demoWorkspace(id: string): ManagedWorkspace {
+  const workspace = demoWorkspaces.find((item) => item.id === id);
+  if (!workspace) throw new Error("The selected workspace no longer exists.");
+  return workspace;
+}
 
 export async function defaultConfigLocation(): Promise<ConfigLocation> {
   if (!isTauri()) {
-    return {
-      path: "/Users/you/Library/Application Support/dev.yutakobayashidev.temari/config.toml",
-      defaultPath: "/Users/you/Library/Application Support/dev.yutakobayashidev.temari/config.toml",
-    };
+    const path = "/Users/you/Library/Application Support/dev.yutakobayashidev.temari/config.toml";
+    return { path, defaultPath: path };
   }
   return invoke<ConfigLocation>("default_config_location");
 }
 
 export async function chooseSource(): Promise<string | null> {
-  if (!isTauri()) return demoProposal.source;
-  const selected = await open({
-    directory: true,
-    multiple: false,
-    title: "Choose a folder to organize",
-  });
+  if (!isTauri()) return "/Users/you/Documents";
+  const selected = await open({ directory: true, multiple: false, title: "Choose a folder to organize" });
   return typeof selected === "string" ? selected : null;
 }
 
@@ -119,111 +112,183 @@ export async function chooseConfig(): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
-export async function scanSource(source: string): Promise<ScanPreview> {
-  if (!isTauri()) {
-    return {
-      source,
-      scope: { recursive_roots: [] },
-      fileCount: demoProposal.files_considered,
-      sampledFiles: [],
-      extensionCounts: { pdf: 5, png: 4, zip: 3, md: 2, mp3: 2, other: 2 },
-    };
-  }
-  return invoke<ScanPreview>("scan_source", { request: { source, recursiveRoots: [] } });
+export async function chooseTemariExecutable(): Promise<string | null> {
+  if (!isTauri()) return "/Users/you/.local/bin/temari";
+  const selected = await open({
+    directory: false,
+    multiple: false,
+    title: "Choose the Temari CLI executable",
+  });
+  return typeof selected === "string" ? selected : null;
 }
 
-export async function proposeStructure(source: string, configPath: string): Promise<Proposal> {
+export async function listManagedWorkspaces(): Promise<ManagedWorkspace[]> {
+  if (!isTauri()) return structuredClone(demoWorkspaces);
+  return invoke<ManagedWorkspace[]>("managed_list_workspaces");
+}
+
+export async function getManagedWorkspace(workspaceId: string): Promise<ManagedWorkspaceStatus> {
   if (!isTauri()) {
-    demoApplied = null;
-    return { ...structuredClone(demoProposal), source };
+    const workspace = structuredClone(demoWorkspace(workspaceId));
+    return {
+      health: workspace.enabled ? "healthy" : "disabled",
+      issues: [],
+      workspace,
+      inbox: {
+        physicalFiles: workspaceId === "workspace-downloads" ? 7 : 1,
+        indexedPending: workspaceId === "workspace-downloads" ? 7 : 1,
+        indexedPlanned: 0,
+        indexedMoved: 34,
+        eligibleNow: workspaceId === "workspace-downloads" ? 2 : 0,
+        nextEligibleUnixMs: now + 42 * 60_000,
+      },
+      runs: { total: 41, actionable: [] },
+    };
   }
-  return invoke<Proposal>("propose_structure", {
-    request: { configPath, source, recursiveRoots: [], maxFolders: 8 },
+  return invoke<ManagedWorkspaceStatus>("managed_get_workspace", { request: { workspaceId } });
+}
+
+export async function proposeManagedWorkspace(
+  source: string,
+  configPath: string,
+): Promise<SetupProposal> {
+  if (!isTauri()) {
+    return {
+      token: "demo-proposal",
+      source,
+      filesConsidered: 24,
+      folders: [
+        { path: "Work", description: "Project documents and working material" },
+        { path: "Personal", description: "Personal records, forms, and receipts" },
+        { path: "Images", description: "Photos, screenshots, and visual assets" },
+      ],
+    };
+  }
+  return invoke<SetupProposal>("managed_propose_workspace", {
+    request: { source, configPath, maxFolders: 8 },
   });
 }
 
-export async function approveStructure(proposal: Proposal): Promise<FolderSet> {
+export async function previewManagedWorkspace(
+  proposal: SetupProposal,
+  retentionSeconds: number,
+  settleSeconds: number,
+): Promise<SetupPreview> {
   if (!isTauri()) {
-    demoApproved = {
-      version: 3,
+    return {
+      token: "demo-preview",
       source: proposal.source,
-      scope: proposal.scope,
-      folders: proposal.folders.map((folder, index) => ({
-        ...folder,
-        id: `d${String(index + 1).padStart(4, "0")}`,
-        model_visible: true,
-        fallback: null,
-      })),
+      directories: ["Kept", "Inbox", "Library", ...proposal.folders.map((folder) => `Library/${folder.path}`)],
+      moves: [
+        { sourcePath: "Existing folder", destinationPath: "Kept/Existing folder", area: "kept" },
+        { sourcePath: "notes.pdf", destinationPath: "Inbox/notes.pdf", area: "inbox" },
+      ],
     };
-    return structuredClone(demoApproved);
   }
-  return invoke<FolderSet>("approve_structure", { request: { folders: proposal.folders } });
+  return invoke<SetupPreview>("managed_preview_workspace", {
+    request: { proposalToken: proposal.token, folders: proposal.folders, retentionSeconds, settleSeconds },
+  });
 }
 
-export async function previewPlan(): Promise<PlanPreview> {
+export async function applyManagedWorkspace(previewToken: string): Promise<ManagedWorkspaceStatus> {
   if (!isTauri()) {
-    const preview = structuredClone(demoPlan);
-    if (!demoApproved) return preview;
-    preview.plan.source = demoApproved.source;
-    preview.plan.folders = structuredClone(demoApproved.folders);
-    const foldersById = new Map(demoApproved.folders.map((folder) => [folder.id, folder.path]));
-    for (const entry of preview.plan.entries) {
-      const folder = foldersById.get(entry.destination_id);
-      if (!folder) continue;
-      const fileName = entry.source_path.split("/").at(-1) ?? entry.source_path;
-      entry.destination_path = `${folder}/${fileName}`;
-      entry.requested_destination = entry.destination_path;
-    }
-    const directories = new Set<string>();
-    for (const folder of demoApproved.folders) {
-      const parts = folder.path.split("/");
-      for (let index = 1; index <= parts.length; index += 1) directories.add(parts.slice(0, index).join("/"));
-    }
-    preview.plan.directories = [...directories].sort((left, right) => {
-      const depth = left.split("/").length - right.split("/").length;
-      return depth || left.localeCompare(right);
-    });
-    return preview;
+    const workspace: ManagedWorkspace = {
+      id: "workspace-documents",
+      source: "/Users/you/Documents",
+      retentionSeconds: 259_200,
+      settleSeconds: 30,
+      enabled: true,
+      createdUnixMs: Date.now(),
+      updatedUnixMs: Date.now(),
+    };
+    demoWorkspaces.push(workspace);
+    return getManagedWorkspace(workspace.id);
   }
-  return invoke<PlanPreview>("preview_plan");
+  return invoke<ManagedWorkspaceStatus>("managed_apply_workspace", { request: { previewToken } });
 }
 
-export async function applyReviewedPlan(planSha256: string): Promise<ApplyResult> {
+export async function setManagedWorkspaceEnabled(workspaceId: string, enabled: boolean): Promise<ManagedWorkspace> {
   if (!isTauri()) {
-    if (planSha256 !== demoPlan.sha256) throw new Error("The confirmed plan no longer matches the reviewed plan.");
-    if (demoApplied) throw new Error("The reviewed plan has already been applied.");
-    await new Promise((resolve) => window.setTimeout(resolve, 180));
-    demoApplied = {
-      state: "completed",
-      sessionId: "demo-apply-session",
-      planSha256,
-      plannedFiles: demoPlan.plan.entries.length,
-      movedFiles: demoPlan.plan.entries.length,
-      createdDirectories: demoPlan.plan.directories.length,
-      conflicts: 0,
-      runDirectory: "/Users/you/Library/Application Support/dev.yutakobayashidev.temari/workflows/demo",
-      planPath: "/Users/you/Library/Application Support/dev.yutakobayashidev.temari/workflows/demo/plan.json",
-      journalPath: "/Users/you/Library/Application Support/dev.yutakobayashidev.temari/workflows/demo/apply.json",
-    };
-    return structuredClone(demoApplied);
+    Object.assign(demoWorkspace(workspaceId), { enabled, updatedUnixMs: Date.now() });
+    return structuredClone(demoWorkspace(workspaceId));
   }
-  return invoke<ApplyResult>("apply_reviewed_plan", { request: { planSha256 } });
+  return invoke<ManagedWorkspace>("managed_set_workspace_enabled", { request: { workspaceId }, enabled });
 }
 
-export async function undoAppliedPlan(applySessionId: string): Promise<UndoResult> {
+export async function runManagedWorkspace(workspaceId: string): Promise<ManagedRunResult> {
   if (!isTauri()) {
-    if (!demoApplied || demoApplied.sessionId !== applySessionId) throw new Error("There is no matching applied session to undo.");
-    await new Promise((resolve) => window.setTimeout(resolve, 180));
-    const result: UndoResult = {
-      state: "completed",
-      applySessionId,
-      restoredFiles: demoApplied.movedFiles,
-      removedDirectories: demoApplied.createdDirectories,
-      conflicts: 0,
-      journalPath: `${demoApplied.runDirectory}/undo.json`,
-    };
-    demoApplied = null;
-    return result;
+    await new Promise((resolve) => window.setTimeout(resolve, 300));
+    return { workspaceId, artifactDirectory: "/tmp/temari-demo", directoryAdoption: null, runs: [] };
   }
-  return invoke<UndoResult>("undo_applied_plan", { request: { applySessionId } });
+  return invoke<ManagedRunResult>("managed_run", { request: { workspaceId, apply: true } });
+}
+
+export async function reprocessManagedFiles(
+  workspaceId: string,
+  area: ReprocessArea,
+  paths: string[],
+): Promise<ManagedRunResult> {
+  if (!isTauri()) return {
+    workspaceId,
+    artifactDirectory: "/tmp/temari-demo",
+    directoryAdoption: null,
+    runs: [],
+  };
+  return invoke<ManagedRunResult>("managed_reprocess", {
+    request: { workspaceId, area, paths, apply: true },
+  });
+}
+
+export async function getManagedSchedule(workspaceId: string): Promise<ScheduleStatus> {
+  if (!isTauri()) return structuredClone(demoSchedule);
+  return invoke<ScheduleStatus>("managed_schedule_status", { request: { workspaceId } });
+}
+
+export async function enableManagedSchedule(
+  workspaceId: string,
+  intervalSeconds: number,
+  executablePath: string,
+): Promise<ScheduleStatus> {
+  if (!isTauri()) {
+    demoSchedule = { ...demoSchedule, installed: true, enabled: true, intervalSeconds };
+    return structuredClone(demoSchedule);
+  }
+  return invoke<ScheduleStatus>("managed_schedule_enable", {
+    request: { workspaceId, everySeconds: intervalSeconds, executablePath },
+  });
+}
+
+export async function disableManagedSchedule(workspaceId: string): Promise<ScheduleStatus> {
+  if (!isTauri()) {
+    demoSchedule = { ...demoSchedule, installed: false, enabled: false, active: false };
+    return structuredClone(demoSchedule);
+  }
+  return invoke<ScheduleStatus>("managed_schedule_disable", { request: { workspaceId } });
+}
+
+export async function getManagedHistory(workspaceId: string): Promise<ManagedMove[]> {
+  if (!isTauri()) return structuredClone(demoHistory);
+  return invoke<ManagedMove[]>("managed_history", { request: { workspaceId, limit: 50 } });
+}
+
+export async function undoManagedRun(workspaceId: string, runId: string): Promise<UndoResult> {
+  if (!isTauri()) {
+    const matches = demoHistory.filter((move) => move.sessionId === runId && !move.undone);
+    matches.forEach((move) => { move.undone = true; move.undoOutcome = "restored"; });
+    return { runId, restoredFiles: matches.length, conflicts: 0, state: "completed", journalPath: "/tmp/temari-demo-undo.json" };
+  }
+  return invoke<UndoResult>("managed_undo_session", { request: { workspaceId, sessionId: runId } });
+}
+
+export async function undoManagedMove(
+  workspaceId: string,
+  runId: string,
+  fileId: string,
+): Promise<UndoResult> {
+  if (!isTauri()) {
+    const move = demoHistory.find((item) => item.sessionId === runId && item.moveId === fileId && !item.undone);
+    if (move) { move.undone = true; move.undoOutcome = "restored"; }
+    return { runId, restoredFiles: move ? 1 : 0, conflicts: 0, state: "completed", journalPath: "/tmp/temari-demo-undo.json" };
+  }
+  return invoke<UndoResult>("managed_undo_move", { request: { workspaceId, sessionId: runId, moveId: fileId } });
 }

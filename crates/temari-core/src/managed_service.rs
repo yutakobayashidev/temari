@@ -1,0 +1,1313 @@
+use std::{
+    collections::HashSet,
+    fs,
+    io::Write,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use serde::Serialize;
+use tempfile::NamedTempFile;
+
+use crate::{
+    ApplySession, ApplyState, Config, Error, FolderSet, InboxReconcileSummary, InboxState,
+    LocalContentExtractor, ManagedReprocessArea, ManagedReprocessSelection, ManagedRun,
+    ManagedRunKind, ManagedSetupPlan, ManagedSetupSession, ManagedSetupState,
+    ManagedSetupUndoSession, ManagedSetupUndoState, ManagedWorkspace, MonitorRecord,
+    MonitoringOptions, OpenAiCompatibleModel, Plan, RunState, SourceLock, StateStore,
+    apply_managed_directory_adoption, apply_managed_setup, apply_monitoring_plan, apply_plan,
+    build_managed_directory_adoption_plan, build_reprocess_to_inbox_plan,
+    build_stage_to_inbox_plan, canonical_source_identity, filter_inbox_candidates,
+    fingerprint_candidate, inbox_file_candidates, library_folder_set, persist_monitoring_plan,
+    plan_monitor_candidates, reprocess_file_candidates, resume_apply_session, resume_managed_setup,
+    root_file_candidates, undo_managed_directory_adoption,
+};
+
+static ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug)]
+pub struct ManagedService {
+    state_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ManagedDirectoryAdoption {
+    pub run_id: String,
+    pub plan_path: String,
+    pub apply_path: Option<String>,
+    pub move_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ManagedCycleResult {
+    pub workspace_id: String,
+    pub artifact_directory: String,
+    pub directory_adoption: Option<ManagedDirectoryAdoption>,
+    pub runs: Vec<ManagedRun>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ManagedActivationResult {
+    pub workspace: ManagedWorkspace,
+    pub setup_run: ManagedRun,
+}
+
+impl ManagedService {
+    pub fn new(state_path: impl Into<PathBuf>) -> Self {
+        Self {
+            state_path: state_path.into(),
+        }
+    }
+
+    pub fn state_path(&self) -> &Path {
+        &self.state_path
+    }
+
+    pub fn activate_workspace(
+        &self,
+        plan: &ManagedSetupPlan,
+        raw_folders: &FolderSet,
+        config_path: &Path,
+        retention_seconds: u64,
+        settle_seconds: u64,
+    ) -> Result<ManagedActivationResult, Error> {
+        self.activate_workspace_in(
+            plan,
+            raw_folders,
+            config_path,
+            retention_seconds,
+            settle_seconds,
+            None,
+        )
+    }
+
+    pub fn activate_workspace_in(
+        &self,
+        plan: &ManagedSetupPlan,
+        raw_folders: &FolderSet,
+        config_path: &Path,
+        retention_seconds: u64,
+        settle_seconds: u64,
+        run_directory: Option<&Path>,
+    ) -> Result<ManagedActivationResult, Error> {
+        validate_windows(retention_seconds, settle_seconds)?;
+        plan.validate()?;
+        raw_folders.validate()?;
+        if raw_folders.source != plan.source {
+            return Err(Error::InvalidState(
+                "approved folders do not belong to the managed source".into(),
+            ));
+        }
+        let config_path = canonical_config_path(config_path, Path::new(&plan.source))?;
+        let managed_folders = library_folder_set(raw_folders)?;
+        let mut store = self.store()?;
+        validate_state_outside_source(&self.state_path, Path::new(&plan.source))?;
+        ensure_no_monitor_overlap(&store, Path::new(&plan.source))?;
+
+        let workspace_id = new_id("workspace")?;
+        let run_directory = match run_directory {
+            Some(path) => create_requested_run_directory(path, Path::new(&plan.source))?,
+            None => self.create_run_directory(&workspace_id, "setup")?,
+        };
+        let plan_path = run_directory.join("setup-plan.json");
+        let folders_path = run_directory.join("folders.json");
+        let setup_path = run_directory.join("setup-session.json");
+        write_json(&plan_path, plan)?;
+        write_json(&folders_path, &managed_folders)?;
+        let setup = apply_managed_setup(plan, &setup_path)?;
+        if setup.state != ManagedSetupState::Completed {
+            return Err(Error::InvalidState(format!(
+                "managed setup finished with {:?}; inspect {}",
+                setup.state,
+                setup_path.display()
+            )));
+        }
+
+        let recovery_error = |error| activation_recovery_error(error, &setup_path);
+        let now = unix_ms().map_err(&recovery_error)?;
+        let monitor_id = new_id("managed-monitor").map_err(&recovery_error)?;
+        let folder_digest = managed_folders.sha256().map_err(&recovery_error)?;
+        let folder_path_text = path_text(&folders_path).map_err(&recovery_error)?;
+        let monitor = MonitorRecord {
+            id: monitor_id.clone(),
+            source: plan.source.clone(),
+            source_identity: plan.source_identity.clone(),
+            folder_set_path: folder_path_text.clone(),
+            folder_set_sha256: folder_digest.clone(),
+            interval_seconds: retention_seconds.max(10),
+            enabled: true,
+            last_checked_unix_ms: None,
+            created_unix_ms: now,
+            updated_unix_ms: now,
+            deleted_unix_ms: None,
+        };
+        let workspace = ManagedWorkspace {
+            id: workspace_id.clone(),
+            monitor_id: monitor_id.clone(),
+            source: plan.source.clone(),
+            source_identity: plan.source_identity.clone(),
+            folder_set_path: folder_path_text,
+            folder_set_sha256: folder_digest,
+            config_path: path_text(&config_path).map_err(&recovery_error)?,
+            retention_seconds,
+            settle_seconds,
+            enabled: true,
+            setup_session_path: Some(path_text(&setup_path).map_err(&recovery_error)?),
+            created_unix_ms: now,
+            updated_unix_ms: now,
+        };
+        store.insert_monitor(&monitor).map_err(&recovery_error)?;
+        if let Err(error) = store.insert_managed_workspace(&workspace) {
+            let _ = store.remove_monitor(&monitor_id, now);
+            return Err(recovery_error(error));
+        }
+        let setup_run =
+            setup_run(&workspace_id, &plan_path, &setup_path, &setup).map_err(&recovery_error)?;
+        if let Err(error) = store.insert_managed_run(&setup_run) {
+            let _ = store.delete_managed_workspace(&workspace_id);
+            let _ = store.remove_monitor(&monitor_id, now);
+            return Err(recovery_error(error));
+        }
+        Ok(ManagedActivationResult {
+            workspace,
+            setup_run,
+        })
+    }
+
+    pub fn run_workspace(
+        &self,
+        workspace_id: &str,
+        apply: bool,
+    ) -> Result<ManagedCycleResult, Error> {
+        self.run_workspace_in(workspace_id, apply, None)
+    }
+
+    pub fn run_workspace_in(
+        &self,
+        workspace_id: &str,
+        apply: bool,
+        run_directory: Option<&Path>,
+    ) -> Result<ManagedCycleResult, Error> {
+        let mut store = self.store()?;
+        let workspace = require_workspace(&store, workspace_id)?;
+        self.validate_workspace(&store, &workspace)?;
+        let source = Path::new(&workspace.source);
+        let out = match run_directory {
+            Some(path) => create_requested_run_directory(path, source)?,
+            None => self.create_run_directory(&workspace.id, "cycle")?,
+        };
+
+        let mut runs = Vec::new();
+        let adoption_plan = build_managed_directory_adoption_plan(source)?;
+        let directory_adoption = if adoption_plan.moves.is_empty() {
+            None
+        } else {
+            let plan_path = out.join("directory-adoption-plan.json");
+            write_json(&plan_path, &adoption_plan)?;
+            let mut run = adoption_run(&workspace.id, &plan_path, &adoption_plan)?;
+            store.insert_managed_run(&run)?;
+            if apply {
+                apply_adoption_run(&mut store, &workspace, &mut run)?;
+            }
+            let result = ManagedDirectoryAdoption {
+                run_id: run.id.clone(),
+                plan_path: path_text(&plan_path)?,
+                apply_path: run.apply_path.clone(),
+                move_count: adoption_plan.moves.len() as u64,
+            };
+            runs.push(run);
+            Some(result)
+        };
+
+        let mut root_candidates = Vec::new();
+        for candidate in root_file_candidates(source)? {
+            let fingerprint = fingerprint_candidate(source, &candidate)?;
+            if !store.has_processed_identity(&workspace.monitor_id, fingerprint.identity)? {
+                root_candidates.push(candidate);
+            }
+        }
+        if !root_candidates.is_empty() {
+            runs.push(self.run_stage(&mut store, &workspace, &out, &root_candidates, apply)?);
+        }
+
+        observe_inbox(&mut store, &workspace, unix_ms()?)?;
+        let inbox_candidates = inbox_file_candidates(source)?;
+        let eligible_paths = store
+            .eligible_items(workspace_id, unix_ms()?)?
+            .into_iter()
+            .map(|item| item.relative_path)
+            .collect::<HashSet<_>>();
+        let eligible =
+            filter_inbox_candidates(&inbox_candidates, &HashSet::new(), &eligible_paths)?;
+        runs.push(self.run_classify(&mut store, &workspace, &out, &eligible, apply)?);
+
+        Ok(ManagedCycleResult {
+            workspace_id: workspace.id,
+            artifact_directory: path_text(&out)?,
+            directory_adoption,
+            runs,
+        })
+    }
+
+    pub fn reprocess(
+        &self,
+        workspace_id: &str,
+        area: ManagedReprocessArea,
+        selection: &ManagedReprocessSelection,
+        apply: bool,
+    ) -> Result<ManagedCycleResult, Error> {
+        self.reprocess_in(workspace_id, area, selection, apply, None)
+    }
+
+    pub fn reprocess_in(
+        &self,
+        workspace_id: &str,
+        area: ManagedReprocessArea,
+        selection: &ManagedReprocessSelection,
+        apply: bool,
+        run_directory: Option<&Path>,
+    ) -> Result<ManagedCycleResult, Error> {
+        let mut store = self.store()?;
+        let workspace = require_workspace(&store, workspace_id)?;
+        self.validate_workspace(&store, &workspace)?;
+        let source = Path::new(&workspace.source);
+        let candidates = reprocess_file_candidates(source, area, selection)?;
+        if candidates.is_empty() {
+            return Err(Error::InvalidState(
+                "the selected managed area contains no regular files".into(),
+            ));
+        }
+        let out = match run_directory {
+            Some(path) => create_requested_run_directory(path, source)?,
+            None => self.create_run_directory(&workspace.id, "reprocess")?,
+        };
+        let plan = build_reprocess_to_inbox_plan(source, area, &candidates)?;
+        let plan_path = out.join("reprocess-plan.json");
+        write_json(&plan_path, &plan)?;
+        let id = new_id("managed-reprocess")?;
+        let mut run = planned_run(&id, &workspace.id, ManagedRunKind::Stage, &plan_path, &plan)?;
+        store.insert_managed_run(&run)?;
+        if apply {
+            apply_indexed_run(&mut store, &workspace, &mut run)?;
+        }
+        Ok(ManagedCycleResult {
+            workspace_id: workspace.id,
+            artifact_directory: path_text(&out)?,
+            directory_adoption: None,
+            runs: vec![run],
+        })
+    }
+
+    pub fn apply_run(&self, run_id: &str) -> Result<ManagedRun, Error> {
+        let mut store = self.store()?;
+        let mut run = require_run(&store, run_id)?;
+        if run.state != RunState::Planned {
+            return Err(Error::InvalidState(format!(
+                "managed run {run_id:?} is not waiting for apply"
+            )));
+        }
+        let workspace = require_workspace(&store, &run.workspace_id)?;
+        self.validate_workspace(&store, &workspace)?;
+        if run.kind == ManagedRunKind::Adopt {
+            apply_adoption_run(&mut store, &workspace, &mut run)?;
+        } else {
+            apply_indexed_run(&mut store, &workspace, &mut run)?;
+        }
+        Ok(run)
+    }
+
+    pub fn resume_run(&self, run_id: &str) -> Result<ManagedRun, Error> {
+        let mut store = self.store()?;
+        let mut run = require_run(&store, run_id)?;
+        if !matches!(run.state, RunState::Applying | RunState::NeedsResume) {
+            return Err(Error::InvalidState(format!(
+                "managed run {run_id:?} does not need resume"
+            )));
+        }
+        let workspace = require_workspace(&store, &run.workspace_id)?;
+        self.validate_workspace(&store, &workspace)?;
+        if run.kind == ManagedRunKind::Adopt {
+            resume_adoption_run(&mut store, &mut run)?;
+        } else {
+            resume_indexed_run(&mut store, &workspace, &mut run)?;
+        }
+        Ok(run)
+    }
+
+    pub fn undo_adoption_run(
+        &self,
+        run_id: &str,
+        journal_path: &Path,
+    ) -> Result<ManagedSetupUndoSession, Error> {
+        let mut store = self.store()?;
+        let mut run = require_run(&store, run_id)?;
+        if run.kind != ManagedRunKind::Adopt || run.state != RunState::Completed {
+            return Err(Error::InvalidState(
+                "directory adoption Undo requires a completed adoption run".into(),
+            ));
+        }
+        if run.undo_path.is_some() {
+            return Err(Error::InvalidState(
+                "directory adoption run has already been undone".into(),
+            ));
+        }
+        let apply_path = run
+            .apply_path
+            .as_deref()
+            .ok_or_else(|| Error::InvalidState("adoption run has no Apply session".into()))?;
+        let session = ManagedSetupSession::load(Path::new(apply_path))?;
+        let undo = undo_managed_directory_adoption(&session, journal_path)?;
+        run.undo_path = Some(path_text(journal_path)?);
+        store.update_managed_run(&run)?;
+        if undo.state != ManagedSetupUndoState::Completed {
+            return Err(Error::InvalidState(format!(
+                "directory adoption Undo finished with {:?}",
+                undo.state
+            )));
+        }
+        Ok(undo)
+    }
+
+    fn store(&self) -> Result<StateStore, Error> {
+        StateStore::open(&self.state_path)
+    }
+
+    fn validate_workspace(
+        &self,
+        store: &StateStore,
+        workspace: &ManagedWorkspace,
+    ) -> Result<(), Error> {
+        if !workspace.enabled {
+            return Err(Error::InvalidState("managed workspace is disabled".into()));
+        }
+        let (source, identity) = canonical_source_identity(Path::new(&workspace.source))?;
+        if source != Path::new(&workspace.source) || identity != workspace.source_identity {
+            return Err(Error::InvalidState(
+                "managed workspace source identity changed".into(),
+            ));
+        }
+        validate_state_outside_source(&self.state_path, &source)?;
+        let config_path = canonical_config_path(Path::new(&workspace.config_path), &source)?;
+        if config_path != Path::new(&workspace.config_path) {
+            return Err(Error::InvalidState(
+                "managed workspace model configuration path changed".into(),
+            ));
+        }
+        let folders = FolderSet::load(Path::new(&workspace.folder_set_path))?;
+        if folders.source != workspace.source || folders.sha256()? != workspace.folder_set_sha256 {
+            return Err(Error::InvalidState(
+                "managed workspace folder set changed".into(),
+            ));
+        }
+        let monitor = store
+            .monitor(&workspace.monitor_id)?
+            .filter(|monitor| monitor.deleted_unix_ms.is_none())
+            .ok_or_else(|| Error::InvalidState("managed monitor is missing".into()))?;
+        if monitor.source != workspace.source
+            || monitor.source_identity != workspace.source_identity
+            || monitor.folder_set_sha256 != workspace.folder_set_sha256
+            || monitor.enabled != workspace.enabled
+        {
+            return Err(Error::InvalidState(
+                "managed monitor no longer matches its workspace".into(),
+            ));
+        }
+        for area in ["Kept", "Inbox", "Library"] {
+            let path = source.join(area);
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| io_error("inspect managed area", &path, error))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(Error::InvalidState(format!(
+                    "managed area is not a real directory: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn create_run_directory(&self, workspace_id: &str, kind: &str) -> Result<PathBuf, Error> {
+        let parent = self.state_path.parent().ok_or_else(|| {
+            Error::InvalidState("managed state database has no parent directory".into())
+        })?;
+        let root = parent.join("managed-runs");
+        ensure_private_directory(&root)?;
+        let workspace_root = root.join(workspace_id);
+        ensure_private_directory(&workspace_root)?;
+        let run = workspace_root.join(new_id(kind)?);
+        fs::create_dir(&run).map_err(|error| io_error("create managed run", &run, error))?;
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o700))
+            .map_err(|error| io_error("secure managed run", &run, error))?;
+        Ok(run)
+    }
+
+    fn run_stage(
+        &self,
+        store: &mut StateStore,
+        workspace: &ManagedWorkspace,
+        out: &Path,
+        candidates: &[crate::FileCandidate],
+        apply: bool,
+    ) -> Result<ManagedRun, Error> {
+        let id = new_id("managed-stage")?;
+        let plan = build_stage_to_inbox_plan(Path::new(&workspace.source), candidates)?;
+        let plan_path = out.join("stage-plan.json");
+        write_json(&plan_path, &plan)?;
+        let mut run = planned_run(&id, &workspace.id, ManagedRunKind::Stage, &plan_path, &plan)?;
+        store.insert_managed_run(&run)?;
+        if apply {
+            apply_indexed_run(store, workspace, &mut run)?;
+        }
+        Ok(run)
+    }
+
+    fn run_classify(
+        &self,
+        store: &mut StateStore,
+        workspace: &ManagedWorkspace,
+        out: &Path,
+        candidates: &[crate::FileCandidate],
+        apply: bool,
+    ) -> Result<ManagedRun, Error> {
+        let id = new_id("managed-classify")?;
+        let started = unix_ms()?;
+        if candidates.is_empty() {
+            let run = noop_run(id, &workspace.id, started)?;
+            store.insert_managed_run(&run)?;
+            return Ok(run);
+        }
+        let monitor = store
+            .monitor(&workspace.monitor_id)?
+            .filter(|monitor| monitor.deleted_unix_ms.is_none())
+            .ok_or_else(|| Error::InvalidState("managed monitor is missing".into()))?;
+        let folders = FolderSet::load(Path::new(&workspace.folder_set_path))?;
+        let rules = store.active_rules(&monitor.id)?;
+        let config = Config::load(Path::new(&workspace.config_path))?;
+        let model = OpenAiCompatibleModel::new(&config.model)?;
+        let extractor = LocalContentExtractor::new(config.privacy.extraction.clone());
+        let monitoring = plan_monitor_candidates(
+            store,
+            &monitor,
+            &folders,
+            &rules,
+            candidates,
+            &model,
+            &extractor,
+            MonitoringOptions::from_config(&config),
+        )?;
+        store.start_run(&id, &monitor.id, started)?;
+        if monitoring.plan.entries.is_empty() {
+            store.finish_noop(&id, monitoring.stats.total_files as u64, unix_ms()?)?;
+            let run = noop_run(id, &workspace.id, started)?;
+            store.insert_managed_run(&run)?;
+            return Ok(run);
+        }
+        let plan_path = out.join("classify-plan.json");
+        persist_monitoring_plan(store, &id, &plan_path, &monitoring)?;
+        let mut run = planned_run(
+            &id,
+            &workspace.id,
+            ManagedRunKind::Classify,
+            &plan_path,
+            &monitoring.plan,
+        )?;
+        store.insert_managed_run(&run)?;
+        mark_inbox_entries(store, workspace, &monitoring.plan, InboxState::Planned, &id)?;
+        if apply {
+            apply_indexed_run(store, workspace, &mut run)?;
+        }
+        Ok(run)
+    }
+}
+
+fn adoption_run(
+    workspace_id: &str,
+    plan_path: &Path,
+    plan: &ManagedSetupPlan,
+) -> Result<ManagedRun, Error> {
+    Ok(ManagedRun {
+        id: new_id("managed-adopt")?,
+        workspace_id: workspace_id.into(),
+        kind: ManagedRunKind::Adopt,
+        state: RunState::Planned,
+        plan_path: Some(path_text(plan_path)?),
+        apply_path: None,
+        undo_path: None,
+        started_unix_ms: unix_ms()?,
+        finished_unix_ms: None,
+        move_count: plan.moves.len() as u64,
+        error: None,
+    })
+}
+
+fn apply_adoption_run(
+    store: &mut StateStore,
+    _workspace: &ManagedWorkspace,
+    run: &mut ManagedRun,
+) -> Result<(), Error> {
+    let plan_path = run
+        .plan_path
+        .as_deref()
+        .ok_or_else(|| Error::InvalidState("adoption run has no Plan path".into()))?;
+    let plan = ManagedSetupPlan::load(Path::new(plan_path))?;
+    let parent = Path::new(plan_path)
+        .parent()
+        .ok_or_else(|| Error::InvalidState("adoption Plan has no parent directory".into()))?;
+    let apply_path = parent.join("directory-adoption-apply.json");
+    run.state = RunState::Applying;
+    run.apply_path = Some(path_text(&apply_path)?);
+    store.update_managed_run(run)?;
+    let session = match apply_managed_directory_adoption(&plan, &apply_path) {
+        Ok(session) => session,
+        Err(error) => {
+            finalize_adoption_error(store, run, &apply_path, &error.to_string())?;
+            return Err(error);
+        }
+    };
+    finish_adoption_session(store, run, &session)
+}
+
+fn resume_adoption_run(store: &mut StateStore, run: &mut ManagedRun) -> Result<(), Error> {
+    let apply_path = run
+        .apply_path
+        .clone()
+        .ok_or_else(|| Error::InvalidState("adoption run has no Apply session".into()))?;
+    let current = ManagedSetupSession::load(Path::new(&apply_path))?;
+    let session = match current.state {
+        ManagedSetupState::Running => match resume_managed_setup(Path::new(&apply_path)) {
+            Ok(session) => session,
+            Err(error) => {
+                finalize_adoption_error(store, run, Path::new(&apply_path), &error.to_string())?;
+                return Err(error);
+            }
+        },
+        ManagedSetupState::Completed => current,
+        state => {
+            run.state = RunState::Failed;
+            run.finished_unix_ms = Some(unix_ms()?);
+            run.error = Some(format!("adoption session finished with {state:?}"));
+            store.update_managed_run(run)?;
+            return Err(Error::InvalidState(format!(
+                "managed directory adoption is not resumable; found {state:?}"
+            )));
+        }
+    };
+    finish_adoption_session(store, run, &session)
+}
+
+fn finish_adoption_session(
+    store: &mut StateStore,
+    run: &mut ManagedRun,
+    session: &ManagedSetupSession,
+) -> Result<(), Error> {
+    run.finished_unix_ms = Some(unix_ms()?);
+    if session.state == ManagedSetupState::Completed {
+        run.state = RunState::Completed;
+        run.error = None;
+        store.update_managed_run(run)
+    } else {
+        run.state = if session.state == ManagedSetupState::Running {
+            RunState::NeedsResume
+        } else {
+            RunState::Failed
+        };
+        run.error = Some(format!(
+            "directory adoption finished with {:?}",
+            session.state
+        ));
+        store.update_managed_run(run)?;
+        Err(Error::InvalidState(format!(
+            "managed directory adoption finished with {:?}",
+            session.state
+        )))
+    }
+}
+
+fn finalize_adoption_error(
+    store: &mut StateStore,
+    run: &mut ManagedRun,
+    apply_path: &Path,
+    message: &str,
+) -> Result<(), Error> {
+    let resumable = ManagedSetupSession::load(apply_path)
+        .is_ok_and(|session| session.state == ManagedSetupState::Running);
+    run.state = if resumable {
+        RunState::NeedsResume
+    } else {
+        RunState::Failed
+    };
+    run.finished_unix_ms = Some(unix_ms()?);
+    run.error = Some(sanitize_error(message));
+    store.update_managed_run(run)
+}
+
+fn resume_indexed_run(
+    store: &mut StateStore,
+    workspace: &ManagedWorkspace,
+    run: &mut ManagedRun,
+) -> Result<(), Error> {
+    let apply_path = run
+        .apply_path
+        .clone()
+        .ok_or_else(|| Error::InvalidState("managed run has no Apply session".into()))?;
+    let current = ApplySession::load(Path::new(&apply_path))?;
+    let session = match current.state {
+        ApplyState::Running => match resume_apply_session(Path::new(&apply_path)) {
+            Ok(session) => session,
+            Err(error) => {
+                finalize_apply_error(store, run, Path::new(&apply_path), &error.to_string())?;
+                return Err(error);
+            }
+        },
+        ApplyState::Completed => current,
+        state => {
+            run.state = RunState::Failed;
+            run.finished_unix_ms = Some(unix_ms()?);
+            run.error = Some(format!("apply session finished with {state:?}"));
+            store.update_managed_run(run)?;
+            return Err(Error::InvalidState(format!(
+                "managed Apply session is not resumable; found {state:?}"
+            )));
+        }
+    };
+    let plan_path = run
+        .plan_path
+        .as_deref()
+        .ok_or_else(|| Error::InvalidState("managed run has no Plan path".into()))?;
+    let plan = Plan::load(Path::new(plan_path))?;
+    if run.kind == ManagedRunKind::Classify {
+        store.reconcile_applying_runs(Some(&workspace.monitor_id), unix_ms()?)?;
+    }
+    if session.state != ApplyState::Completed {
+        return finish_incomplete_apply(store, run, session.state);
+    }
+    mark_apply_finalization_pending(store, run)?;
+    finalize_completed_apply(store, workspace, run, &plan)
+}
+
+fn apply_indexed_run(
+    store: &mut StateStore,
+    workspace: &ManagedWorkspace,
+    run: &mut ManagedRun,
+) -> Result<(), Error> {
+    let plan_path = run
+        .plan_path
+        .as_deref()
+        .ok_or_else(|| Error::InvalidState("managed run has no Plan path".into()))?;
+    let plan = Plan::load(Path::new(plan_path))?;
+    let parent = Path::new(plan_path)
+        .parent()
+        .ok_or_else(|| Error::InvalidState("managed Plan has no parent directory".into()))?;
+    let apply_path = parent.join(match run.kind {
+        ManagedRunKind::Stage => "stage-apply.json",
+        ManagedRunKind::Classify => "classify-apply.json",
+        ManagedRunKind::Setup | ManagedRunKind::Adopt => {
+            return Err(Error::InvalidState(
+                "setup runs cannot be applied through managed run".into(),
+            ));
+        }
+    });
+    let apply_time = unix_ms()?;
+    run.state = RunState::Applying;
+    run.apply_path = Some(path_text(&apply_path)?);
+    store.update_managed_run(run)?;
+    let applied = match run.kind {
+        ManagedRunKind::Stage => apply_plan(&plan, &apply_path),
+        ManagedRunKind::Classify => {
+            let lock = SourceLock::acquire(Path::new(&workspace.source))?;
+            apply_monitoring_plan(store, &run.id, &plan, &apply_path, &lock, apply_time)
+        }
+        ManagedRunKind::Setup | ManagedRunKind::Adopt => unreachable!(),
+    };
+    let session = match applied {
+        Ok(session) => session,
+        Err(error) => {
+            finalize_apply_error(store, run, &apply_path, &error.to_string())?;
+            return Err(error);
+        }
+    };
+    if session.state != ApplyState::Completed {
+        return finish_incomplete_apply(store, run, session.state);
+    }
+    mark_apply_finalization_pending(store, run)?;
+    finalize_completed_apply(store, workspace, run, &plan)
+}
+
+fn mark_apply_finalization_pending(
+    store: &mut StateStore,
+    run: &mut ManagedRun,
+) -> Result<(), Error> {
+    run.state = RunState::NeedsResume;
+    run.finished_unix_ms = Some(unix_ms()?);
+    run.error = Some("apply completed; state finalization is pending".into());
+    store.update_managed_run(run)
+}
+
+fn finalize_completed_apply(
+    store: &mut StateStore,
+    workspace: &ManagedWorkspace,
+    run: &mut ManagedRun,
+    plan: &Plan,
+) -> Result<(), Error> {
+    match run.kind {
+        ManagedRunKind::Stage => complete_stage_index(store, workspace, plan, unix_ms()?)?,
+        ManagedRunKind::Classify => {
+            mark_inbox_entries(store, workspace, plan, InboxState::Moved, &run.id)?
+        }
+        ManagedRunKind::Setup | ManagedRunKind::Adopt => unreachable!(),
+    }
+    run.state = RunState::Completed;
+    run.finished_unix_ms = Some(unix_ms()?);
+    run.error = None;
+    store.update_managed_run(run)
+}
+
+fn finish_incomplete_apply(
+    store: &mut StateStore,
+    run: &mut ManagedRun,
+    state: ApplyState,
+) -> Result<(), Error> {
+    run.state = if state == ApplyState::Running {
+        RunState::NeedsResume
+    } else {
+        RunState::Failed
+    };
+    run.finished_unix_ms = Some(unix_ms()?);
+    run.error = Some(format!("apply session finished with {state:?}"));
+    store.update_managed_run(run)?;
+    Err(Error::InvalidState(format!(
+        "managed apply finished with {state:?}"
+    )))
+}
+
+fn finalize_apply_error(
+    store: &mut StateStore,
+    run: &mut ManagedRun,
+    apply_path: &Path,
+    message: &str,
+) -> Result<(), Error> {
+    run.apply_path = apply_path
+        .exists()
+        .then(|| path_text(apply_path))
+        .transpose()?;
+    let resumable =
+        ApplySession::load(apply_path).is_ok_and(|session| session.state == ApplyState::Running);
+    run.state = if resumable {
+        RunState::NeedsResume
+    } else {
+        RunState::Failed
+    };
+    run.finished_unix_ms = Some(unix_ms()?);
+    run.error = Some(sanitize_error(message));
+    store.update_managed_run(run)
+}
+
+fn sanitize_error(message: &str) -> String {
+    let value = message
+        .chars()
+        .filter(|value| !value.is_control())
+        .collect::<String>();
+    if value.is_empty() {
+        "managed operation failed".into()
+    } else {
+        value
+    }
+}
+
+fn complete_stage_index(
+    store: &mut StateStore,
+    workspace: &ManagedWorkspace,
+    plan: &Plan,
+    observed_unix_ms: i64,
+) -> Result<(), Error> {
+    for entry in &plan.entries {
+        if entry.source_path.contains('/') {
+            store.forget_processed_file(
+                &workspace.monitor_id,
+                entry.source_fingerprint.identity.clone(),
+            )?;
+        }
+    }
+    observe_inbox(store, workspace, observed_unix_ms)
+}
+
+fn observe_inbox(
+    store: &mut StateStore,
+    workspace: &ManagedWorkspace,
+    now: i64,
+) -> Result<(), Error> {
+    reconcile_inbox(store, workspace, now)?;
+    Ok(())
+}
+
+fn reconcile_inbox(
+    store: &mut StateStore,
+    workspace: &ManagedWorkspace,
+    now: i64,
+) -> Result<InboxReconcileSummary, Error> {
+    let previously_moved = store
+        .inbox_items(&workspace.id)?
+        .into_iter()
+        .filter(|item| item.state == InboxState::Moved)
+        .map(|item| (item.file_identity.device, item.file_identity.inode))
+        .collect::<HashSet<_>>();
+    let mut observed = Vec::new();
+    for candidate in inbox_file_candidates(Path::new(&workspace.source))? {
+        let fingerprint = fingerprint_candidate(Path::new(&workspace.source), &candidate)?;
+        observed.push(fingerprint.identity.clone());
+        store.upsert_observation(&workspace.id, &fingerprint, &candidate.source_path, now)?;
+    }
+    let summary = store.reconcile_inbox_index(&workspace.id, &observed)?;
+    for identity in observed
+        .into_iter()
+        .filter(|identity| previously_moved.contains(&(identity.device, identity.inode)))
+    {
+        store.forget_processed_file(&workspace.monitor_id, identity)?;
+    }
+    Ok(summary)
+}
+
+fn mark_inbox_entries(
+    store: &mut StateStore,
+    workspace: &ManagedWorkspace,
+    plan: &Plan,
+    state: InboxState,
+    run_id: &str,
+) -> Result<(), Error> {
+    for entry in &plan.entries {
+        if store
+            .inbox_item(&workspace.id, entry.source_fingerprint.identity.clone())?
+            .is_some()
+        {
+            store.set_inbox_item_state(
+                &workspace.id,
+                entry.source_fingerprint.identity.clone(),
+                state,
+                Some(run_id),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn planned_run(
+    id: &str,
+    workspace_id: &str,
+    kind: ManagedRunKind,
+    plan_path: &Path,
+    plan: &Plan,
+) -> Result<ManagedRun, Error> {
+    Ok(ManagedRun {
+        id: id.into(),
+        workspace_id: workspace_id.into(),
+        kind,
+        state: RunState::Planned,
+        plan_path: Some(path_text(plan_path)?),
+        apply_path: None,
+        undo_path: None,
+        started_unix_ms: unix_ms()?,
+        finished_unix_ms: None,
+        move_count: plan.entries.len() as u64,
+        error: None,
+    })
+}
+
+fn noop_run(id: String, workspace_id: &str, started: i64) -> Result<ManagedRun, Error> {
+    Ok(ManagedRun {
+        id,
+        workspace_id: workspace_id.into(),
+        kind: ManagedRunKind::Classify,
+        state: RunState::Noop,
+        plan_path: None,
+        apply_path: None,
+        undo_path: None,
+        started_unix_ms: started,
+        finished_unix_ms: Some(unix_ms()?),
+        move_count: 0,
+        error: None,
+    })
+}
+
+fn setup_run(
+    workspace_id: &str,
+    plan_path: &Path,
+    setup_path: &Path,
+    setup: &ManagedSetupSession,
+) -> Result<ManagedRun, Error> {
+    Ok(ManagedRun {
+        id: new_id("managed-setup")?,
+        workspace_id: workspace_id.into(),
+        kind: ManagedRunKind::Setup,
+        state: RunState::Completed,
+        plan_path: Some(path_text(plan_path)?),
+        apply_path: Some(path_text(setup_path)?),
+        undo_path: None,
+        started_unix_ms: i64::try_from(setup.started_unix_ms)
+            .map_err(|_| Error::InvalidState("managed setup start time is too large".into()))?,
+        finished_unix_ms: setup
+            .finished_unix_ms
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| Error::InvalidState("managed setup finish time is too large".into()))?,
+        move_count: setup.moves.len() as u64,
+        error: None,
+    })
+}
+
+fn require_workspace(store: &StateStore, id: &str) -> Result<ManagedWorkspace, Error> {
+    store
+        .managed_workspace(id)?
+        .ok_or_else(|| Error::InvalidState(format!("unknown managed workspace {id:?}")))
+}
+
+fn require_run(store: &StateStore, id: &str) -> Result<ManagedRun, Error> {
+    store
+        .managed_run(id)?
+        .ok_or_else(|| Error::InvalidState(format!("unknown managed run {id:?}")))
+}
+
+fn ensure_no_monitor_overlap(store: &StateStore, source: &Path) -> Result<(), Error> {
+    for monitor in store.active_monitors()? {
+        let existing = Path::new(&monitor.source);
+        if source.starts_with(existing) || existing.starts_with(source) {
+            return Err(Error::InvalidState(format!(
+                "managed source overlaps active workspace {:?}",
+                monitor.source
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_windows(retention_seconds: u64, settle_seconds: u64) -> Result<(), Error> {
+    if retention_seconds == 0 || settle_seconds == 0 {
+        return Err(Error::InvalidState(
+            "workspace retention and settle windows must be greater than zero".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn activation_recovery_error(error: Error, setup_path: &Path) -> Error {
+    Error::InvalidState(format!(
+        "managed setup completed but activation indexing failed: {}; recover or Undo with setup journal {}",
+        sanitize_error(&error.to_string()),
+        setup_path.display()
+    ))
+}
+
+fn validate_state_outside_source(state: &Path, source: &Path) -> Result<(), Error> {
+    let state = absolute_target(state)?;
+    if state.starts_with(source) {
+        return Err(Error::InvalidState(
+            "managed state database must be outside the managed source".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_config_path(path: &Path, source: &Path) -> Result<PathBuf, Error> {
+    let path = fs::canonicalize(path)
+        .map_err(|error| io_error("resolve model configuration", path, error))?;
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| io_error("inspect model configuration", &path, error))?;
+    if !metadata.is_file() {
+        return Err(Error::InvalidState(format!(
+            "model configuration is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if path.starts_with(source) {
+        return Err(Error::InvalidState(
+            "model configuration must be outside the managed source".into(),
+        ));
+    }
+    Config::load(&path)?;
+    Ok(path)
+}
+
+fn absolute_target(path: &Path) -> Result<PathBuf, Error> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map(|directory| directory.join(path))
+            .map_err(|error| io_error("resolve", path, error))
+    }
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), Error> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(Error::InvalidState(format!(
+                "managed artifact path is not a real directory: {}",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)
+                .map_err(|error| io_error("create managed artifact directory", path, error))?;
+        }
+        Err(error) => return Err(io_error("inspect managed artifact directory", path, error)),
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| io_error("secure managed artifact directory", path, error))
+}
+
+fn create_requested_run_directory(path: &Path, source: &Path) -> Result<PathBuf, Error> {
+    let path = absolute_target(path)?;
+    if path.starts_with(source) {
+        return Err(Error::InvalidState(
+            "managed artifact directory must be outside the managed source".into(),
+        ));
+    }
+    fs::create_dir(&path).map_err(|error| io_error("create managed run", &path, error))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| io_error("secure managed run", &path, error))?;
+    path.canonicalize()
+        .map_err(|error| io_error("resolve managed run", &path, error))
+}
+
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::InvalidState("artifact path has no parent directory".into()))?;
+    let mut temporary = NamedTempFile::new_in(parent)
+        .map_err(|error| io_error("create temporary artifact", path, error))?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| io_error("secure temporary artifact", path, error))?;
+    serde_json::to_writer_pretty(&mut temporary, value)?;
+    temporary
+        .write_all(b"\n")
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| io_error("write artifact", path, error))?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| io_error("publish artifact", path, error.error))?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| io_error("sync artifact directory", parent, error))?;
+    Ok(())
+}
+
+fn new_id(prefix: &str) -> Result<String, Error> {
+    let sequence = ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    Ok(format!(
+        "{prefix}-{}-{}-{sequence}",
+        unix_ms()?,
+        std::process::id()
+    ))
+}
+
+fn unix_ms() -> Result<i64, Error> {
+    let value = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::InvalidState("system clock is before the Unix epoch".into()))?
+        .as_millis();
+    i64::try_from(value)
+        .map_err(|_| Error::InvalidState("current timestamp does not fit in i64".into()))
+}
+
+fn path_text(path: &Path) -> Result<String, Error> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| Error::InvalidState(format!("path is not valid UTF-8: {}", path.display())))
+}
+
+fn io_error(action: &'static str, path: &Path, source: std::io::Error) -> Error {
+    Error::FileSystem {
+        action,
+        path: path.display().to_string(),
+        source,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{thread, time::Duration};
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::{
+        ContentPolicy, ExtractionConfig, FolderProposal, LocalRule, ModelConfig, PrivacyConfig,
+        Proposal, ScanScope, build_managed_setup_plan,
+    };
+
+    fn config() -> Config {
+        Config {
+            version: 4,
+            model: ModelConfig {
+                base_url: "http://127.0.0.1:11434/v1".into(),
+                name: "unused-local-model".into(),
+                allowed_hosts: vec!["127.0.0.1".into()],
+                api_key: None,
+                api_key_env: None,
+            },
+            privacy: PrivacyConfig {
+                content: ContentPolicy::MetadataOnly,
+                max_content_chars: 1_000,
+                max_content_file_bytes: 10_000,
+                extraction: ExtractionConfig {
+                    max_output_bytes: 2_000,
+                    max_archive_entries: 10,
+                    max_expanded_bytes: 20_000,
+                    max_xml_events: 1_000,
+                    max_xml_depth: 20,
+                    timeout_seconds: 2,
+                    ocr: None,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn cycle_adopts_new_directories_and_respects_a_manually_returned_file() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("baseline.txt"), b"baseline").unwrap();
+        let state = root.path().join("state.sqlite3");
+        let config_path = root.path().join("config.toml");
+        fs::write(&config_path, toml::to_string(&config()).unwrap()).unwrap();
+        let folders = Proposal {
+            version: 2,
+            source: source.display().to_string(),
+            scope: ScanScope::default(),
+            files_considered: 1,
+            folders: vec![FolderProposal {
+                path: "Documents".into(),
+                description: "Documents".into(),
+            }],
+        }
+        .approve()
+        .unwrap();
+        let destination_id = folders.folders[0].id.clone();
+        let setup = build_managed_setup_plan(&source).unwrap();
+        let service = ManagedService::new(&state);
+        let activation = service
+            .activate_workspace(&setup, &folders, &config_path, 1, 1)
+            .unwrap();
+        assert_eq!(
+            activation.workspace.config_path,
+            config_path.canonicalize().unwrap().display().to_string()
+        );
+        let mut store = StateStore::open(&state).unwrap();
+        store
+            .insert_rule(
+                &LocalRule {
+                    id: "text-rule".into(),
+                    monitor_id: activation.workspace.monitor_id.clone(),
+                    name_glob: "*.txt".into(),
+                    destination_id,
+                    priority: 100,
+                    enabled: true,
+                },
+                unix_ms().unwrap(),
+            )
+            .unwrap();
+        drop(store);
+
+        service
+            .run_workspace(&activation.workspace.id, false)
+            .unwrap();
+        thread::sleep(Duration::from_millis(1_100));
+        service
+            .run_workspace(&activation.workspace.id, true)
+            .unwrap();
+        let classified = source.join("Library/Documents/baseline.txt");
+        assert!(classified.is_file());
+
+        fs::rename(&classified, source.join("baseline.txt")).unwrap();
+        fs::create_dir(source.join("NewManualDirectory")).unwrap();
+        fs::write(source.join("NewManualDirectory/note.txt"), b"manual").unwrap();
+        let cycle = service
+            .run_workspace(&activation.workspace.id, true)
+            .unwrap();
+
+        let adoption = cycle.directory_adoption.unwrap();
+        let indexed = StateStore::open(&state)
+            .unwrap()
+            .managed_run(&adoption.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(indexed.kind, ManagedRunKind::Adopt);
+        assert_eq!(indexed.state, RunState::Completed);
+        assert!(source.join("baseline.txt").is_file());
+        assert!(source.join("Kept/NewManualDirectory/note.txt").is_file());
+        assert!(!source.join("Inbox/baseline.txt").exists());
+
+        let undo_path = root.path().join("adoption-undo.json");
+        service
+            .undo_adoption_run(&adoption.run_id, &undo_path)
+            .unwrap();
+        assert!(source.join("NewManualDirectory/note.txt").is_file());
+        for area in ["Kept", "Inbox", "Library"] {
+            assert!(source.join(area).is_dir());
+        }
+    }
+
+    #[test]
+    fn activation_index_failure_returns_the_authoritative_recovery_journal() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("report.txt"), b"report").unwrap();
+        let state = root.path().join("state.sqlite3");
+        let config_path = root.path().join("config.toml");
+        fs::write(&config_path, toml::to_string(&config()).unwrap()).unwrap();
+        let folders = Proposal {
+            version: 2,
+            source: source.display().to_string(),
+            scope: ScanScope::default(),
+            files_considered: 1,
+            folders: vec![FolderProposal {
+                path: "Documents".into(),
+                description: "Documents".into(),
+            }],
+        }
+        .approve()
+        .unwrap();
+        let setup = build_managed_setup_plan(&source).unwrap();
+        let run_directory = root.path().join("activation");
+        let error = ManagedService::new(&state)
+            .activate_workspace_in(
+                &setup,
+                &folders,
+                &config_path,
+                u64::MAX,
+                1,
+                Some(&run_directory),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("activation indexing failed"));
+        assert!(
+            error.to_string().contains(
+                &run_directory
+                    .join("setup-session.json")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            ManagedSetupSession::load(&run_directory.join("setup-session.json"))
+                .unwrap()
+                .state,
+            ManagedSetupState::Completed
+        );
+        assert!(
+            StateStore::open(&state)
+                .unwrap()
+                .managed_workspaces()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(source.join("Kept").is_dir());
+    }
+}

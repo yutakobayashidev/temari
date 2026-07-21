@@ -2,30 +2,31 @@
 
 ## Scope
 
-The Tauri 2 application under `apps/temari-desktop` is a private proof of concept for Linux and macOS. It validates the complete guided workflow while keeping filesystem safety in `temari-core`.
+The Tauri 2 application under `apps/temari-desktop` is a private proof of concept for Linux and macOS. It exposes the managed three-area workflow while keeping filesystem safety and orchestration in the shared `ManagedService` in `temari-core`.
 
 The native flow is:
 
-1. Select a local source directory with the operating-system picker.
-2. Scan file-name metadata through `temari-core` and summarize the result locally.
-3. Request a compact hierarchy from the model configured by the selected TOML path.
-4. Edit destination paths and descriptions in the review panel.
-5. Approve the edited destinations locally, preserving the source and scan scope recorded by the backend.
-6. Build and inspect a real, read-only Plan containing every exact source and collision-safe destination path.
-7. Confirm the exact Plan digest, persist the Plan, and apply its moves with a durable journal.
-8. Undo the active Apply session from a separate confirmation and journal.
+1. Select a local source directory and model configuration with operating-system pickers.
+2. Request and edit a compact Library hierarchy from file-name metadata.
+3. Review the backend-held setup preview: existing directories go to `Kept`, loose files go to `Inbox`, and approved destinations are created below `Library`.
+4. Confirm and apply that exact preview, creating durable setup artifacts and registering the workspace in the shared SQLite state.
+5. Run explicit finite cycles that adopt new root directories, stage new files, and classify eligible Inbox files.
+6. Inspect workspace health, Inbox deadlines, actionable runs, and detailed move history.
+7. Reprocess selected `Kept` or `Library` entries through Inbox when classification should run again.
+8. Undo a completed run or one selected move with a separate durable Undo journal.
 
 ## Trust boundary
 
-- The frontend cannot replace proposal provenance during approval. The backend retains the latest real `Proposal` and accepts only edited `FolderProposal` entries.
-- Plan preview accepts no source, configuration, folder set, classification, or destination path from the frontend. It uses the backend-held configuration and approved `FolderSet`.
-- Scanning, proposal generation, approval, name classification, bounded content classification, fallback routing, and Plan construction use existing `temari-core` types and validation.
-- Proposal generation receives file-name metadata only. During planning, explicit `on_demand` permits bounded extraction for ambiguous files. `ask` behaves as declined consent and uses local extension fallbacks because this POC does not yet include a content-consent screen.
-- The frontend can request Apply only with the SHA-256 digest of the latest backend-held Plan. It cannot submit a Plan, source path, destination path, or journal path.
-- Before the first mutation, the backend writes the exact Plan to a private workflow run directory. Apply rechecks the source identity, fingerprints, directory chain, and destination occupancy through `temari-core`; it never overwrites.
-- The frontend can request Undo only for the backend-held Apply session ID. Undo uses the immutable Apply journal and writes a separate Undo journal.
-- Workflow runs live under `ProjectDirs::state_dir()/workflows`, falling back to `data_local_dir()/workflows` where a platform state directory is unavailable. Run directories are mode `0700`; Plan, Apply, and Undo artifacts are mode `0600` on Linux and macOS.
-- A desktop restart does not automatically resume or rediscover a run. If a crash leaves an Apply journal in `running` state, use the CLI `resume` command with the displayed journal path. Completed or partial Apply journals can be passed to the CLI `undo` command after a restart.
+- The frontend cannot replace proposal provenance. Revisioned, process-unique proposal and preview tokens resolve only to the latest backend-held `Proposal`, approved `FolderSet`, and `ManagedSetupPlan`.
+- Setup preview is read-only and Apply atomically consumes its opaque token before mutation. Replays, concurrent duplicate Apply requests, and stale tokens are rejected without discarding a newer preview. The frontend cannot submit a Plan, source identity, destination path, or journal path.
+- The canonical model configuration path is stored with the workspace and revalidated before runs. Manual runs and generated schedules therefore use the same model and privacy policy selected during setup.
+- `ManagedService` owns workspace activation, binding validation, private artifact directories, Inbox reconciliation, stage/classify persistence, Apply finalization, directory adoption, and explicit reprocessing for both CLI and desktop.
+- Managed filesystem and model operations run on blocking workers instead of the Tauri event loop.
+- Workspace status is computed by the backend from the physical Inbox, indexed deadlines, and actionable runs. IPC responses use explicit camel-case view types rather than exposing database records.
+- History merges immutable file Apply/Undo journals and directory-adoption setup/Undo journals. File moves support session or individual Undo; directory adoption supports session Undo only so managed areas remain intact. Undo allocates the journal path in the backend and reconciles SQLite only after filesystem outcomes are known.
+- New root directories are moved to `Kept`. A classified file manually returned to the root retains its processed identity and is left in place until the user explicitly requests reprocessing.
+- OS scheduling uses `temari-schedule`, creates shell-free systemd or launchd definitions, and requires an explicitly selected stable Temari CLI executable. Setup never installs a schedule implicitly.
+- Managed artifacts live below `ProjectDirs::state_dir()/managed-runs`, falling back to `data_local_dir()` where needed. Directories are mode `0700` and artifacts are mode `0600` on Linux and macOS.
 - Tauri capabilities grant the main window only core defaults and access to the native open dialog.
 - The content security policy allows packaged assets and Tauri IPC; no arbitrary remote page or script is enabled.
 - No telemetry, updater, browser shell, or direct filesystem API is included.

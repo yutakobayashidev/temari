@@ -14,7 +14,7 @@ use crate::{
     Plan, artifact::normalize_relative_path,
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -103,6 +103,7 @@ pub struct ManagedWorkspace {
     pub source_identity: FsIdentity,
     pub folder_set_path: String,
     pub folder_set_sha256: String,
+    pub config_path: String,
     pub retention_seconds: u64,
     pub settle_seconds: u64,
     pub enabled: bool,
@@ -138,6 +139,7 @@ pub struct InboxItem {
 #[serde(rename_all = "snake_case")]
 pub enum ManagedRunKind {
     Setup,
+    Adopt,
     Stage,
     Classify,
 }
@@ -440,9 +442,9 @@ impl StateStore {
         self.connection.execute(
             "INSERT INTO managed_workspaces (
                 id, monitor_id, source, source_device, source_inode, folder_set_path,
-                folder_set_sha256, retention_seconds, settle_seconds, enabled, setup_session_path,
-                created_unix_ms, updated_unix_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                folder_set_sha256, config_path, retention_seconds, settle_seconds, enabled,
+                setup_session_path, created_unix_ms, updated_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 workspace.id,
                 workspace.monitor_id,
@@ -451,6 +453,7 @@ impl StateStore {
                 workspace.source_identity.inode.to_string(),
                 workspace.folder_set_path,
                 workspace.folder_set_sha256,
+                workspace.config_path,
                 to_i64(workspace.retention_seconds, "workspace retention")?,
                 to_i64(workspace.settle_seconds, "workspace settle window")?,
                 workspace.enabled,
@@ -467,8 +470,8 @@ impl StateStore {
             .connection
             .query_row(
                 "SELECT id, monitor_id, source, source_device, source_inode, folder_set_path,
-                        folder_set_sha256, retention_seconds, settle_seconds, enabled, setup_session_path,
-                        created_unix_ms, updated_unix_ms
+                        folder_set_sha256, config_path, retention_seconds, settle_seconds, enabled,
+                        setup_session_path, created_unix_ms, updated_unix_ms
                  FROM managed_workspaces WHERE id = ?1",
                 [id],
                 managed_workspace_from_row,
@@ -479,8 +482,8 @@ impl StateStore {
     pub fn managed_workspaces(&self) -> Result<Vec<ManagedWorkspace>, Error> {
         let mut statement = self.connection.prepare(
             "SELECT id, monitor_id, source, source_device, source_inode, folder_set_path,
-                    folder_set_sha256, retention_seconds, settle_seconds, enabled, setup_session_path,
-                    created_unix_ms, updated_unix_ms
+                    folder_set_sha256, config_path, retention_seconds, settle_seconds, enabled,
+                    setup_session_path, created_unix_ms, updated_unix_ms
              FROM managed_workspaces ORDER BY source, id",
         )?;
         let rows = statement.query_map([], managed_workspace_from_row)?;
@@ -674,9 +677,9 @@ impl StateStore {
             self.connection.execute(
                 "UPDATE managed_workspaces
                  SET monitor_id = ?2, source = ?3, source_device = ?4, source_inode = ?5,
-                     folder_set_path = ?6, folder_set_sha256 = ?7,
-                     retention_seconds = ?8, settle_seconds = ?9, enabled = ?10,
-                     setup_session_path = ?11, created_unix_ms = ?12, updated_unix_ms = ?13
+                     folder_set_path = ?6, folder_set_sha256 = ?7, config_path = ?8,
+                     retention_seconds = ?9, settle_seconds = ?10, enabled = ?11,
+                     setup_session_path = ?12, created_unix_ms = ?13, updated_unix_ms = ?14
                  WHERE id = ?1",
                 params![
                     workspace.id,
@@ -686,6 +689,7 @@ impl StateStore {
                     workspace.source_identity.inode.to_string(),
                     workspace.folder_set_path,
                     workspace.folder_set_sha256,
+                    workspace.config_path,
                     to_i64(workspace.retention_seconds, "workspace retention")?,
                     to_i64(workspace.settle_seconds, "workspace settle window")?,
                     workspace.enabled,
@@ -1149,7 +1153,9 @@ impl StateStore {
         let run = self
             .managed_run(run_id)?
             .ok_or_else(|| Error::InvalidState(format!("unknown managed run {run_id:?}")))?;
-        if run.kind == ManagedRunKind::Setup || run.state != RunState::Completed {
+        if matches!(run.kind, ManagedRunKind::Setup | ManagedRunKind::Adopt)
+            || run.state != RunState::Completed
+        {
             return Err(Error::InvalidState(
                 "managed Undo journals require a completed file-move run".into(),
             ));
@@ -1205,7 +1211,9 @@ impl StateStore {
             )
             .optional()?
             .ok_or_else(|| Error::InvalidState(format!("unknown managed run {run_id:?}")))?;
-        if kind == ManagedRunKind::Setup || state != RunState::Completed {
+        if matches!(kind, ManagedRunKind::Setup | ManagedRunKind::Adopt)
+            || state != RunState::Completed
+        {
             return Err(Error::InvalidState(
                 "managed Undo journals require a completed file-move run".into(),
             ));
@@ -1261,7 +1269,7 @@ impl StateStore {
                         ],
                     )?;
                 }
-                ManagedRunKind::Setup => unreachable!(),
+                ManagedRunKind::Setup | ManagedRunKind::Adopt => unreachable!(),
             }
         }
         transaction.commit()?;
@@ -1805,6 +1813,28 @@ impl StateStore {
         Ok(found)
     }
 
+    /// Returns whether this exact filesystem identity has already completed
+    /// classification for a monitor, regardless of its current path.
+    pub fn has_processed_identity(
+        &self,
+        monitor_id: &str,
+        file_identity: FsIdentity,
+    ) -> Result<bool, Error> {
+        validate_identifier("monitor ID", monitor_id)?;
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM processed_files
+                WHERE monitor_id = ?1 AND file_device = ?2 AND file_inode = ?3
+             )",
+            params![
+                monitor_id,
+                file_identity.device.to_string(),
+                file_identity.inode.to_string(),
+            ],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Forgets the processed marker for exactly one filesystem identity.
     ///
     /// A missing marker is accepted so recovery and repeated Undo reconciliation
@@ -1893,6 +1923,7 @@ impl ManagedRunKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Setup => "setup",
+            Self::Adopt => "adopt",
             Self::Stage => "stage",
             Self::Classify => "classify",
         }
@@ -1901,6 +1932,7 @@ impl ManagedRunKind {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
             "setup" => Ok(Self::Setup),
+            "adopt" => Ok(Self::Adopt),
             "stage" => Ok(Self::Stage),
             "classify" => Ok(Self::Classify),
             other => Err(format!("unknown managed run kind {other:?}")),
@@ -2062,6 +2094,7 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
             source_inode TEXT NOT NULL,
             folder_set_path TEXT NOT NULL,
             folder_set_sha256 TEXT NOT NULL,
+            config_path TEXT NOT NULL CHECK(config_path != ''),
             retention_seconds INTEGER NOT NULL CHECK(retention_seconds > 0),
             settle_seconds INTEGER NOT NULL CHECK(settle_seconds > 0),
             enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
@@ -2074,7 +2107,7 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
         CREATE TABLE IF NOT EXISTS managed_runs (
             id TEXT PRIMARY KEY,
             workspace_id TEXT NOT NULL REFERENCES managed_workspaces(id) ON DELETE CASCADE,
-            kind TEXT NOT NULL CHECK(kind IN ('setup', 'stage', 'classify')),
+            kind TEXT NOT NULL CHECK(kind IN ('setup', 'adopt', 'stage', 'classify')),
             state TEXT NOT NULL CHECK(state IN (
                 'planning', 'planned', 'applying', 'completed',
                 'noop', 'failed', 'needs_resume'
@@ -2120,6 +2153,67 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
         CREATE INDEX IF NOT EXISTS inbox_items_by_eligibility
             ON inbox_items(workspace_id, state, eligible_unix_ms, relative_path);",
     )?;
+    let has_config_path: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('managed_workspaces') WHERE name = 'config_path'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_config_path {
+        transaction.execute(
+            "ALTER TABLE managed_workspaces
+             ADD COLUMN config_path TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    let managed_runs_support_adoption: bool = transaction.query_row(
+        "SELECT instr(COALESCE(sql, ''), '''adopt''') > 0
+         FROM sqlite_master WHERE type = 'table' AND name = 'managed_runs'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !managed_runs_support_adoption {
+        transaction.execute_batch(
+            "DROP INDEX IF EXISTS managed_runs_by_workspace_time;
+             DROP INDEX IF EXISTS managed_undo_journals_by_run_time;
+             ALTER TABLE managed_undo_journals RENAME TO managed_undo_journals_v4;
+             ALTER TABLE managed_runs RENAME TO managed_runs_v4;
+             CREATE TABLE managed_runs (
+                 id TEXT PRIMARY KEY,
+                 workspace_id TEXT NOT NULL REFERENCES managed_workspaces(id) ON DELETE CASCADE,
+                 kind TEXT NOT NULL CHECK(kind IN ('setup', 'adopt', 'stage', 'classify')),
+                 state TEXT NOT NULL CHECK(state IN (
+                     'planning', 'planned', 'applying', 'completed',
+                     'noop', 'failed', 'needs_resume'
+                 )),
+                 plan_path TEXT,
+                 apply_path TEXT,
+                 undo_path TEXT,
+                 started_unix_ms INTEGER NOT NULL,
+                 finished_unix_ms INTEGER,
+                 move_count INTEGER NOT NULL DEFAULT 0 CHECK(move_count >= 0),
+                 error TEXT,
+                 CHECK(finished_unix_ms IS NULL OR finished_unix_ms >= started_unix_ms)
+             );
+             INSERT INTO managed_runs
+             SELECT * FROM managed_runs_v4;
+             CREATE TABLE managed_undo_journals (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id TEXT NOT NULL REFERENCES managed_runs(id) ON DELETE CASCADE,
+                 path TEXT NOT NULL UNIQUE,
+                 created_unix_ms INTEGER NOT NULL
+             );
+             INSERT INTO managed_undo_journals
+             SELECT * FROM managed_undo_journals_v4;
+             DROP TABLE managed_undo_journals_v4;
+             DROP TABLE managed_runs_v4;
+             CREATE INDEX managed_runs_by_workspace_time
+                 ON managed_runs(workspace_id, started_unix_ms DESC, id DESC);
+             CREATE INDEX managed_undo_journals_by_run_time
+                 ON managed_undo_journals(run_id, id);",
+        )?;
+    }
     transaction.execute(
         "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
          VALUES (1, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
@@ -2128,6 +2222,16 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
     transaction.execute(
         "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
          VALUES (2, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
+         VALUES (3, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
+         VALUES (4, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
         [],
     )?;
     transaction.execute(
@@ -2211,12 +2315,13 @@ fn managed_workspace_from_row(row: &Row<'_>) -> rusqlite::Result<ManagedWorkspac
         },
         folder_set_path: row.get(5)?,
         folder_set_sha256: row.get(6)?,
-        retention_seconds: i64_to_u64(row.get(7)?, 7)?,
-        settle_seconds: i64_to_u64(row.get(8)?, 8)?,
-        enabled: row.get(9)?,
-        setup_session_path: row.get(10)?,
-        created_unix_ms: row.get(11)?,
-        updated_unix_ms: row.get(12)?,
+        config_path: row.get(7)?,
+        retention_seconds: i64_to_u64(row.get(8)?, 8)?,
+        settle_seconds: i64_to_u64(row.get(9)?, 9)?,
+        enabled: row.get(10)?,
+        setup_session_path: row.get(11)?,
+        created_unix_ms: row.get(12)?,
+        updated_unix_ms: row.get(13)?,
     })
 }
 
@@ -2228,7 +2333,7 @@ fn managed_workspace_for_update(
     let workspace = transaction
         .query_row(
             "SELECT id, monitor_id, source, source_device, source_inode, folder_set_path,
-                    folder_set_sha256, retention_seconds, settle_seconds, enabled,
+                    folder_set_sha256, config_path, retention_seconds, settle_seconds, enabled,
                     setup_session_path, created_unix_ms, updated_unix_ms
              FROM managed_workspaces WHERE id = ?1",
             [id],
@@ -2330,6 +2435,7 @@ fn validate_managed_workspace(workspace: &ManagedWorkspace) -> Result<(), Error>
     validate_identifier("workspace monitor ID", &workspace.monitor_id)?;
     validate_absolute_path("workspace source", &workspace.source)?;
     validate_absolute_path("workspace folder-set path", &workspace.folder_set_path)?;
+    validate_absolute_path("workspace model configuration path", &workspace.config_path)?;
     validate_digest("workspace folder-set digest", &workspace.folder_set_sha256)?;
     if workspace.retention_seconds == 0 {
         return Err(Error::InvalidState(
@@ -2678,6 +2784,7 @@ mod tests {
             },
             folder_set_path: root.join("folders.json").display().to_string(),
             folder_set_sha256: DIGEST_A.into(),
+            config_path: root.join("config.toml").display().to_string(),
             retention_seconds: 100,
             settle_seconds: 30,
             enabled: true,
@@ -2715,7 +2822,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            3
+            SCHEMA_VERSION
         );
     }
 

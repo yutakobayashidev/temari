@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/temari-core", "crates/temari-cli"]
+members = ["crates/temari-core", "crates/temari-cli", "crates/temari-schedule"]
 resolver = "2"
 
 [workspace.package]

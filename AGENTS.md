@@ -20,7 +20,13 @@
 - Preserve the canonical `propose -> approve -> plan -> apply -> undo` command boundaries. The interactive `organize` command must orchestrate the same application services.
 - Keep `organize` as TTY-only orchestration; non-interactive callers use the primitive commands. Preserve both destination approval and exact apply confirmation.
 - Keep `managed` as the only public recurring organization workflow. Monitoring records and services are internal implementation details; expose local rules, history, apply, resume, and undo through managed workspace IDs instead of a second monitor-oriented CLI.
+- Keep recurring workspace orchestration in `temari-core::ManagedService`; CLI and desktop adapters must not duplicate the state transition sequence or shell out to each other.
+- Bind each managed workspace to one canonical model configuration path. Revalidate that binding before model-backed runs and reuse it in schedule definitions; never fall back to a process-default configuration for an existing workspace.
+- Desktop setup authority must remain backend-held, revisioned, and single-use. Consume the exact latest preview token before mutation and reject stale, replayed, or concurrent Apply requests.
 - Keep scheduled execution finite and explicit. Platform schedulers may invoke `managed run`, but workspace setup and enablement must never install a daemon or schedule implicitly; generated definitions must use absolute arguments without a shell or embedded secrets.
+- Keep systemd and launchd rendering and installation in `temari-schedule`. Desktop schedule activation must require an explicitly selected stable Temari CLI executable rather than guessing a helper path.
+- Treat a classified file manually returned to the workspace root as durable user intent. Do not stage it again unless explicit reprocessing or Undo clears its processed identity.
+- Adopt newly created root directories into `Kept` through a read-only setup-style Plan and durable journal; never move them through an unjournaled desktop-only path.
 - Reprocess protected or classified files only through a reviewed model-free Plan back to Inbox. Do not classify directly from Kept or inside Library, and do not clear processed markers before the staging Apply succeeds.
 - Keep workspace lifecycle metadata transactional with its internal monitor. Registration removal must leave physical areas and authoritative JSON artifacts untouched.
 - Resume may update only a `running` ApplySession after conservative filesystem reconciliation. Completed, failed, and partial-failure sessions are immutable, and undo must reject a running session.

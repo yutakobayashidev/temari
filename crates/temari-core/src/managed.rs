@@ -522,6 +522,137 @@ pub fn build_managed_setup_plan(source: &Path) -> Result<ManagedSetupPlan, Error
     Ok(plan)
 }
 
+/// Build a read-only plan that adopts newly created root directories into
+/// Kept after managed workspace setup has completed.
+pub fn build_managed_directory_adoption_plan(source: &Path) -> Result<ManagedSetupPlan, Error> {
+    let (source, source_identity) = canonical_directory(source)?;
+    for area in MANAGED_AREAS {
+        let path = source.join(area);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| io_error("inspect managed area", &path, error))?;
+        if !metadata.file_type().is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.dev() != source_identity.device
+        {
+            return Err(Error::InvalidArtifact(format!(
+                "managed area must be a real same-filesystem directory: {area:?}"
+            )));
+        }
+    }
+
+    let mut moves = Vec::new();
+    for (name, path) in read_directory_sorted(&source)? {
+        if MANAGED_AREAS.contains(&name.as_str()) {
+            continue;
+        }
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|error| io_error("inspect", &path, error))?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.dev() != source_identity.device {
+            return Err(Error::InvalidArtifact(format!(
+                "managed directory adoption requires a same-filesystem move: {name:?}"
+            )));
+        }
+        let destination = source.join("Kept").join(&name);
+        if path_exists(&destination)? {
+            return Err(Error::InvalidArtifact(format!(
+                "managed directory adoption destination is occupied: {:?}",
+                format!("Kept/{name}")
+            )));
+        }
+        moves.push(ManagedSetupMove {
+            source_path: name.clone(),
+            destination_path: format!("Kept/{name}"),
+            fingerprint: ManagedEntryFingerprint::Directory {
+                fingerprint: fingerprint_directory(&path)?,
+            },
+        });
+    }
+    moves.sort_by(|left, right| {
+        left.source_path
+            .as_bytes()
+            .cmp(right.source_path.as_bytes())
+    });
+    let plan = ManagedSetupPlan {
+        version: 1,
+        source: path_text(&source)?,
+        source_identity,
+        areas: MANAGED_AREAS
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect(),
+        moves,
+    };
+    plan.validate()?;
+    Ok(plan)
+}
+
+/// Apply a reviewed directory-adoption plan using the same durable journal,
+/// fingerprint checks, lock, and resume path as managed setup.
+pub fn apply_managed_directory_adoption(
+    plan: &ManagedSetupPlan,
+    journal_path: &Path,
+) -> Result<ManagedSetupSession, Error> {
+    plan.validate()?;
+    if plan.moves.iter().any(|movement| {
+        !matches!(
+            movement.fingerprint,
+            ManagedEntryFingerprint::Directory { .. }
+        )
+    }) {
+        return Err(Error::InvalidArtifact(
+            "managed directory adoption plan may contain only directories".into(),
+        ));
+    }
+    let lock = SourceLock::acquire(Path::new(&plan.source))?;
+    lock.validate_source(&plan.source, &plan.source_identity)?;
+    let current = build_managed_directory_adoption_plan(Path::new(&plan.source))?;
+    if current != *plan {
+        return Err(Error::InvalidArtifact(
+            "managed source changed after directory adoption planning".into(),
+        ));
+    }
+    validate_new_journal(journal_path, Path::new(&plan.source))?;
+    let root = Path::new(&plan.source);
+    let mut areas = Vec::with_capacity(MANAGED_AREAS.len());
+    for area in MANAGED_AREAS {
+        let metadata = fs::symlink_metadata(root.join(area))
+            .map_err(|error| io_error("inspect managed area", &root.join(area), error))?;
+        areas.push(ManagedAreaRecord {
+            path: area.into(),
+            outcome: ManagedAreaOutcome::Created {
+                identity: identity(&metadata),
+            },
+        });
+    }
+    let mut session = ManagedSetupSession {
+        version: 1,
+        id: format!("{}-{}", now_unix_ms()?, std::process::id()),
+        plan_sha256: plan.sha256()?,
+        source: plan.source.clone(),
+        source_identity: plan.source_identity.clone(),
+        state: ManagedSetupState::Running,
+        started_unix_ms: now_unix_ms()?,
+        finished_unix_ms: None,
+        areas,
+        moves: plan
+            .moves
+            .iter()
+            .map(|movement| ManagedMoveRecord {
+                source_path: movement.source_path.clone(),
+                destination_path: movement.destination_path.clone(),
+                fingerprint: movement.fingerprint.clone(),
+                outcome: ManagedMoveOutcome::Pending,
+            })
+            .collect(),
+    };
+    create_journal(journal_path, &session, root)?;
+    continue_setup(&mut session, journal_path)?;
+    Ok(session)
+}
+
 pub fn fingerprint_directory(path: &Path) -> Result<DirectoryFingerprint, Error> {
     let metadata = fs::symlink_metadata(path).map_err(|error| io_error("inspect", path, error))?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
@@ -659,6 +790,25 @@ pub fn undo_managed_setup_with_lock(
     journal_path: &Path,
     lock: &SourceLock,
 ) -> Result<ManagedSetupUndoSession, Error> {
+    undo_managed_session_with_lock(setup, journal_path, lock, true)
+}
+
+/// Undo a directory-adoption session without removing the three managed areas,
+/// which predated the adoption and belong to the workspace setup.
+pub fn undo_managed_directory_adoption(
+    setup: &ManagedSetupSession,
+    journal_path: &Path,
+) -> Result<ManagedSetupUndoSession, Error> {
+    let lock = SourceLock::acquire(Path::new(&setup.source))?;
+    undo_managed_session_with_lock(setup, journal_path, &lock, false)
+}
+
+fn undo_managed_session_with_lock(
+    setup: &ManagedSetupSession,
+    journal_path: &Path,
+    lock: &SourceLock,
+    remove_areas: bool,
+) -> Result<ManagedSetupUndoSession, Error> {
     lock.validate_recovery_source(&setup.source, &setup.source_identity)?;
     preflight_managed_undo(setup, journal_path)?;
     let mut undo = ManagedSetupUndoSession {
@@ -685,12 +835,16 @@ pub fn undo_managed_setup_with_lock(
             .rev()
             .map(|area| ManagedUndoAreaRecord {
                 path: area.path.clone(),
-                outcome: ManagedUndoAreaOutcome::Pending,
+                outcome: if remove_areas {
+                    ManagedUndoAreaOutcome::Pending
+                } else {
+                    ManagedUndoAreaOutcome::NotPresent
+                },
             })
             .collect(),
     };
     create_journal(journal_path, &undo, Path::new(&setup.source))?;
-    continue_undo(setup, &mut undo, journal_path)?;
+    continue_undo(setup, &mut undo, journal_path, remove_areas)?;
     Ok(undo)
 }
 
@@ -918,6 +1072,7 @@ fn continue_undo(
     setup: &ManagedSetupSession,
     undo: &mut ManagedSetupUndoSession,
     journal_path: &Path,
+    remove_areas: bool,
 ) -> Result<(), Error> {
     let root = PathBuf::from(&setup.source);
     let (_, current_source_identity) = canonical_directory(&root)?;
@@ -982,6 +1137,9 @@ fn continue_undo(
         update_journal(journal_path, undo)?;
     }
     for index in 0..undo.areas.len() {
+        if !remove_areas {
+            continue;
+        }
         let setup_area = &setup.areas[setup.areas.len() - 1 - index];
         let path = root.join(&setup_area.path);
         let ManagedAreaOutcome::Created { identity: expected } = &setup_area.outcome else {
@@ -1575,6 +1733,89 @@ mod tests {
         symlink("other", source.path().join("link")).unwrap();
         let third = fingerprint_directory(source.path()).unwrap();
         assert_ne!(second.manifest_sha256, third.manifest_sha256);
+    }
+
+    #[test]
+    fn adopts_only_new_root_directories_into_existing_kept_area() {
+        let source = tempdir().unwrap();
+        for area in MANAGED_AREAS {
+            fs::create_dir(source.path().join(area)).unwrap();
+        }
+        fs::create_dir(source.path().join("Project")).unwrap();
+        fs::write(source.path().join("Project/readme.md"), b"kept").unwrap();
+        fs::write(source.path().join("loose.txt"), b"staged separately").unwrap();
+        let artifacts = tempdir().unwrap();
+
+        let plan = build_managed_directory_adoption_plan(source.path()).unwrap();
+        assert_eq!(plan.moves.len(), 1);
+        assert_eq!(plan.moves[0].source_path, "Project");
+        assert_eq!(plan.moves[0].destination_path, "Kept/Project");
+
+        let session = apply_managed_directory_adoption(
+            &plan,
+            &artifacts.path().join("directory-adoption.json"),
+        )
+        .unwrap();
+        assert_eq!(session.state, ManagedSetupState::Completed);
+        assert!(source.path().join("Kept/Project/readme.md").is_file());
+        assert!(source.path().join("loose.txt").is_file());
+        assert!(source.path().join("Inbox").is_dir());
+        assert!(source.path().join("Library").is_dir());
+    }
+
+    #[test]
+    fn directory_adoption_undo_restores_directories_without_removing_managed_areas() {
+        let source = tempdir().unwrap();
+        for area in MANAGED_AREAS {
+            fs::create_dir(source.path().join(area)).unwrap();
+        }
+        fs::create_dir(source.path().join("Project")).unwrap();
+        fs::write(source.path().join("Project/readme.md"), b"kept").unwrap();
+        let artifacts = tempdir().unwrap();
+        let plan = build_managed_directory_adoption_plan(source.path()).unwrap();
+        let session = apply_managed_directory_adoption(
+            &plan,
+            &artifacts.path().join("directory-adoption.json"),
+        )
+        .unwrap();
+
+        let undo = undo_managed_directory_adoption(
+            &session,
+            &artifacts.path().join("directory-adoption-undo.json"),
+        )
+        .unwrap();
+
+        assert_eq!(undo.state, ManagedSetupUndoState::Completed);
+        assert!(source.path().join("Project/readme.md").is_file());
+        assert!(!source.path().join("Kept/Project").exists());
+        for area in MANAGED_AREAS {
+            assert!(source.path().join(area).is_dir());
+        }
+    }
+
+    #[test]
+    fn directory_adoption_rejects_source_changes_after_planning() {
+        let source = tempdir().unwrap();
+        for area in MANAGED_AREAS {
+            fs::create_dir(source.path().join(area)).unwrap();
+        }
+        fs::create_dir(source.path().join("Project")).unwrap();
+        let plan = build_managed_directory_adoption_plan(source.path()).unwrap();
+        fs::write(source.path().join("Project/new.txt"), b"changed").unwrap();
+        let artifacts = tempdir().unwrap();
+
+        let error = apply_managed_directory_adoption(
+            &plan,
+            &artifacts.path().join("directory-adoption.json"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("changed after directory adoption planning")
+        );
+        assert!(source.path().join("Project/new.txt").is_file());
+        assert!(!source.path().join("Kept/Project").exists());
     }
 
     #[test]
