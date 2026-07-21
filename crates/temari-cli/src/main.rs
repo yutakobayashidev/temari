@@ -20,10 +20,8 @@ use temari_core::{
 use tempfile::NamedTempFile;
 
 mod managed;
-mod monitoring;
 
 use managed::ManagedCommand;
-use monitoring::{HistoryCommand, MonitorCommand, MonitoringContext, RuleCommand};
 
 const PROPOSAL_SAMPLE_LIMIT: usize = 100;
 
@@ -31,14 +29,14 @@ const PROPOSAL_SAMPLE_LIMIT: usize = 100;
 #[command(
     name = "temari",
     version,
-    about = "Organize files through reviewable, privacy-conscious AI workflows"
+    about = "Organize files through one-time or managed, privacy-conscious AI workflows"
 )]
 struct Cli {
     /// Path to the model configuration file.
     #[arg(long, default_value = ".temari.toml", global = true)]
     config: PathBuf,
 
-    /// Path to the local monitoring state database.
+    /// Path to the local managed-workspace state database.
     #[arg(long, global = true)]
     state: Option<PathBuf>,
 
@@ -64,91 +62,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Ask the configured model to propose a folder hierarchy.
-    Propose {
-        /// Directory whose direct child files should be considered.
-        source: PathBuf,
+    /// Normal workflow: manage a long-lived Kept, Inbox, and Library workspace.
+    #[command(subcommand)]
+    Managed(ManagedCommand),
 
-        /// Write the proposal artifact to this path, or '-' for stdout.
-        #[arg(long)]
-        out: PathBuf,
-
-        /// Maximum physical directories, including parent path prefixes.
-        #[arg(long, default_value_t = 12)]
-        max_folders: usize,
-
-        /// Recursively include this source-relative directory; repeat as needed. Use '.' for all.
-        #[arg(long = "include-subtree")]
-        include_subtrees: Vec<String>,
-    },
-
-    /// Validate and explicitly approve a folder proposal.
-    Approve {
-        /// Proposal JSON created by `temari propose`.
-        proposal: PathBuf,
-
-        /// Write the approved folder set to this path, or '-' for stdout.
-        #[arg(long)]
-        out: PathBuf,
-
-        /// Approve every proposed folder without prompting.
-        #[arg(long)]
-        accept_all: bool,
-    },
-
-    /// Classify files into an approved folder set without changing the filesystem.
-    Plan {
-        /// Directory whose direct child files should be classified.
-        source: PathBuf,
-
-        /// Approved folder-set JSON created by `temari approve`.
-        #[arg(long)]
-        folders: PathBuf,
-
-        /// Write the plan artifact to this path, or '-' for stdout.
-        #[arg(long)]
-        out: PathBuf,
-    },
-
-    /// Create approved directories and move files exactly as recorded in a plan.
-    Apply {
-        /// Plan JSON created by `temari plan`.
-        plan: PathBuf,
-
-        /// Write the durable apply journal to this new path.
-        #[arg(long)]
-        out: PathBuf,
-
-        /// Apply the reviewed plan without prompting.
-        #[arg(long)]
-        yes: bool,
-    },
-
-    /// Safely reverse the recorded moves from an apply session.
-    Undo {
-        /// Apply-session JSON created by `temari apply`.
-        session: PathBuf,
-
-        /// Write the separate undo journal to this new path.
-        #[arg(long)]
-        out: PathBuf,
-
-        /// Undo the reviewed session without prompting.
-        #[arg(long)]
-        yes: bool,
-    },
-
-    /// Continue a running apply journal after conservative crash reconciliation.
-    Resume {
-        /// Running apply-session JSON to reconcile and continue in place.
-        session: PathBuf,
-
-        /// Resume without prompting.
-        #[arg(long)]
-        yes: bool,
-    },
-
-    /// Run the complete proposal, review, plan, and apply flow interactively.
+    /// One-shot workflow: organize a directory through interactive review.
     Organize {
         /// Directory whose direct child files should be organized.
         source: PathBuf,
@@ -166,21 +84,89 @@ enum Command {
         include_subtrees: Vec<String>,
     },
 
-    /// Configure or run foreground directory monitoring.
-    #[command(subcommand)]
-    Monitor(MonitorCommand),
+    /// Advanced/agent workflow: create a read-only folder proposal artifact.
+    Propose {
+        /// Directory whose direct child files should be considered.
+        source: PathBuf,
 
-    /// Configure deterministic local routing rules.
-    #[command(subcommand)]
-    Rule(RuleCommand),
+        /// Write the proposal artifact to this path, or '-' for stdout.
+        #[arg(long)]
+        out: PathBuf,
 
-    /// Inspect durable monitoring run history.
-    #[command(subcommand)]
-    History(HistoryCommand),
+        /// Maximum physical directories, including parent path prefixes.
+        #[arg(long, default_value_t = 12)]
+        max_folders: usize,
 
-    /// Manage a Kept, Inbox, and Library workspace.
-    #[command(subcommand)]
-    Managed(ManagedCommand),
+        /// Recursively include this source-relative directory; repeat as needed. Use '.' for all.
+        #[arg(long = "include-subtree")]
+        include_subtrees: Vec<String>,
+    },
+
+    /// Advanced/agent workflow: approve a proposal without changing files.
+    Approve {
+        /// Proposal JSON created by `temari propose`.
+        proposal: PathBuf,
+
+        /// Write the approved folder set to this path, or '-' for stdout.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Approve every proposed folder without prompting.
+        #[arg(long)]
+        accept_all: bool,
+    },
+
+    /// Advanced/agent workflow: create an exact, read-only move plan artifact.
+    Plan {
+        /// Directory whose direct child files should be classified.
+        source: PathBuf,
+
+        /// Approved folder-set JSON created by `temari approve`.
+        #[arg(long)]
+        folders: PathBuf,
+
+        /// Write the plan artifact to this path, or '-' for stdout.
+        #[arg(long)]
+        out: PathBuf,
+    },
+
+    /// Advanced/agent workflow: apply an exact, reviewed move plan.
+    Apply {
+        /// Plan JSON created by `temari plan`.
+        plan: PathBuf,
+
+        /// Write the durable apply journal to this new path.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Apply the reviewed plan without prompting.
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Advanced/recovery workflow: reverse moves recorded by an apply session.
+    Undo {
+        /// Apply-session JSON created by `temari apply`.
+        session: PathBuf,
+
+        /// Write the separate undo journal to this new path.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Undo the reviewed session without prompting.
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Advanced/recovery workflow: continue a running apply journal after a crash.
+    Resume {
+        /// Running apply-session JSON to reconcile and continue in place.
+        session: PathBuf,
+
+        /// Resume without prompting.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -233,36 +219,6 @@ fn run() -> Result<()> {
             max_folders,
             include_subtrees,
         } => organize(&cli, source, out, *max_folders, include_subtrees),
-        Command::Monitor(command) => monitoring::run_monitor(
-            MonitoringContext::from_cli(
-                &cli.config,
-                cli.state.as_deref(),
-                cli.json,
-                cli.no_input,
-                cli.verbose,
-            )?,
-            command,
-        ),
-        Command::Rule(command) => monitoring::run_rule(
-            MonitoringContext::from_cli(
-                &cli.config,
-                cli.state.as_deref(),
-                cli.json,
-                cli.no_input,
-                cli.verbose,
-            )?,
-            command,
-        ),
-        Command::History(command) => monitoring::run_history(
-            MonitoringContext::from_cli(
-                &cli.config,
-                cli.state.as_deref(),
-                cli.json,
-                cli.no_input,
-                cli.verbose,
-            )?,
-            command,
-        ),
         Command::Managed(command) => managed::run_managed(&cli, command),
     }
 }

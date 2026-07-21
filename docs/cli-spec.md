@@ -7,26 +7,21 @@ The implementation will evolve, but the experimental CLI contract will be redesi
 ## Command tree
 
 ```text
+temari [global options] managed init <SOURCE> --out <SETUP_PLAN>
+temari [global options] managed apply <SETUP_PLAN> --folders <FOLDER_SET> --out <RUN_DIR> [--yes]
+temari [global options] managed list|status|run|apply-run|resume-run|history|undo ...
+temari [global options] managed rule add|list|enable|disable|remove ...
+temari [global options] managed undo-setup|resume-setup ...
+temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...
 temari [global options] propose <SOURCE> --out <PROPOSAL> [--include-subtree <PATH>]...
 temari [global options] approve <PROPOSAL> --out <FOLDER_SET>
 temari [global options] plan <SOURCE> --folders <FOLDER_SET> --out <PLAN>
 temari [global options] apply <PLAN> --out <APPLY_SESSION> [--yes]
 temari [global options] undo <APPLY_SESSION> --out <UNDO_SESSION> [--yes]
 temari [global options] resume <APPLY_SESSION> [--yes]
-temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...
-temari [global options] monitor add <SOURCE> --folders <FOLDER_SET> [--interval <SECONDS>]
-temari [global options] monitor list|enable|disable|remove ...
-temari [global options] monitor run --out <RUN_ROOT> [--monitor <ID>] [--once] [--apply --yes]
-temari [global options] monitor apply <RUN_ID> [--yes]
-temari [global options] rule add|list|enable|disable|remove ...
-temari [global options] history list|show ...
-temari [global options] managed init <SOURCE> --out <SETUP_PLAN>
-temari [global options] managed apply <SETUP_PLAN> --folders <FOLDER_SET> --out <RUN_DIR> [--yes]
-temari [global options] managed list|status|run|apply-run|resume-run|history|undo ...
-temari [global options] managed undo-setup|resume-setup ...
 ```
 
-`organize` is an interactive convenience command. The five primitive commands remain the stable interface for agents and scripts.
+`managed` is the normal recurring workflow. `organize` is an interactive one-time cleanup. The six primitive commands are the stable advanced interface for agents, scripts, inspection, and recovery.
 
 ## Command semantics
 
@@ -103,29 +98,6 @@ temari [global options] managed undo-setup|resume-setup ...
 - Keeps name, content, and fallback processing inside Stage 3 and reports their counts without adding another command boundary.
 - Under `ask`, discloses the model origin, exact sanitized ambiguous paths, extraction limits, and local OCR status, then asks once. It never displays credentials, endpoint paths or queries, executable paths, or extracted text.
 
-### `monitor`
-
-- `add` binds one canonical, non-overlapping source to one immutable approved FolderSet digest and an interval of at least ten seconds. Definitions are enabled unless `--disabled` is supplied.
-- `run --once` performs one due-time pass and creates read-only Plans. Selecting `--monitor <ID>` checks that monitor immediately, even when disabled.
-- `apply <RUN_ID>` applies one previously reviewed `planned` run, writes its ApplySession beside the Plan, and completes the processed index only after the journal is complete. It requires confirmation or `--yes`.
-- Running without `--once` polls in the foreground. It requires standing mutation authorization through both `--apply` and `--yes`; neither flag is accepted alone. Temari does not install or launch a service.
-- The run root, state database, and FolderSet artifact must remain outside the monitored source. Each non-empty run gets a private `<MONITOR_ID>/<RUN_ID>/` directory containing its authoritative Plan and, when applied, ApplySession.
-- Enabled local rules run before name classification. Remaining files use the same name/content/fallback services as `plan`. Since monitoring is non-interactive, `ask` never grants content consent and uses local fallbacks.
-- Unchanged files are skipped only after a completed ApplySession has durably populated the processed index. The processing signature includes the file fingerprint, FolderSet digest, and enabled-rule digest.
-- Startup reconciles interrupted database rows from Plan and ApplySession JSON. Completed journals may finalize the index; running journals become `needs_resume`; missing, invalid, failed, or partial journals never mark files processed.
-
-### `rule`
-
-- Rules are case-insensitive basename globs. Path separators are literal, so rules cannot match or construct arbitrary source paths.
-- Higher priority wins; equal priority uses stable rule-ID order.
-- A rule selects only an opaque destination ID present in the monitor's reviewed FolderSet. Enabling a rule revalidates the complete active rule set.
-- Removal is a soft delete and requires a terminal confirmation or `--yes`.
-
-### `history`
-
-- `list [--monitor <ID>] [--limit <N>]` reads the cross-run SQLite index.
-- `show <RUN_ID>` displays run status, artifact paths, aggregate routing counts, and staged file metadata. It never contains extracted text, raw model responses, or credentials.
-
 ### `managed`
 
 - `init` is read-only. It inventories the complete source root and writes a `ManagedSetupPlan` that creates `Kept`, `Inbox`, and `Library`, moves existing real directories to Kept, and moves existing regular files to Inbox. It rejects reserved-name collisions, special entries, non-portable names, stale source identity, and cross-filesystem directory entries.
@@ -134,14 +106,16 @@ temari [global options] managed undo-setup|resume-setup ...
 - `apply-run` applies a previously recorded stage or classification Plan by run ID and exact digest.
 - `resume-run` conservatively reconciles and resumes a running Apply journal, then synchronizes both the managed run index and Inbox state. Terminal runs are immutable.
 - `history` lists recent indexed moves. `undo` resolves a completed run to its ApplySession and restores either the complete session or repeated `--file <FILE_ID>` selections. Selected-file Undo never removes shared directories.
+- `rule` manages case-insensitive basename globs for one workspace. Rules select reviewed opaque destination IDs, run before model classification, use descending priority and stable rule-ID ordering, and never store executable paths.
 - `undo-setup` and `resume-setup` operate only from their versioned setup journals. Setup Undo refuses a changed kept directory, occupied original path, or changed area identity.
 - SQLite stores mutable retention and history indexes only. Setup Plans, normal Plans, Apply sessions, and Undo sessions remain authoritative JSON artifacts outside the managed source.
+- Internal monitoring records, processed signatures, and reconciliation services are implementation details. They do not create a second public workflow, expose internal monitor IDs, or install a daemon.
 
 ## Global options and output
 
 ```text
 --config <PATH>   Override model and privacy configuration
---state <PATH>    Override the local monitoring SQLite database
+--state <PATH>    Override the local managed-workspace SQLite database
 --json            Emit a machine-readable command result
 --no-input        Never prompt; fail when explicit input is missing
 --no-color        Disable color
@@ -176,11 +150,12 @@ $ temari undo downloads.apply.json --out downloads.undo.json
 $ temari resume interrupted.apply.json
 $ temari organize ~/Downloads --out downloads-run
 $ temari organize ~/Downloads --include-subtree Receipts --include-subtree Work --out downloads-run
-$ temari monitor add ~/Downloads --folders /absolute/path/downloads.folders.json
-$ temari monitor run --out ~/.local/state/temari/runs --once
-$ temari monitor apply <RUN_ID> --yes
-$ temari monitor run --out ~/.local/state/temari/runs --apply --yes
-$ temari history list
+$ temari managed init ~/Downloads --out downloads.setup-plan.json
+$ temari managed apply downloads.setup-plan.json --folders downloads.folders.json --out downloads-setup
+$ temari managed run <WORKSPACE_ID> --out downloads-cycle
+$ temari managed run <WORKSPACE_ID> --out downloads-cycle-apply --apply --yes
+$ temari managed history <WORKSPACE_ID>
+$ temari managed rule add <WORKSPACE_ID> --name-glob 'invoice-*.pdf' --destination d000001
 ```
 
 For an agent-driven approval after the proposal has already been reviewed:
@@ -196,8 +171,9 @@ $ temari approve downloads.proposal.json --accept-all --no-input --out downloads
 3. Migrate `plan` to consume a `FolderSet` and emit a durable plan.
 4. Implement apply with audit sessions, then undo. Completed.
 5. Add interactive `organize` orchestration and explicit crash resume. Completed.
-6. Reuse the same services for portable polling, rules, processed-file tracking, and run history. Completed.
+6. Reuse the same services internally for rules, processed-file tracking, reconciliation, and run history. Completed.
 7. Add automatic two-pass name/content classification and approved deterministic extension fallbacks. Completed.
 8. Add bounded cross-platform document extraction and optional local OCR. Completed.
 9. Add ambiguity-aware per-run content consent without making primitive commands interactive. Completed.
-10. Add a GUI adapter over the same application services. Not started.
+10. Make managed workspaces the only public recurring workflow. Completed.
+11. Add a GUI adapter over the same application services. In progress as a proof of concept.

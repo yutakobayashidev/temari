@@ -12,11 +12,11 @@ use clap::Subcommand;
 use directories::ProjectDirs;
 use serde::Serialize;
 use temari_core::{
-    ApplySession, ApplyState, Config, FolderSet, InboxState, LocalContentExtractor, ManagedRun,
-    ManagedRunKind, ManagedSetupPlan, ManagedSetupSession, ManagedSetupState, ManagedWorkspace,
-    MonitorRecord, MonitoringOptions, OpenAiCompatibleModel, Plan, RunState, StateStore,
-    UndoMoveOutcome, UndoState, apply_managed_setup, apply_monitoring_plan, apply_plan,
-    build_managed_setup_plan, build_stage_to_inbox_plan, canonical_source_identity,
+    ApplySession, ApplyState, Config, FolderSet, InboxState, LocalContentExtractor, LocalRule,
+    ManagedRun, ManagedRunKind, ManagedSetupPlan, ManagedSetupSession, ManagedSetupState,
+    ManagedWorkspace, MonitorRecord, MonitoringOptions, OpenAiCompatibleModel, Plan, RuleSet,
+    RunState, StateStore, UndoMoveOutcome, UndoState, apply_managed_setup, apply_monitoring_plan,
+    apply_plan, build_managed_setup_plan, build_stage_to_inbox_plan, canonical_source_identity,
     filter_inbox_candidates, fingerprint_candidate, inbox_file_candidates, library_folder_set,
     persist_monitoring_plan, plan_monitor_candidates, resume_managed_setup, root_file_candidates,
     undo_managed_setup, undo_session, undo_session_files,
@@ -27,6 +27,60 @@ use crate::{
 };
 
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Serialize)]
+struct ManagedWorkspaceView<'a> {
+    id: &'a str,
+    source: &'a str,
+    folder_set_path: &'a str,
+    folder_set_sha256: &'a str,
+    retention_seconds: u64,
+    settle_seconds: u64,
+    enabled: bool,
+    setup_session_path: Option<&'a str>,
+    created_unix_ms: i64,
+    updated_unix_ms: i64,
+}
+
+impl<'a> From<&'a ManagedWorkspace> for ManagedWorkspaceView<'a> {
+    fn from(workspace: &'a ManagedWorkspace) -> Self {
+        Self {
+            id: &workspace.id,
+            source: &workspace.source,
+            folder_set_path: &workspace.folder_set_path,
+            folder_set_sha256: &workspace.folder_set_sha256,
+            retention_seconds: workspace.retention_seconds,
+            settle_seconds: workspace.settle_seconds,
+            enabled: workspace.enabled,
+            setup_session_path: workspace.setup_session_path.as_deref(),
+            created_unix_ms: workspace.created_unix_ms,
+            updated_unix_ms: workspace.updated_unix_ms,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ManagedRuleView<'a> {
+    id: &'a str,
+    workspace_id: &'a str,
+    name_glob: &'a str,
+    destination_id: &'a str,
+    priority: i32,
+    enabled: bool,
+}
+
+impl<'a> ManagedRuleView<'a> {
+    fn new(rule: &'a LocalRule, workspace_id: &'a str) -> Self {
+        Self {
+            id: &rule.id,
+            workspace_id,
+            name_glob: &rule.name_glob,
+            destination_id: &rule.destination_id,
+            priority: rule.priority,
+            enabled: rule.enabled,
+        }
+    }
+}
 
 #[derive(Debug, Subcommand)]
 pub enum ManagedCommand {
@@ -64,6 +118,11 @@ pub enum ManagedCommand {
     Status {
         /// Managed workspace ID.
         id: String,
+    },
+    /// Configure deterministic local routing rules for managed workspaces.
+    Rule {
+        #[command(subcommand)]
+        command: RuleCommand,
     },
     /// Run one staging and classification cycle.
     Run {
@@ -138,6 +197,50 @@ pub enum ManagedCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum RuleCommand {
+    /// Add a basename glob rule to a managed workspace.
+    Add {
+        /// Managed workspace ID.
+        workspace_id: String,
+        /// Case-insensitive basename glob to match.
+        #[arg(long = "name-glob")]
+        name_glob: String,
+        /// Approved opaque destination ID from the workspace folder set.
+        #[arg(long)]
+        destination: String,
+        /// Match priority; higher values run first.
+        #[arg(long, default_value_t = 50)]
+        priority: i32,
+        /// Create the rule without activating it.
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// List a managed workspace's rules in matching order.
+    List {
+        /// Managed workspace ID.
+        workspace_id: String,
+    },
+    /// Enable a managed workspace rule.
+    Enable {
+        /// Rule ID.
+        rule_id: String,
+    },
+    /// Disable a managed workspace rule.
+    Disable {
+        /// Rule ID.
+        rule_id: String,
+    },
+    /// Remove a managed workspace rule.
+    Remove {
+        /// Rule ID.
+        rule_id: String,
+        /// Confirm removal without prompting.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 pub fn run_managed(cli: &Cli, command: &ManagedCommand) -> Result<()> {
     match command {
         ManagedCommand::Init { source, out } => init(cli, source, out),
@@ -159,6 +262,7 @@ pub fn run_managed(cli: &Cli, command: &ManagedCommand) -> Result<()> {
         ),
         ManagedCommand::List => list(cli),
         ManagedCommand::Status { id } => status(cli, id),
+        ManagedCommand::Rule { command } => run_rule(cli, command),
         ManagedCommand::Run {
             id,
             out,
@@ -176,6 +280,29 @@ pub fn run_managed(cli: &Cli, command: &ManagedCommand) -> Result<()> {
         } => undo_run(cli, run_id, out, files, *yes),
         ManagedCommand::UndoSetup { session, out, yes } => undo_setup(cli, session, out, *yes),
         ManagedCommand::ResumeSetup { session, yes } => resume_setup(cli, session, *yes),
+    }
+}
+
+fn run_rule(cli: &Cli, command: &RuleCommand) -> Result<()> {
+    match command {
+        RuleCommand::Add {
+            workspace_id,
+            name_glob,
+            destination,
+            priority,
+            disabled,
+        } => add_rule(
+            cli,
+            workspace_id,
+            name_glob,
+            destination,
+            *priority,
+            *disabled,
+        ),
+        RuleCommand::List { workspace_id } => list_rules(cli, workspace_id),
+        RuleCommand::Enable { rule_id } => set_rule_enabled(cli, rule_id, true),
+        RuleCommand::Disable { rule_id } => set_rule_enabled(cli, rule_id, false),
+        RuleCommand::Remove { rule_id, yes } => remove_rule(cli, rule_id, *yes),
     }
 }
 
@@ -309,7 +436,6 @@ fn activate(
         cli,
         &serde_json::json!({
             "workspace_id": workspace_id,
-            "monitor_id": monitor_id,
             "setup_session": setup_path,
             "folder_set": folders_path,
         }),
@@ -320,7 +446,12 @@ fn activate(
 fn list(cli: &Cli) -> Result<()> {
     let records = ManagedContext::new(cli)?.store()?.managed_workspaces()?;
     if cli.json {
-        print_json(&records)
+        print_json(
+            &records
+                .iter()
+                .map(ManagedWorkspaceView::from)
+                .collect::<Vec<_>>(),
+        )
     } else {
         for workspace in records {
             println!(
@@ -347,7 +478,7 @@ fn status(cli: &Cli, id: &str) -> Result<()> {
     let runs = store.managed_runs(id)?;
     if cli.json {
         print_json(&serde_json::json!({
-            "workspace": workspace,
+            "workspace": ManagedWorkspaceView::from(&workspace),
             "inbox": inbox,
             "runs": runs,
         }))
@@ -364,6 +495,132 @@ fn status(cli: &Cli, id: &str) -> Result<()> {
         }
         Ok(())
     }
+}
+
+fn add_rule(
+    cli: &Cli,
+    workspace_id: &str,
+    name_glob: &str,
+    destination: &str,
+    priority: i32,
+    disabled: bool,
+) -> Result<()> {
+    let context = ManagedContext::new(cli)?;
+    let mut store = context.store()?;
+    let workspace = require_workspace(&store, workspace_id)?;
+    let folders = managed_rule_folders(&store, &workspace)?;
+    let rule = LocalRule {
+        id: new_id("rule")?,
+        monitor_id: workspace.monitor_id,
+        name_glob: name_glob.to_owned(),
+        destination_id: destination.to_owned(),
+        priority,
+        enabled: !disabled,
+    };
+    let mut rules = store.active_rules(&rule.monitor_id)?;
+    rules.push(rule.clone());
+    RuleSet::compile(&rules, &folders.folders)?;
+    store.insert_rule(&rule, unix_ms()?)?;
+    print_value(cli, &ManagedRuleView::new(&rule, workspace_id), &rule.id)
+}
+
+fn list_rules(cli: &Cli, workspace_id: &str) -> Result<()> {
+    let store = ManagedContext::new(cli)?.store()?;
+    let workspace = require_workspace(&store, workspace_id)?;
+    managed_rule_folders(&store, &workspace)?;
+    let rules = store.active_rules(&workspace.monitor_id)?;
+    if cli.json {
+        print_json(
+            &rules
+                .iter()
+                .map(|rule| ManagedRuleView::new(rule, workspace_id))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        for rule in rules {
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                rule.id,
+                if rule.enabled { "enabled" } else { "disabled" },
+                rule.priority,
+                rule.name_glob,
+                rule.destination_id
+            );
+        }
+        Ok(())
+    }
+}
+
+fn set_rule_enabled(cli: &Cli, rule_id: &str, enabled: bool) -> Result<()> {
+    let context = ManagedContext::new(cli)?;
+    let mut store = context.store()?;
+    let mut rule = require_managed_rule(&store, rule_id)?;
+    let workspace = workspace_for_monitor(&store, &rule.monitor_id)?;
+    let folders = managed_rule_folders(&store, &workspace)?;
+    rule.enabled = enabled;
+    let mut rules = store.active_rules(&rule.monitor_id)?;
+    let candidate = rules
+        .iter_mut()
+        .find(|candidate| candidate.id == rule.id)
+        .ok_or_else(|| anyhow::anyhow!("unknown active rule {rule_id:?}"))?;
+    *candidate = rule.clone();
+    RuleSet::compile(&rules, &folders.folders)?;
+    store.set_rule_enabled(rule_id, enabled, unix_ms()?)?;
+    print_value(cli, &ManagedRuleView::new(&rule, &workspace.id), &rule.id)
+}
+
+fn remove_rule(cli: &Cli, rule_id: &str, yes: bool) -> Result<()> {
+    confirm(
+        cli,
+        yes,
+        &format!("Remove managed rule {rule_id:?}? [y/N] "),
+    )?;
+    let context = ManagedContext::new(cli)?;
+    let mut store = context.store()?;
+    let rule = require_managed_rule(&store, rule_id)?;
+    let workspace = workspace_for_monitor(&store, &rule.monitor_id)?;
+    managed_rule_folders(&store, &workspace)?;
+    store.remove_rule(rule_id, unix_ms()?)?;
+    print_value(
+        cli,
+        &serde_json::json!({ "id": rule_id, "state": "removed" }),
+        rule_id,
+    )
+}
+
+fn require_managed_rule(store: &StateStore, rule_id: &str) -> Result<LocalRule> {
+    let rule = store
+        .rule(rule_id)?
+        .ok_or_else(|| anyhow::anyhow!("unknown active rule {rule_id:?}"))?;
+    workspace_for_monitor(store, &rule.monitor_id)?;
+    Ok(rule)
+}
+
+fn workspace_for_monitor(store: &StateStore, monitor_id: &str) -> Result<ManagedWorkspace> {
+    store
+        .managed_workspaces()?
+        .into_iter()
+        .find(|workspace| workspace.monitor_id == monitor_id)
+        .ok_or_else(|| anyhow::anyhow!("rule does not belong to a managed workspace"))
+}
+
+fn managed_rule_folders(store: &StateStore, workspace: &ManagedWorkspace) -> Result<FolderSet> {
+    let monitor = store
+        .monitor(&workspace.monitor_id)?
+        .filter(|monitor| monitor.deleted_unix_ms.is_none())
+        .ok_or_else(|| anyhow::anyhow!("managed monitor is missing"))?;
+    if monitor.source != workspace.source
+        || monitor.source_identity != workspace.source_identity
+        || monitor.folder_set_path != workspace.folder_set_path
+        || monitor.folder_set_sha256 != workspace.folder_set_sha256
+    {
+        bail!("managed monitor no longer matches its workspace");
+    }
+    let folders = FolderSet::load(Path::new(&workspace.folder_set_path))?;
+    if folders.source != workspace.source || folders.sha256()? != workspace.folder_set_sha256 {
+        bail!("managed workspace folder set changed");
+    }
+    Ok(folders)
 }
 
 fn run_cycle(cli: &Cli, id: &str, out: &Path, apply: bool, yes: bool) -> Result<()> {
@@ -1091,6 +1348,21 @@ mod tests {
     }
 
     #[test]
+    fn managed_rule_json_uses_workspace_ids_only() {
+        let rule = LocalRule {
+            id: "rule-1".into(),
+            monitor_id: "internal-monitor-1".into(),
+            name_glob: "*.pdf".into(),
+            destination_id: "destination-1".into(),
+            priority: 50,
+            enabled: true,
+        };
+        let value = serde_json::to_value(ManagedRuleView::new(&rule, "workspace-1")).unwrap();
+        assert_eq!(value["workspace_id"], "workspace-1");
+        assert!(value.get("monitor_id").is_none());
+    }
+
+    #[test]
     fn apply_and_yes_are_a_pair() {
         assert!(matches!(
             (false, false),
@@ -1140,6 +1412,43 @@ mod tests {
         assert!(matches!(
             cli.command,
             crate::Command::Managed(ManagedCommand::ResumeRun { yes: true, .. })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "temari",
+            "managed",
+            "rule",
+            "add",
+            "workspace-1",
+            "--name-glob",
+            "*.pdf",
+            "--destination",
+            "destination-1",
+        ])
+        .unwrap();
+        let crate::Command::Managed(ManagedCommand::Rule {
+            command:
+                RuleCommand::Add {
+                    workspace_id,
+                    priority,
+                    disabled,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected managed rule add");
+        };
+        assert_eq!(workspace_id, "workspace-1");
+        assert_eq!(priority, 50);
+        assert!(!disabled);
+
+        let cli = Cli::try_parse_from(["temari", "managed", "rule", "remove", "rule-1", "--yes"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            crate::Command::Managed(ManagedCommand::Rule {
+                command: RuleCommand::Remove { yes: true, .. }
+            })
         ));
     }
 
@@ -1207,7 +1516,7 @@ mod tests {
         assert!(source.join("Inbox/baseline.txt").is_file());
         assert!(source.join("Kept/ExistingDirectory/kept.txt").is_file());
 
-        let mut store = StateStore::open(&state_path).unwrap();
+        let store = StateStore::open(&state_path).unwrap();
         let workspace = store.managed_workspaces().unwrap().pop().unwrap();
         let managed_folders = FolderSet::load(Path::new(&workspace.folder_set_path)).unwrap();
         assert!(
@@ -1223,20 +1532,18 @@ mod tests {
             .unwrap()
             .id
             .clone();
-        store
-            .insert_rule(
-                &temari_core::LocalRule {
-                    id: "managed-text-rule".into(),
-                    monitor_id: workspace.monitor_id.clone(),
-                    name_glob: "*.txt".into(),
-                    destination_id,
-                    priority: 100,
-                    enabled: true,
-                },
-                unix_ms().unwrap(),
-            )
-            .unwrap();
         drop(store);
+
+        add_rule(&cli, &workspace.id, "*.txt", &destination_id, 100, true).unwrap();
+        let store = StateStore::open(&state_path).unwrap();
+        let rule = store
+            .active_rules(&workspace.monitor_id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(!rule.enabled);
+        drop(store);
+        set_rule_enabled(&cli, &rule.id, true).unwrap();
 
         fs::write(source.join("fresh.txt"), b"fresh").unwrap();
         let cycle_root = root.path().join("cycle");
@@ -1301,5 +1608,35 @@ mod tests {
         let reclassify_root = root.path().join("reclassify-cycle");
         run_cycle(&cli, &workspace.id, &reclassify_root, true, true).unwrap();
         assert!(source.join("Library/Documents/baseline.txt").is_file());
+
+        set_rule_enabled(&cli, &rule.id, false).unwrap();
+        let store = StateStore::open(&state_path).unwrap();
+        assert!(!store.rule(&rule.id).unwrap().unwrap().enabled);
+        drop(store);
+        assert!(remove_rule(&cli, &rule.id, false).is_err());
+        assert!(
+            StateStore::open(&state_path)
+                .unwrap()
+                .rule(&rule.id)
+                .unwrap()
+                .is_some()
+        );
+        remove_rule(&cli, &rule.id, true).unwrap();
+        assert!(
+            StateStore::open(&state_path)
+                .unwrap()
+                .rule(&rule.id)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut changed_folders = managed_folders;
+        changed_folders.folders[0].description.push_str(" changed");
+        fs::write(
+            &workspace.folder_set_path,
+            serde_json::to_vec_pretty(&changed_folders).unwrap(),
+        )
+        .unwrap();
+        assert!(list_rules(&cli, &workspace.id).is_err());
     }
 }

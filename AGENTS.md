@@ -19,6 +19,7 @@
 - Local rules match file basenames deterministically and select approved opaque IDs only. Persist the rule ID in the Plan; rules may target local-only approved fallbacks because they are user-authored, not model output.
 - Preserve the canonical `propose -> approve -> plan -> apply -> undo` command boundaries. The interactive `organize` command must orchestrate the same application services.
 - Keep `organize` as TTY-only orchestration; non-interactive callers use the primitive commands. Preserve both destination approval and exact apply confirmation.
+- Keep `managed` as the only public recurring organization workflow. Monitoring records and services are internal implementation details; expose local rules, history, apply, resume, and undo through managed workspace IDs instead of a second monitor-oriented CLI.
 - Resume may update only a `running` ApplySession after conservative filesystem reconciliation. Completed, failed, and partial-failure sessions are immutable, and undo must reject a running session.
 - No telemetry or cloud model provider is enabled by default.
 

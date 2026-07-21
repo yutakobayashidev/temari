@@ -3,6 +3,7 @@
 ## Status
 
 - Accepted
+- Public CLI portions are superseded by ADR 0013; the storage and internal-service decisions remain active.
 
 ## Decision Drivers
 

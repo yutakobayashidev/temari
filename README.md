@@ -30,25 +30,27 @@ For a long-lived folder, the managed workflow creates three physical areas: `Kep
 
 ## Quick start
 
-For the guided human workflow:
+For the normal long-lived workflow, first review a folder hierarchy, then initialize the managed source:
 
 ```console
 $ cp examples/temari.example.toml .temari.toml
-$ cargo run -p temari-cli -- organize ~/Downloads --out downloads-run
+$ cargo run -p temari-cli -- propose ~/Downloads --out downloads.proposal.json
+$ cargo run -p temari-cli -- approve downloads.proposal.json --out downloads.folders.json
+$ cargo run -p temari-cli -- managed init ~/Downloads --out downloads.setup-plan.json
+$ cargo run -p temari-cli -- managed apply downloads.setup-plan.json \
+    --folders downloads.folders.json \
+    --out ~/.local/state/temari/downloads-setup
 ```
 
-`organize` is TTY-only. It preserves the raw proposal, opens an optional `$VISUAL` or `$EDITOR` review path, asks separately whether to approve destinations and apply exact moves, then prints an undo command.
+This creates `Kept`, `Inbox`, and `Library`. Run one reviewed cycle with `temari managed run <WORKSPACE_ID> --out <RUN_DIR>`, then add `--apply --yes` when the generated Plans should be applied.
 
-The equivalent primitive workflow for agents and scripts is:
+For a one-time folder cleanup instead of ongoing management, use the TTY-only `organize` command:
 
 ```console
-$ cargo run -p temari-cli -- propose ~/Downloads --out downloads.proposal.json
-$ $EDITOR downloads.proposal.json
-$ cargo run -p temari-cli -- approve downloads.proposal.json --out downloads.folders.json
-$ cargo run -p temari-cli -- plan ~/Downloads --folders downloads.folders.json --out downloads.plan.json
-$ cargo run -p temari-cli -- apply downloads.plan.json --out downloads.apply.json
-$ cargo run -p temari-cli -- undo downloads.apply.json --out downloads.undo.json
+$ cargo run -p temari-cli -- organize /path/to/one-time-folder --out cleanup-run
 ```
+
+The top-level `propose`, `approve`, `plan`, `apply`, `undo`, and `resume` commands are advanced primitives for agents, scripts, inspection, and recovery. They expose the same versioned artifacts used by managed workspaces.
 
 To include selected existing directories recursively, repeat `--include-subtree`. Use `.` only when the entire source tree should be included:
 
@@ -79,32 +81,6 @@ $ corepack pnpm --dir apps/temari-desktop tauri dev
 
 Desktop automatically loads `config.toml` from the platform application-config directory (`$XDG_CONFIG_HOME/temari` on Linux and Application Support on macOS). The native file picker can override it for the current session. Desktop accepts only absolute regular-file paths and never searches the source folder or process working directory. Plan preview repeats the scan against the backend-held approved destinations. Under `privacy.content = "ask"`, ambiguous files use local fallbacks because this POC has no content-consent screen; explicit `on_demand` retains bounded extraction. Desktop workflow artifacts are private files under the platform application-state directory and remain usable by the CLI for explicit recovery after the app restarts. Running `pnpm dev` without Tauri opens an explicitly simulated browser preview for UI development; simulated Apply and Undo do not access the filesystem or model. See [the desktop POC notes](docs/desktop-poc.md) for its command boundary and verification steps.
 
-## Foreground monitoring
-
-Register an approved folder set, optionally add deterministic basename rules, then run a read-only check:
-
-```console
-$ temari monitor add ~/Downloads --folders /absolute/path/downloads.folders.json
-$ temari monitor list
-$ temari rule add --monitor <MONITOR_ID> --name-glob 'invoice-*.pdf' \
-    --destination d000001 --priority 100
-$ temari monitor run --out ~/.local/state/temari/runs --once
-$ temari history list
-$ temari monitor apply <RUN_ID> --yes
-```
-
-`monitor run --once` writes an immutable Plan but does not move files. After reviewing it, `monitor apply <RUN_ID>` uses the same recorded Plan, writes an ApplySession beside it, and updates processed state only after completion. Continuous foreground polling is deliberately more explicit:
-
-```console
-$ temari monitor run --out ~/.local/state/temari/runs --apply --yes
-```
-
-No daemon or login service is installed. Stop the foreground process with the normal process signal. Every mutation cycle writes its Plan before applying it and uses the normal ApplySession journal. Only a completed journal marks a fingerprint as processed; startup reconciliation can finish the SQLite index after a crash, while a running journal still requires explicit `temari resume`.
-
-Monitoring stores definitions, schedules, rules, processed signatures, and run indexes in SQLite. Authoritative workflow artifacts remain JSON files under `--out`. The default database uses the platform user-state directory; override it with global `--state PATH`. Both the database and run artifacts must remain outside monitored sources.
-
-Rules match file basenames case-insensitively in descending priority and stable ID order. They select reviewed opaque destination IDs locally before any model call. Rule changes alter the processing signature. In unattended monitoring, `privacy.content = "ask"` behaves as no consent and uses approved local fallbacks; choose `on_demand` explicitly to permit bounded extracted text.
-
 ## Managed workspaces
 
 Managed setup is deliberately split into read-only planning and confirmed apply. Existing directories move to `Kept`, existing loose files move to `Inbox`, and the reviewed folder set is namespaced below `Library` without changing its opaque destination IDs.
@@ -118,11 +94,15 @@ $ temari managed list
 $ temari managed status <WORKSPACE_ID>
 $ temari managed run <WORKSPACE_ID> \
     --out ~/.local/state/temari/managed-runs
+$ temari managed rule add <WORKSPACE_ID> \
+    --name-glob 'invoice-*.pdf' --destination d000001 --priority 100
 ```
 
 The first `managed run` is read-only unless `--apply --yes` is supplied. A run first stages new root files into `Inbox`, then considers only direct Inbox files whose retention and stability deadlines have passed. Classification writes a normal Plan before Apply. Recent run records resolve back to authoritative JSON journals for full-session or selected-file Undo.
 
 Arrival time is the first local observation stored in SQLite, not file modification time. Editing or replacing a pending file resets its stability deadline. `Kept` is never recursively scanned, and `Library` is always excluded as an approved destination subtree.
+
+The portable monitoring engine, processed signatures, local rules, and run reconciliation remain internal Core services used by `managed`. There is no separate public monitor workflow and no daemon is installed implicitly.
 
 The approval command previews every destination and asks for confirmation when stdin and stderr are terminals. For a proposal that has already been reviewed by an agent or script, make acceptance explicit:
 
@@ -152,17 +132,14 @@ Document containers are parsed in memory without unpacking files. Archive expans
 temari [--config PATH] [--state PATH] [--json] [--no-input] [--no-color] [-v] <COMMAND>
 
 Commands:
+  managed init|apply|list|status|run|apply-run|resume-run|history|rule|undo|undo-setup|resume-setup ...
+  organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...  One-time cleanup
   propose <SOURCE> --out <PROPOSAL> [--include-subtree <PATH>]...
   approve <PROPOSAL> --out <FOLDER_SET>             Validate and approve it
   plan <SOURCE> --folders <FOLDER_SET> --out <PLAN> Classify files without changing them
   apply <PLAN> --out <APPLY_SESSION> [--yes]         Create directories and move files
   undo <APPLY_SESSION> --out <UNDO_SESSION> [--yes] Restore safely recorded moves
   resume <APPLY_SESSION> [--yes]                     Reconcile and continue a running apply
-  organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...
-  monitor add|list|enable|disable|remove|run|apply ...
-  rule add|list|enable|disable|remove ...
-  history list|show ...
-  managed init|apply|list|status|run|apply-run|resume-run|history|undo|undo-setup|resume-setup ...
 ```
 
 - Artifact paths go to stdout. Read-only commands accept `--out -` to emit artifact JSON. Apply and undo require persistent journal paths outside the organized source.
@@ -182,7 +159,7 @@ The workflow follows five explicit trust boundaries:
 4. `apply`: after confirmation, local code creates only required approved directories and performs validated moves while atomically updating an audit journal.
 5. `undo`: local code conservatively reverses recorded moves and removes only unchanged, empty directories created by that apply session.
 
-All five primitive stages, explicit crash resume, the interactive `organize` orchestrator, foreground monitoring, and managed three-area core workflow are implemented. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for artifact persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits, [ADR 0008](docs/adr/0008-use-sqlite-for-monitoring-state.md) for monitoring state, [ADR 0009](docs/adr/0009-request-per-run-content-consent.md) for consent, [ADR 0010](docs/adr/0010-load-desktop-config-from-platform-directory.md) for desktop configuration and private credentials, [ADR 0011](docs/adr/0011-apply-backend-held-desktop-plans.md) for confirmed desktop Apply and Undo, and [ADR 0012](docs/adr/0012-adopt-managed-three-area-workspaces.md) for protected, staged, and classified areas.
+The managed workflow is the primary product surface. `organize` remains a one-time convenience, and the six primitive commands remain available for agents and recovery. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for artifact persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits, [ADR 0008](docs/adr/0008-use-sqlite-for-monitoring-state.md) for internal monitoring state, [ADR 0009](docs/adr/0009-request-per-run-content-consent.md) for consent, [ADR 0010](docs/adr/0010-load-desktop-config-from-platform-directory.md) for desktop configuration and private credentials, [ADR 0011](docs/adr/0011-apply-backend-held-desktop-plans.md) for confirmed desktop Apply and Undo, [ADR 0012](docs/adr/0012-adopt-managed-three-area-workspaces.md) for protected, staged, and classified areas, and [ADR 0013](docs/adr/0013-make-managed-the-primary-cli.md) for the public CLI boundary.
 
 Example schemas are available for a model-created [proposal](examples/proposal.example.json) and a locally approved [folder set](examples/folders.example.json). Their source paths are illustrative and must match the canonical source used by `plan`.
 
