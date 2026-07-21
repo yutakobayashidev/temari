@@ -12,3 +12,4 @@
 - When the desired brand personality is cute and Japanese, prefer short native words, mimetic expressions, or Japanese-derived coinages over cold, globally generic AI-style names.
 - When reverse-engineering a trust boundary, distinguish limiting the model's prompt candidates from enforcing the returned value locally. Verify the lookup operands and the final call path before claiming an allowlist check exists.
 - Treat an AI folder limit as a budget for every physical directory, including implicit parents. Keep generated hierarchies shallow, ask for broad reusable categories, and preserve deeper structures only when a person explicitly edits and approves them.
+- On NixOS, verify that GTK 3 GSettings schemas are present in `XDG_DATA_DIRS` before diagnosing a Tauri file chooser as an application hang; a missing `org.gtk.Settings.FileChooser` schema terminates the native process when the dialog opens.

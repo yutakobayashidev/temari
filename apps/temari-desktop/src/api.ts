@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import type { FolderSet, Proposal, ScanPreview } from "./types";
 
 const demoProposal: Proposal = {
@@ -21,7 +22,12 @@ function isTauri(): boolean {
 
 export async function chooseSource(): Promise<string | null> {
   if (!isTauri()) return demoProposal.source;
-  return invoke<string | null>("select_source");
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    title: "Choose a folder to organize",
+  });
+  return typeof selected === "string" ? selected : null;
 }
 
 export async function scanSource(source: string): Promise<ScanPreview> {

@@ -5,8 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
-use tauri_plugin_dialog::DialogExt;
+use tauri::State;
 use temari_core::{
     Config, FileCandidate, FolderProposal, FolderProposer, FolderSet, OpenAiCompatibleModel,
     Proposal, ScanScope, scan_directory, select_representative_files,
@@ -52,21 +51,6 @@ struct ProposeRequest {
 #[serde(deny_unknown_fields)]
 struct ApproveRequest {
     folders: Vec<FolderProposal>,
-}
-
-#[tauri::command]
-fn select_source(app: AppHandle) -> Result<Option<String>, String> {
-    app.dialog()
-        .file()
-        .set_title("Choose a folder to organize")
-        .blocking_pick_folder()
-        .map(|selected| {
-            selected
-                .into_path()
-                .map_err(|error| format!("selected folder is not a local path: {error}"))
-                .and_then(|path| path_to_string(&path))
-        })
-        .transpose()
 }
 
 #[tauri::command]
@@ -226,7 +210,6 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
-            select_source,
             scan_source,
             propose_structure,
             approve_structure
