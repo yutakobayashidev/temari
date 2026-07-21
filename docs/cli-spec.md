@@ -12,6 +12,11 @@ temari [global options] managed apply <SETUP_PLAN> --folders <FOLDER_SET> --out 
 temari [global options] managed list|status|enable|disable|edit|remove|reconcile ...
 temari [global options] managed run|reprocess|schedule|apply-run|resume-run|history|undo ...
 temari [global options] managed rule add|list|enable|disable|remove ...
+temari [global options] managed library show <WORKSPACE_ID> --out <FOLDER_SET|->
+temari [global options] managed library plan <WORKSPACE_ID> --out <PLAN> add|rename|describe|delete ...
+temari [global options] managed library apply <PLAN> [--yes]
+temari [global options] managed library undo <WORKSPACE_ID> <RUN_ID> [--yes]
+temari [global options] managed library resume <WORKSPACE_ID> <RUN_ID>
 temari [global options] managed undo-setup|resume-setup ...
 temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...
 temari [global options] propose <SOURCE> --out <PROPOSAL> [--include-subtree <PATH>]...
@@ -103,7 +108,7 @@ temari [global options] resume <APPLY_SESSION> [--yes]
 
 - `init` is read-only. It inventories the complete source root and writes a `ManagedSetupPlan` that creates `Kept`, `Inbox`, and `Library`, moves existing real directories to Kept, and moves existing regular files to Inbox. It rejects reserved-name collisions, special entries, non-portable names, stale source identity, and cross-filesystem directory entries.
 - `apply` confirms that exact setup Plan, writes a durable setup journal before mutation, then registers the completed workspace with a Library-prefixed FolderSet. Retention and stability windows are fixed in the workspace definition.
-- `run` is finite. It first writes a setup-style Plan for new root directories to `Kept`, writes a normal Plan for new root files to Inbox, reconciles Inbox fingerprints in SQLite, and writes a classification Plan only for files past both deadlines. Without `--apply --yes`, Plans remain reviewable and no file moves. Omitted `--out` creates a private unique artifact directory below the state directory.
+- `run` is finite. It first writes a setup-style Plan for new root directories to `Kept`, writes a normal Plan for new root files to Inbox, reconciles Inbox fingerprints in SQLite, and writes a classification Plan only for files past both deadlines. Directories manually returned from `Kept`, including through adoption Undo, are excluded by filesystem identity derived from authoritative setup and adoption journals; missing or invalid referenced journals stop the run before mutation. A different directory that later reuses the same name remains eligible. Without `--apply --yes`, Plans remain reviewable and no file moves. Omitted `--out` creates a private unique artifact directory below the state directory.
 - A classified file manually returned from `Library` to the workspace root retains its processed filesystem identity and is skipped by later runs. Explicit `reprocess` and recorded Undo remain the only operations that clear that intent as part of their reviewed state transitions.
 - `enable` and `disable` atomically update the workspace and its internal monitor. Disabled workspaces reject new runs and Apply but still permit recovery. `edit` changes retention and stability windows and recalculates only pending deadlines. `remove` requires a disabled idle workspace and deletes only registration and mutable indexes; files and JSON artifacts remain.
 - `reconcile` removes stale pending Inbox rows and recognizes manually returned files without treating SQLite as filesystem proof. `status` reports health, physical and indexed Inbox counts, eligibility, and actionable runs without contacting the model.
@@ -113,6 +118,8 @@ temari [global options] resume <APPLY_SESSION> [--yes]
 - `resume-run` conservatively reconciles a running directory-adoption or file Apply journal, then synchronizes mutable indexes before marking the managed run completed. A completed filesystem Apply with interrupted index finalization remains resumable. Failed and partial-failure journals are not mislabeled as resumable, and other terminal runs are immutable.
 - `history` lists each recent indexed file move or root-directory adoption with its original path, destination, and Undo state. `undo` restores a directory-adoption session as a whole without removing `Kept`, `Inbox`, or `Library`; for file runs it restores either the complete session or repeated `--file <FILE_ID_OR_SOURCE_PATH>` selections. It keeps the source lock through atomic journal and Inbox reconciliation. Every individual file Undo journal is indexed without replacing earlier Undo state, and selected-file Undo never removes shared directories.
 - `rule` manages case-insensitive basename globs for one workspace. Rules select reviewed opaque destination IDs, run before model classification, use descending priority and stable rule-ID ordering, and never store executable paths.
+- `library show` exports the current approved FolderSet. `library plan add|rename|describe|delete` is read-only and writes an immutable edit Plan; `library apply` separately confirms and applies that reviewed Plan. Library edits require a disabled workspace and update only logical FolderSet revisions and the workspace binding. They never move files or rename or delete physical directories.
+- Each completed Library Configure run owns its Apply and Undo journals. `library undo` accepts a workspace ID and run ID, derives the journal path from that run, and requires confirmation. `library resume` verifies workspace ownership and resumes Apply from an `applying` run or Undo from a `needs_resume` run; terminal runs remain immutable.
 - `undo-setup` and `resume-setup` operate only from their versioned setup journals. Setup Undo refuses a changed kept directory, occupied original path, or changed area identity.
 - SQLite stores mutable retention and history indexes only. Setup Plans, normal Plans, Apply sessions, and Undo sessions remain authoritative JSON artifacts outside the managed source.
 - SQLite binds each managed workspace to the canonical model configuration path selected at activation. The path is revalidated before model-backed runs and is reused in generated schedule arguments; credentials remain in the owner-only configuration file and never enter workflow artifacts.
@@ -162,6 +169,12 @@ $ temari managed apply downloads.setup-plan.json --folders downloads.folders.jso
 $ temari managed run <WORKSPACE_ID> --out downloads-cycle
 $ temari managed run <WORKSPACE_ID> --apply --yes
 $ temari managed reprocess <WORKSPACE_ID> --from kept --path Projects --apply --yes
+$ temari managed disable <WORKSPACE_ID>
+$ temari managed library show <WORKSPACE_ID> --out library.folders.json
+$ temari managed library plan <WORKSPACE_ID> --out library-edit.plan.json add --path Research --description "Research material"
+$ temari managed library apply library-edit.plan.json --yes
+$ temari managed library undo <WORKSPACE_ID> <CONFIGURE_RUN_ID> --yes
+$ temari managed library resume <WORKSPACE_ID> <CONFIGURE_RUN_ID>
 $ temari managed schedule install <WORKSPACE_ID> --every-seconds 300 --executable ~/.local/bin/temari --yes
 $ temari managed history <WORKSPACE_ID>
 $ temari managed rule add <WORKSPACE_ID> --name-glob 'invoice-*.pdf' --destination d000001

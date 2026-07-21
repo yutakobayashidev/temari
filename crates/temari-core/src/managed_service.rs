@@ -11,14 +11,19 @@ use std::{
 use serde::Serialize;
 use tempfile::NamedTempFile;
 
+use crate::managed::{
+    apply_managed_directory_adoption_excluding, build_managed_directory_adoption_plan_excluding,
+};
+
 use crate::{
     ApplySession, ApplyState, Config, Error, FolderSet, InboxReconcileSummary, InboxState,
-    LocalContentExtractor, ManagedReprocessArea, ManagedReprocessSelection, ManagedRun,
+    LocalContentExtractor, ManagedEntryFingerprint, ManagedLibraryEdit, ManagedLibraryEditPlan,
+    ManagedLibraryEditSession, ManagedLibraryEditState, ManagedLibraryEditUndoSession,
+    ManagedMoveOutcome, ManagedReprocessArea, ManagedReprocessSelection, ManagedRun,
     ManagedRunKind, ManagedSetupPlan, ManagedSetupSession, ManagedSetupState,
     ManagedSetupUndoSession, ManagedSetupUndoState, ManagedWorkspace, MonitorRecord,
     MonitoringOptions, OpenAiCompatibleModel, Plan, RunState, SourceLock, StateStore,
-    apply_managed_directory_adoption, apply_managed_setup, apply_monitoring_plan, apply_plan,
-    build_managed_directory_adoption_plan, build_reprocess_to_inbox_plan,
+    apply_managed_setup, apply_monitoring_plan, apply_plan, build_reprocess_to_inbox_plan,
     build_stage_to_inbox_plan, canonical_source_identity, filter_inbox_candidates,
     fingerprint_candidate, inbox_file_candidates, library_folder_set, persist_monitoring_plan,
     plan_monitor_candidates, reprocess_file_candidates, resume_apply_session, resume_managed_setup,
@@ -52,6 +57,20 @@ pub struct ManagedCycleResult {
 pub struct ManagedActivationResult {
     pub workspace: ManagedWorkspace,
     pub setup_run: ManagedRun,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ManagedLibraryEditResult {
+    pub workspace: ManagedWorkspace,
+    pub run: ManagedRun,
+    pub session: ManagedLibraryEditSession,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ManagedLibraryEditUndoResult {
+    pub workspace: ManagedWorkspace,
+    pub run: ManagedRun,
+    pub session: ManagedLibraryEditUndoSession,
 }
 
 impl ManagedService {
@@ -200,7 +219,9 @@ impl ManagedService {
         };
 
         let mut runs = Vec::new();
-        let adoption_plan = build_managed_directory_adoption_plan(source)?;
+        let excluded_directories = managed_directory_identities(&store, &workspace)?;
+        let adoption_plan =
+            build_managed_directory_adoption_plan_excluding(source, &excluded_directories)?;
         let directory_adoption = if adoption_plan.moves.is_empty() {
             None
         } else {
@@ -310,10 +331,16 @@ impl ManagedService {
         }
         let workspace = require_workspace(&store, &run.workspace_id)?;
         self.validate_workspace(&store, &workspace)?;
-        if run.kind == ManagedRunKind::Adopt {
-            apply_adoption_run(&mut store, &workspace, &mut run)?;
-        } else {
-            apply_indexed_run(&mut store, &workspace, &mut run)?;
+        match run.kind {
+            ManagedRunKind::Adopt => apply_adoption_run(&mut store, &workspace, &mut run)?,
+            ManagedRunKind::Stage | ManagedRunKind::Classify => {
+                apply_indexed_run(&mut store, &workspace, &mut run)?
+            }
+            ManagedRunKind::Setup | ManagedRunKind::Configure => {
+                return Err(Error::InvalidState(
+                    "this run kind requires its dedicated Apply service".into(),
+                ));
+            }
         }
         Ok(run)
     }
@@ -328,10 +355,16 @@ impl ManagedService {
         }
         let workspace = require_workspace(&store, &run.workspace_id)?;
         self.validate_workspace(&store, &workspace)?;
-        if run.kind == ManagedRunKind::Adopt {
-            resume_adoption_run(&mut store, &mut run)?;
-        } else {
-            resume_indexed_run(&mut store, &workspace, &mut run)?;
+        match run.kind {
+            ManagedRunKind::Adopt => resume_adoption_run(&mut store, &mut run)?,
+            ManagedRunKind::Stage | ManagedRunKind::Classify => {
+                resume_indexed_run(&mut store, &workspace, &mut run)?
+            }
+            ManagedRunKind::Setup | ManagedRunKind::Configure => {
+                return Err(Error::InvalidState(
+                    "this run kind requires its dedicated Resume service".into(),
+                ));
+            }
         }
         Ok(run)
     }
@@ -368,6 +401,391 @@ impl ManagedService {
             )));
         }
         Ok(undo)
+    }
+
+    pub fn preview_library_edit(
+        &self,
+        workspace_id: &str,
+        operation: ManagedLibraryEdit,
+    ) -> Result<ManagedLibraryEditPlan, Error> {
+        let store = self.store()?;
+        let workspace = require_workspace(&store, workspace_id)?;
+        let folders = validate_library_edit_workspace(&store, &workspace)?;
+        let added_id = matches!(operation, ManagedLibraryEdit::Add { .. })
+            .then(|| new_id("destination"))
+            .transpose()?;
+        ManagedLibraryEditPlan::build(
+            new_id("library-edit-plan")?,
+            workspace.id,
+            workspace.source_identity,
+            workspace.folder_set_path,
+            &folders,
+            operation,
+            added_id,
+        )
+    }
+
+    pub fn apply_library_edit(
+        &self,
+        plan: &ManagedLibraryEditPlan,
+    ) -> Result<ManagedLibraryEditResult, Error> {
+        plan.validate()?;
+        let mut store = self.store()?;
+        let workspace = require_workspace(&store, &plan.workspace_id)?;
+        validate_library_edit_plan_binding(&store, &workspace, plan)?;
+        let _lock = SourceLock::acquire(Path::new(&workspace.source))?;
+        let workspace = require_workspace(&store, &plan.workspace_id)?;
+        validate_library_edit_plan_binding(&store, &workspace, plan)?;
+
+        let run_directory = self.create_run_directory(&workspace.id, "configure")?;
+        let plan_path = run_directory.join("library-edit-plan.json");
+        let folders_path = run_directory.join("folders.json");
+        let session_path = run_directory.join("library-edit-session.json");
+        write_json(&plan_path, plan)?;
+        write_json(&folders_path, &plan.after_folders)?;
+        let started = unix_ms()?;
+        let mut run = ManagedRun {
+            id: new_id("managed-configure")?,
+            workspace_id: workspace.id.clone(),
+            kind: ManagedRunKind::Configure,
+            state: RunState::Applying,
+            plan_path: Some(path_text(&plan_path)?),
+            apply_path: Some(path_text(&session_path)?),
+            undo_path: None,
+            started_unix_ms: started,
+            finished_unix_ms: None,
+            move_count: 0,
+            error: None,
+        };
+        let mut session = ManagedLibraryEditSession {
+            version: 1,
+            id: new_id("library-edit-session")?,
+            run_id: run.id.clone(),
+            plan_id: plan.id.clone(),
+            workspace_id: workspace.id.clone(),
+            source: workspace.source.clone(),
+            source_identity: workspace.source_identity.clone(),
+            before_folder_set_path: plan.before_folder_set_path.clone(),
+            before_folder_set_sha256: plan.before_folder_set_sha256.clone(),
+            after_folder_set_path: path_text(&folders_path)?,
+            after_folder_set_sha256: plan.after_folder_set_sha256.clone(),
+            operation: plan.operation.clone(),
+            state: ManagedLibraryEditState::Running,
+            started_unix_ms: to_u64_time(started)?,
+            finished_unix_ms: None,
+            error: None,
+        };
+        write_json(&session_path, &session)?;
+        store.insert_managed_run(&run)?;
+        let updated = unix_ms()?;
+        let updated_workspace = match store.replace_managed_folder_set_binding(
+            &workspace.id,
+            &run.id,
+            &plan.before_folder_set_path,
+            &plan.before_folder_set_sha256,
+            &session.after_folder_set_path,
+            &plan.after_folder_set_sha256,
+            plan.removed_destination_id(),
+            updated,
+        ) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                session.state = ManagedLibraryEditState::PartialFailure;
+                session.finished_unix_ms = Some(to_u64_time(updated)?);
+                session.error = Some(error.to_string());
+                replace_json(&session_path, &session)?;
+                run.state = RunState::Failed;
+                run.finished_unix_ms = Some(updated);
+                run.error = Some(error.to_string());
+                store.update_managed_run(&run)?;
+                return Err(error);
+            }
+        };
+        session.state = ManagedLibraryEditState::Completed;
+        session.finished_unix_ms = Some(to_u64_time(updated)?);
+        replace_json(&session_path, &session)?;
+        run.state = RunState::Completed;
+        run.finished_unix_ms = Some(updated);
+        store.update_managed_run(&run)?;
+        Ok(ManagedLibraryEditResult {
+            workspace: updated_workspace,
+            run,
+            session,
+        })
+    }
+
+    pub fn resume_library_edit(&self, run_id: &str) -> Result<ManagedLibraryEditResult, Error> {
+        let mut store = self.store()?;
+        let mut run = require_run(&store, run_id)?;
+        if run.kind != ManagedRunKind::Configure || run.state != RunState::Applying {
+            return Err(Error::InvalidState(
+                "Library edit resume requires a running Configure session".into(),
+            ));
+        }
+        let plan = ManagedLibraryEditPlan::load(Path::new(
+            run.plan_path
+                .as_deref()
+                .ok_or_else(|| Error::InvalidState("Configure run has no Plan".into()))?,
+        ))?;
+        let session_path = Path::new(
+            run.apply_path
+                .as_deref()
+                .ok_or_else(|| Error::InvalidState("Configure run has no Session".into()))?,
+        );
+        let mut session = ManagedLibraryEditSession::load(session_path)?;
+        let workspace = require_workspace(&store, &run.workspace_id)?;
+        if workspace.enabled {
+            return Err(Error::InvalidState(
+                "managed workspace must remain disabled while resuming Library editing".into(),
+            ));
+        }
+        validate_library_edit_session(&run, &workspace, &plan, &session)?;
+        let _lock = SourceLock::acquire(Path::new(&workspace.source))?;
+        let updated = unix_ms()?;
+        let workspace = if workspace.folder_set_path == session.after_folder_set_path
+            && workspace.folder_set_sha256 == session.after_folder_set_sha256
+        {
+            workspace
+        } else {
+            store.replace_managed_folder_set_binding(
+                &workspace.id,
+                &run.id,
+                &plan.before_folder_set_path,
+                &plan.before_folder_set_sha256,
+                &session.after_folder_set_path,
+                &plan.after_folder_set_sha256,
+                plan.removed_destination_id(),
+                updated,
+            )?
+        };
+        session.state = ManagedLibraryEditState::Completed;
+        session.finished_unix_ms = Some(to_u64_time(updated)?);
+        session.error = None;
+        replace_json(session_path, &session)?;
+        run.state = RunState::Completed;
+        run.finished_unix_ms = Some(updated);
+        run.error = None;
+        store.update_managed_run(&run)?;
+        Ok(ManagedLibraryEditResult {
+            workspace,
+            run,
+            session,
+        })
+    }
+
+    pub fn undo_library_edit(
+        &self,
+        run_id: &str,
+        journal_path: &Path,
+    ) -> Result<ManagedLibraryEditUndoResult, Error> {
+        let mut store = self.store()?;
+        let mut run = require_run(&store, run_id)?;
+        if run.kind != ManagedRunKind::Configure || run.state != RunState::Completed {
+            return Err(Error::InvalidState(
+                "Library edit Undo requires a completed Configure session".into(),
+            ));
+        }
+        if run.undo_path.is_some() {
+            return Err(Error::InvalidState(
+                "Library edit session has already been undone".into(),
+            ));
+        }
+        let plan = ManagedLibraryEditPlan::load(Path::new(
+            run.plan_path
+                .as_deref()
+                .ok_or_else(|| Error::InvalidState("Configure run has no Plan".into()))?,
+        ))?;
+        let apply = ManagedLibraryEditSession::load(Path::new(
+            run.apply_path
+                .as_deref()
+                .ok_or_else(|| Error::InvalidState("Configure run has no Session".into()))?,
+        ))?;
+        let workspace = require_workspace(&store, &run.workspace_id)?;
+        if workspace.enabled {
+            return Err(Error::InvalidState(
+                "managed workspace must be disabled before undoing Library editing".into(),
+            ));
+        }
+        validate_library_edit_session(&run, &workspace, &plan, &apply)?;
+        validate_library_edit_undo_path(&run, &workspace, journal_path)?;
+        let _lock = SourceLock::acquire(Path::new(&workspace.source))?;
+        let started = unix_ms()?;
+        let mut undo = ManagedLibraryEditUndoSession {
+            version: 1,
+            id: new_id("library-edit-undo")?,
+            apply_session_id: apply.id,
+            workspace_id: workspace.id.clone(),
+            state: ManagedLibraryEditState::Running,
+            started_unix_ms: to_u64_time(started)?,
+            finished_unix_ms: None,
+            error: None,
+        };
+        run.undo_path = Some(path_text(journal_path)?);
+        run.state = RunState::NeedsResume;
+        run.finished_unix_ms = Some(started);
+        run.error = Some("Library edit Undo is pending".into());
+        store.update_managed_run(&run)?;
+        write_json(journal_path, &undo)?;
+        let removed_id = match &plan.operation {
+            ManagedLibraryEdit::Add { .. } => plan
+                .after_folders
+                .folders
+                .iter()
+                .find(|folder| {
+                    !plan
+                        .before_folders
+                        .folders
+                        .iter()
+                        .any(|before| before.id == folder.id)
+                })
+                .map(|folder| folder.id.as_str()),
+            _ => None,
+        };
+        let updated = unix_ms()?;
+        let workspace = match store.replace_managed_folder_set_binding(
+            &workspace.id,
+            &run.id,
+            &apply.after_folder_set_path,
+            &apply.after_folder_set_sha256,
+            &apply.before_folder_set_path,
+            &apply.before_folder_set_sha256,
+            removed_id,
+            updated,
+        ) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                run.state = RunState::NeedsResume;
+                run.finished_unix_ms = Some(updated);
+                run.error = Some(format!("Library edit Undo is pending: {error}"));
+                store.update_managed_run(&run)?;
+                return Err(error);
+            }
+        };
+        undo.state = ManagedLibraryEditState::Completed;
+        undo.finished_unix_ms = Some(to_u64_time(updated)?);
+        replace_json(journal_path, &undo)?;
+        run.state = RunState::Completed;
+        run.finished_unix_ms = Some(updated);
+        run.error = None;
+        store.update_managed_run(&run)?;
+        Ok(ManagedLibraryEditUndoResult {
+            workspace,
+            run,
+            session: undo,
+        })
+    }
+
+    pub fn resume_library_edit_undo(
+        &self,
+        run_id: &str,
+    ) -> Result<ManagedLibraryEditUndoResult, Error> {
+        let mut store = self.store()?;
+        let mut run = require_run(&store, run_id)?;
+        if run.kind != ManagedRunKind::Configure || run.state != RunState::NeedsResume {
+            return Err(Error::InvalidState(
+                "Library edit Undo resume requires a resumable Configure run".into(),
+            ));
+        }
+        let plan = ManagedLibraryEditPlan::load(Path::new(
+            run.plan_path
+                .as_deref()
+                .ok_or_else(|| Error::InvalidState("Configure run has no Plan".into()))?,
+        ))?;
+        let apply = ManagedLibraryEditSession::load(Path::new(
+            run.apply_path
+                .as_deref()
+                .ok_or_else(|| Error::InvalidState("Configure run has no Session".into()))?,
+        ))?;
+        let undo_path = Path::new(
+            run.undo_path
+                .as_deref()
+                .ok_or_else(|| Error::InvalidState("Configure run has no Undo journal".into()))?,
+        );
+        let mut undo: ManagedLibraryEditUndoSession = if undo_path.exists() {
+            serde_json::from_reader(fs::File::open(undo_path).map_err(|source| {
+                Error::ReadFile {
+                    path: undo_path.display().to_string(),
+                    source,
+                }
+            })?)?
+        } else {
+            let started = unix_ms()?;
+            let undo = ManagedLibraryEditUndoSession {
+                version: 1,
+                id: new_id("library-edit-undo")?,
+                apply_session_id: apply.id.clone(),
+                workspace_id: run.workspace_id.clone(),
+                state: ManagedLibraryEditState::Running,
+                started_unix_ms: to_u64_time(started)?,
+                finished_unix_ms: None,
+                error: None,
+            };
+            write_json(undo_path, &undo)?;
+            undo
+        };
+        if undo.version != 1
+            || undo.apply_session_id != apply.id
+            || undo.workspace_id != run.workspace_id
+            || undo.state != ManagedLibraryEditState::Running
+        {
+            return Err(Error::InvalidState(
+                "managed Library edit Undo journal provenance does not match".into(),
+            ));
+        }
+        let workspace = require_workspace(&store, &run.workspace_id)?;
+        if workspace.enabled {
+            return Err(Error::InvalidState(
+                "managed workspace must remain disabled while resuming Library edit Undo".into(),
+            ));
+        }
+        validate_library_edit_session(&run, &workspace, &plan, &apply)?;
+        validate_library_edit_undo_path(&run, &workspace, undo_path)?;
+        let _lock = SourceLock::acquire(Path::new(&workspace.source))?;
+        let updated = unix_ms()?;
+        let workspace = if workspace.folder_set_path == apply.before_folder_set_path
+            && workspace.folder_set_sha256 == apply.before_folder_set_sha256
+        {
+            workspace
+        } else {
+            let removed_id = match &plan.operation {
+                ManagedLibraryEdit::Add { .. } => plan
+                    .after_folders
+                    .folders
+                    .iter()
+                    .find(|folder| {
+                        !plan
+                            .before_folders
+                            .folders
+                            .iter()
+                            .any(|before| before.id == folder.id)
+                    })
+                    .map(|folder| folder.id.as_str()),
+                _ => None,
+            };
+            store.replace_managed_folder_set_binding(
+                &workspace.id,
+                &run.id,
+                &apply.after_folder_set_path,
+                &apply.after_folder_set_sha256,
+                &apply.before_folder_set_path,
+                &apply.before_folder_set_sha256,
+                removed_id,
+                updated,
+            )?
+        };
+        undo.state = ManagedLibraryEditState::Completed;
+        undo.finished_unix_ms = Some(to_u64_time(updated)?);
+        undo.error = None;
+        replace_json(undo_path, &undo)?;
+        run.state = RunState::Completed;
+        run.finished_unix_ms = Some(updated);
+        run.error = None;
+        store.update_managed_run(&run)?;
+        Ok(ManagedLibraryEditUndoResult {
+            workspace,
+            run,
+            session: undo,
+        })
     }
 
     fn store(&self) -> Result<StateStore, Error> {
@@ -522,6 +940,223 @@ impl ManagedService {
     }
 }
 
+fn validate_library_edit_workspace(
+    store: &StateStore,
+    workspace: &ManagedWorkspace,
+) -> Result<FolderSet, Error> {
+    if workspace.enabled {
+        return Err(Error::InvalidState(
+            "managed workspace must be disabled before editing its Library".into(),
+        ));
+    }
+    let (source, identity) = canonical_source_identity(Path::new(&workspace.source))?;
+    if source != Path::new(&workspace.source) || identity != workspace.source_identity {
+        return Err(Error::InvalidState(
+            "managed workspace source identity changed".into(),
+        ));
+    }
+    let folders = FolderSet::load(Path::new(&workspace.folder_set_path))?;
+    if folders.source != workspace.source || folders.sha256()? != workspace.folder_set_sha256 {
+        return Err(Error::InvalidState(
+            "managed workspace FolderSet binding changed".into(),
+        ));
+    }
+    let monitor = store
+        .monitor(&workspace.monitor_id)?
+        .filter(|monitor| monitor.deleted_unix_ms.is_none())
+        .ok_or_else(|| Error::InvalidState("managed monitor is missing".into()))?;
+    if monitor.source != workspace.source
+        || monitor.source_identity != workspace.source_identity
+        || monitor.folder_set_path != workspace.folder_set_path
+        || monitor.folder_set_sha256 != workspace.folder_set_sha256
+        || monitor.enabled != workspace.enabled
+    {
+        return Err(Error::InvalidState(
+            "managed monitor no longer matches its workspace".into(),
+        ));
+    }
+    Ok(folders)
+}
+
+fn validate_library_edit_plan_binding(
+    store: &StateStore,
+    workspace: &ManagedWorkspace,
+    plan: &ManagedLibraryEditPlan,
+) -> Result<(), Error> {
+    let folders = validate_library_edit_workspace(store, workspace)?;
+    if plan.workspace_id != workspace.id
+        || plan.source != workspace.source
+        || plan.source_identity != workspace.source_identity
+        || plan.before_folder_set_path != workspace.folder_set_path
+        || plan.before_folder_set_sha256 != workspace.folder_set_sha256
+        || folders != plan.before_folders
+    {
+        return Err(Error::InvalidState(
+            "managed Library edit preview is stale".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_library_edit_session(
+    run: &ManagedRun,
+    workspace: &ManagedWorkspace,
+    plan: &ManagedLibraryEditPlan,
+    session: &ManagedLibraryEditSession,
+) -> Result<(), Error> {
+    let session_path = Path::new(
+        run.apply_path
+            .as_deref()
+            .ok_or_else(|| Error::InvalidState("Configure run has no Session path".into()))?,
+    );
+    let run_directory = session_path
+        .parent()
+        .ok_or_else(|| Error::InvalidState("Configure Session has no parent directory".into()))?;
+    let replacement_path = Path::new(&session.after_folder_set_path);
+    if replacement_path != run_directory.join("folders.json")
+        || !replacement_path.is_absolute()
+        || replacement_path.starts_with(Path::new(&workspace.source))
+    {
+        return Err(Error::InvalidState(
+            "managed Library replacement FolderSet must be the run-owned folders.json outside the source"
+                .into(),
+        ));
+    }
+    if session.run_id != run.id
+        || session.plan_id != plan.id
+        || session.workspace_id != workspace.id
+        || session.source != workspace.source
+        || session.source_identity != workspace.source_identity
+        || session.before_folder_set_path != plan.before_folder_set_path
+        || session.before_folder_set_sha256 != plan.before_folder_set_sha256
+        || session.after_folder_set_sha256 != plan.after_folder_set_sha256
+        || session.operation != plan.operation
+    {
+        return Err(Error::InvalidState(
+            "managed Library edit Session provenance does not match its run and Plan".into(),
+        ));
+    }
+    let replacement = FolderSet::load(Path::new(&session.after_folder_set_path))?;
+    if replacement != plan.after_folders || replacement.sha256()? != session.after_folder_set_sha256
+    {
+        return Err(Error::InvalidState(
+            "managed Library edit replacement FolderSet changed".into(),
+        ));
+    }
+    let current = FolderSet::load(Path::new(&workspace.folder_set_path))?;
+    if current.source != workspace.source || current.sha256()? != workspace.folder_set_sha256 {
+        return Err(Error::InvalidState(
+            "managed workspace FolderSet binding changed".into(),
+        ));
+    }
+    if (workspace.folder_set_path != session.before_folder_set_path
+        || workspace.folder_set_sha256 != session.before_folder_set_sha256)
+        && (workspace.folder_set_path != session.after_folder_set_path
+            || workspace.folder_set_sha256 != session.after_folder_set_sha256)
+    {
+        return Err(Error::InvalidState(
+            "managed Library edit Session is stale for the current binding".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_library_edit_undo_path(
+    run: &ManagedRun,
+    workspace: &ManagedWorkspace,
+    journal_path: &Path,
+) -> Result<(), Error> {
+    if !journal_path.is_absolute() || journal_path.starts_with(Path::new(&workspace.source)) {
+        return Err(Error::InvalidState(
+            "Library edit Undo journal must be an absolute path outside the managed source".into(),
+        ));
+    }
+    let apply_parent = Path::new(
+        run.apply_path
+            .as_deref()
+            .ok_or_else(|| Error::InvalidState("Configure run has no Session path".into()))?,
+    )
+    .parent()
+    .ok_or_else(|| Error::InvalidState("Configure Session has no parent directory".into()))?;
+    if journal_path.parent() != Some(apply_parent) {
+        return Err(Error::InvalidState(
+            "Library edit Undo journal must stay beside its Apply Session".into(),
+        ));
+    }
+    let parent = fs::symlink_metadata(apply_parent).map_err(|error| {
+        io_error(
+            "inspect Library edit artifact directory",
+            apply_parent,
+            error,
+        )
+    })?;
+    if parent.file_type().is_symlink() || !parent.is_dir() {
+        return Err(Error::InvalidState(
+            "Library edit artifact parent is not a real directory".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn managed_directory_identities(
+    store: &StateStore,
+    workspace: &ManagedWorkspace,
+) -> Result<HashSet<(u64, u64)>, Error> {
+    let setup_path = workspace.setup_session_path.as_deref().ok_or_else(|| {
+        Error::InvalidState("managed workspace has no authoritative setup session".into())
+    })?;
+    let mut identities = HashSet::new();
+    collect_moved_directory_identities(
+        &mut identities,
+        workspace,
+        &ManagedSetupSession::load(Path::new(setup_path))?,
+    )?;
+    for run in store.managed_runs(&workspace.id)? {
+        if run.kind != ManagedRunKind::Adopt {
+            continue;
+        }
+        let Some(apply_path) = run.apply_path.as_deref() else {
+            if matches!(run.state, RunState::Planned | RunState::Failed) {
+                continue;
+            }
+            return Err(Error::InvalidState(format!(
+                "adoption run {:?} has no authoritative Apply session",
+                run.id
+            )));
+        };
+        if !Path::new(apply_path).exists() && run.state == RunState::Failed {
+            continue;
+        }
+        collect_moved_directory_identities(
+            &mut identities,
+            workspace,
+            &ManagedSetupSession::load(Path::new(apply_path))?,
+        )?;
+    }
+    Ok(identities)
+}
+
+fn collect_moved_directory_identities(
+    identities: &mut HashSet<(u64, u64)>,
+    workspace: &ManagedWorkspace,
+    session: &ManagedSetupSession,
+) -> Result<(), Error> {
+    if session.source != workspace.source || session.source_identity != workspace.source_identity {
+        return Err(Error::InvalidState(
+            "managed directory journal does not belong to its workspace".into(),
+        ));
+    }
+    for movement in &session.moves {
+        if movement.outcome != ManagedMoveOutcome::Moved {
+            continue;
+        }
+        if let ManagedEntryFingerprint::Directory { fingerprint } = &movement.fingerprint {
+            identities.insert((fingerprint.identity.device, fingerprint.identity.inode));
+        }
+    }
+    Ok(())
+}
+
 fn adoption_run(
     workspace_id: &str,
     plan_path: &Path,
@@ -544,7 +1179,7 @@ fn adoption_run(
 
 fn apply_adoption_run(
     store: &mut StateStore,
-    _workspace: &ManagedWorkspace,
+    workspace: &ManagedWorkspace,
     run: &mut ManagedRun,
 ) -> Result<(), Error> {
     let plan_path = run
@@ -556,16 +1191,19 @@ fn apply_adoption_run(
         .parent()
         .ok_or_else(|| Error::InvalidState("adoption Plan has no parent directory".into()))?;
     let apply_path = parent.join("directory-adoption-apply.json");
+    let excluded_directories = managed_directory_identities(store, workspace)?;
     run.state = RunState::Applying;
     run.apply_path = Some(path_text(&apply_path)?);
     store.update_managed_run(run)?;
-    let session = match apply_managed_directory_adoption(&plan, &apply_path) {
-        Ok(session) => session,
-        Err(error) => {
-            finalize_adoption_error(store, run, &apply_path, &error.to_string())?;
-            return Err(error);
-        }
-    };
+    let session =
+        match apply_managed_directory_adoption_excluding(&plan, &apply_path, &excluded_directories)
+        {
+            Ok(session) => session,
+            Err(error) => {
+                finalize_adoption_error(store, run, &apply_path, &error.to_string())?;
+                return Err(error);
+            }
+        };
     finish_adoption_session(store, run, &session)
 }
 
@@ -703,7 +1341,7 @@ fn apply_indexed_run(
     let apply_path = parent.join(match run.kind {
         ManagedRunKind::Stage => "stage-apply.json",
         ManagedRunKind::Classify => "classify-apply.json",
-        ManagedRunKind::Setup | ManagedRunKind::Adopt => {
+        ManagedRunKind::Setup | ManagedRunKind::Adopt | ManagedRunKind::Configure => {
             return Err(Error::InvalidState(
                 "setup runs cannot be applied through managed run".into(),
             ));
@@ -719,7 +1357,9 @@ fn apply_indexed_run(
             let lock = SourceLock::acquire(Path::new(&workspace.source))?;
             apply_monitoring_plan(store, &run.id, &plan, &apply_path, &lock, apply_time)
         }
-        ManagedRunKind::Setup | ManagedRunKind::Adopt => unreachable!(),
+        ManagedRunKind::Setup | ManagedRunKind::Adopt | ManagedRunKind::Configure => {
+            unreachable!()
+        }
     };
     let session = match applied {
         Ok(session) => session,
@@ -756,7 +1396,9 @@ fn finalize_completed_apply(
         ManagedRunKind::Classify => {
             mark_inbox_entries(store, workspace, plan, InboxState::Moved, &run.id)?
         }
-        ManagedRunKind::Setup | ManagedRunKind::Adopt => unreachable!(),
+        ManagedRunKind::Setup | ManagedRunKind::Adopt | ManagedRunKind::Configure => {
+            unreachable!()
+        }
     }
     run.state = RunState::Completed;
     run.finished_unix_ms = Some(unix_ms()?);
@@ -1095,6 +1737,29 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
     Ok(())
 }
 
+fn replace_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::InvalidState("artifact path has no parent directory".into()))?;
+    let mut temporary = NamedTempFile::new_in(parent)
+        .map_err(|error| io_error("create temporary artifact", path, error))?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| io_error("secure temporary artifact", path, error))?;
+    serde_json::to_writer_pretty(&mut temporary, value)?;
+    temporary
+        .write_all(b"\n")
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| io_error("write artifact", path, error))?;
+    temporary
+        .persist(path)
+        .map_err(|error| io_error("replace artifact", path, error.error))?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| io_error("sync artifact directory", parent, error))
+}
+
 fn new_id(prefix: &str) -> Result<String, Error> {
     let sequence = ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     Ok(format!(
@@ -1111,6 +1776,11 @@ fn unix_ms() -> Result<i64, Error> {
         .as_millis();
     i64::try_from(value)
         .map_err(|_| Error::InvalidState("current timestamp does not fit in i64".into()))
+}
+
+fn to_u64_time(value: i64) -> Result<u64, Error> {
+    u64::try_from(value)
+        .map_err(|_| Error::InvalidState("timestamp is before the Unix epoch".into()))
 }
 
 fn path_text(path: &Path) -> Result<String, Error> {
@@ -1172,6 +1842,12 @@ mod tests {
         let source = root.path().join("source");
         fs::create_dir(&source).unwrap();
         fs::write(source.join("baseline.txt"), b"baseline").unwrap();
+        fs::create_dir(source.join("InitialManualDirectory")).unwrap();
+        fs::write(
+            source.join("InitialManualDirectory/note.txt"),
+            b"initial manual",
+        )
+        .unwrap();
         let state = root.path().join("state.sqlite3");
         let config_path = root.path().join("config.toml");
         fs::write(&config_path, toml::to_string(&config()).unwrap()).unwrap();
@@ -1224,32 +1900,82 @@ mod tests {
         assert!(classified.is_file());
 
         fs::rename(&classified, source.join("baseline.txt")).unwrap();
+        fs::rename(
+            source.join("Kept/InitialManualDirectory"),
+            source.join("InitialManualDirectory"),
+        )
+        .unwrap();
         fs::create_dir(source.join("NewManualDirectory")).unwrap();
         fs::write(source.join("NewManualDirectory/note.txt"), b"manual").unwrap();
         let cycle = service
-            .run_workspace(&activation.workspace.id, true)
+            .run_workspace(&activation.workspace.id, false)
             .unwrap();
 
         let adoption = cycle.directory_adoption.unwrap();
-        let indexed = StateStore::open(&state)
-            .unwrap()
-            .managed_run(&adoption.run_id)
-            .unwrap()
-            .unwrap();
+        let indexed = service.apply_run(&adoption.run_id).unwrap();
         assert_eq!(indexed.kind, ManagedRunKind::Adopt);
         assert_eq!(indexed.state, RunState::Completed);
         assert!(source.join("baseline.txt").is_file());
+        assert!(source.join("InitialManualDirectory/note.txt").is_file());
         assert!(source.join("Kept/NewManualDirectory/note.txt").is_file());
         assert!(!source.join("Inbox/baseline.txt").exists());
 
+        fs::rename(
+            source.join("Kept/NewManualDirectory"),
+            source.join("NewManualDirectory"),
+        )
+        .unwrap();
+        let returned = service
+            .run_workspace(&activation.workspace.id, true)
+            .unwrap();
+        assert!(returned.directory_adoption.is_none());
+        assert!(source.join("NewManualDirectory/note.txt").is_file());
+
+        fs::remove_dir_all(source.join("NewManualDirectory")).unwrap();
+        fs::create_dir(source.join("NewManualDirectory")).unwrap();
+        fs::write(
+            source.join("NewManualDirectory/recreated.txt"),
+            b"new identity",
+        )
+        .unwrap();
+        let recreated = service
+            .run_workspace(&activation.workspace.id, true)
+            .unwrap();
+        assert!(recreated.directory_adoption.is_some());
+        assert!(
+            source
+                .join("Kept/NewManualDirectory/recreated.txt")
+                .is_file()
+        );
+
+        fs::create_dir(source.join("UndoManualDirectory")).unwrap();
+        fs::write(source.join("UndoManualDirectory/undo.txt"), b"undo").unwrap();
+        let undo_cycle = service
+            .run_workspace(&activation.workspace.id, true)
+            .unwrap();
+        let undo_adoption = undo_cycle.directory_adoption.unwrap();
         let undo_path = root.path().join("adoption-undo.json");
         service
-            .undo_adoption_run(&adoption.run_id, &undo_path)
+            .undo_adoption_run(&undo_adoption.run_id, &undo_path)
             .unwrap();
-        assert!(source.join("NewManualDirectory/note.txt").is_file());
+        assert!(source.join("UndoManualDirectory/undo.txt").is_file());
+        let after_undo = service
+            .run_workspace(&activation.workspace.id, true)
+            .unwrap();
+        assert!(after_undo.directory_adoption.is_none());
         for area in ["Kept", "Inbox", "Library"] {
             assert!(source.join(area).is_dir());
         }
+
+        fs::write(indexed.apply_path.unwrap(), b"{}").unwrap();
+        fs::create_dir(source.join("MustRemainAfterCorruption")).unwrap();
+        assert!(
+            service
+                .run_workspace(&activation.workspace.id, true)
+                .is_err()
+        );
+        assert!(source.join("MustRemainAfterCorruption").is_dir());
+        assert!(!source.join("Kept/MustRemainAfterCorruption").exists());
     }
 
     #[test]
@@ -1309,5 +2035,276 @@ mod tests {
                 .is_empty()
         );
         assert!(source.join("Kept").is_dir());
+    }
+
+    #[test]
+    fn missing_authoritative_directory_journal_fails_before_adoption() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let state = root.path().join("state.sqlite3");
+        let config_path = root.path().join("config.toml");
+        fs::write(&config_path, toml::to_string(&config()).unwrap()).unwrap();
+        let folders = Proposal {
+            version: 2,
+            source: source.display().to_string(),
+            scope: ScanScope::default(),
+            files_considered: 0,
+            folders: vec![FolderProposal {
+                path: "Documents".into(),
+                description: "Documents".into(),
+            }],
+        }
+        .approve()
+        .unwrap();
+        let setup = build_managed_setup_plan(&source).unwrap();
+        let service = ManagedService::new(&state);
+        let activation = service
+            .activate_workspace(&setup, &folders, &config_path, 1, 1)
+            .unwrap();
+        let setup_path = activation.workspace.setup_session_path.unwrap();
+        fs::remove_file(setup_path).unwrap();
+        fs::create_dir(source.join("MustRemainAtRoot")).unwrap();
+
+        assert!(
+            service
+                .run_workspace(&activation.workspace.id, true)
+                .is_err()
+        );
+        assert!(source.join("MustRemainAtRoot").is_dir());
+        assert!(!source.join("Kept/MustRemainAtRoot").exists());
+    }
+
+    #[test]
+    fn library_edits_switch_immutable_bindings_without_moving_existing_files() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let state = root.path().join("state.sqlite3");
+        let config_path = root.path().join("config.toml");
+        fs::write(&config_path, toml::to_string(&config()).unwrap()).unwrap();
+        let folders = Proposal {
+            version: 2,
+            source: source.display().to_string(),
+            scope: ScanScope::default(),
+            files_considered: 0,
+            folders: vec![
+                FolderProposal {
+                    path: "Documents".into(),
+                    description: "Documents".into(),
+                },
+                FolderProposal {
+                    path: "Images".into(),
+                    description: "Images".into(),
+                },
+            ],
+        }
+        .approve()
+        .unwrap();
+        let setup = build_managed_setup_plan(&source).unwrap();
+        let service = ManagedService::new(&state);
+        let activation = service
+            .activate_workspace(&setup, &folders, &config_path, 1, 1)
+            .unwrap();
+        let mut store = StateStore::open(&state).unwrap();
+        let workspace = store
+            .set_managed_workspace_enabled(&activation.workspace.id, false, unix_ms().unwrap())
+            .unwrap();
+        let original = FolderSet::load(Path::new(&workspace.folder_set_path)).unwrap();
+        let documents = original
+            .folders
+            .iter()
+            .find(|folder| folder.path == "Library/Documents")
+            .unwrap()
+            .clone();
+        let images_id = original
+            .folders
+            .iter()
+            .find(|folder| folder.path == "Library/Images")
+            .unwrap()
+            .id
+            .clone();
+        fs::create_dir(source.join("Library/Documents")).unwrap();
+        fs::write(source.join("Library/Documents/existing.txt"), "existing").unwrap();
+        drop(store);
+
+        let rename = service
+            .preview_library_edit(
+                &workspace.id,
+                ManagedLibraryEdit::Rename {
+                    id: documents.id.clone(),
+                    path: "Archive".into(),
+                },
+            )
+            .unwrap();
+        let renamed = service.apply_library_edit(&rename).unwrap();
+        let renamed_folders =
+            FolderSet::load(Path::new(&renamed.workspace.folder_set_path)).unwrap();
+        assert_ne!(renamed.workspace.folder_set_path, workspace.folder_set_path);
+        assert_eq!(
+            renamed_folders
+                .folders
+                .iter()
+                .find(|folder| folder.id == documents.id)
+                .unwrap()
+                .path,
+            "Library/Archive"
+        );
+        assert!(source.join("Library/Documents/existing.txt").is_file());
+        assert!(!source.join("Library/Archive").exists());
+        assert!(service.apply_library_edit(&rename).is_err());
+
+        let session_path = Path::new(renamed.run.apply_path.as_deref().unwrap());
+        let mut interrupted_session = ManagedLibraryEditSession::load(session_path).unwrap();
+        interrupted_session.state = ManagedLibraryEditState::Running;
+        interrupted_session.finished_unix_ms = None;
+        replace_json(session_path, &interrupted_session).unwrap();
+        let mut interrupted_run = renamed.run.clone();
+        interrupted_run.state = RunState::Applying;
+        interrupted_run.finished_unix_ms = None;
+        StateStore::open(&state)
+            .unwrap()
+            .update_managed_run(&interrupted_run)
+            .unwrap();
+        assert_eq!(
+            service
+                .resume_library_edit(&interrupted_run.id)
+                .unwrap()
+                .run
+                .state,
+            RunState::Completed
+        );
+
+        let undo_path = Path::new(renamed.run.apply_path.as_deref().unwrap())
+            .parent()
+            .unwrap()
+            .join("library-edit-undo.json");
+        let undone = service
+            .undo_library_edit(&renamed.run.id, &undo_path)
+            .unwrap();
+        let restored = FolderSet::load(Path::new(&undone.workspace.folder_set_path)).unwrap();
+        assert_eq!(undone.workspace.folder_set_path, workspace.folder_set_path);
+        assert_eq!(restored.sha256().unwrap(), original.sha256().unwrap());
+        assert!(source.join("Library/Documents/existing.txt").is_file());
+
+        let add = service
+            .preview_library_edit(
+                &workspace.id,
+                ManagedLibraryEdit::Add {
+                    path: "Research".into(),
+                    description: "Research material".into(),
+                },
+            )
+            .unwrap();
+        let added_id = add
+            .after_folders
+            .folders
+            .iter()
+            .find(|folder| {
+                !add.before_folders
+                    .folders
+                    .iter()
+                    .any(|before| before.id == folder.id)
+            })
+            .unwrap()
+            .id
+            .clone();
+        let added = service.apply_library_edit(&add).unwrap();
+        assert!(!source.join("Library/Research").exists());
+
+        let mut store = StateStore::open(&state).unwrap();
+        store
+            .insert_rule(
+                &LocalRule {
+                    id: "research-rule".into(),
+                    monitor_id: workspace.monitor_id.clone(),
+                    name_glob: "*.research".into(),
+                    destination_id: added_id.clone(),
+                    priority: 100,
+                    enabled: true,
+                },
+                unix_ms().unwrap(),
+            )
+            .unwrap();
+        drop(store);
+        let delete = service
+            .preview_library_edit(
+                &workspace.id,
+                ManagedLibraryEdit::Delete {
+                    id: added_id.clone(),
+                },
+            )
+            .unwrap();
+        assert!(service.apply_library_edit(&delete).is_err());
+        assert!(
+            service
+                .undo_library_edit(&added.run.id, &root.path().join("injected-undo.json"))
+                .is_err()
+        );
+        let add_undo_path = Path::new(added.run.apply_path.as_deref().unwrap())
+            .parent()
+            .unwrap()
+            .join("library-edit-undo.json");
+        assert!(
+            service
+                .undo_library_edit(&added.run.id, &add_undo_path)
+                .is_err()
+        );
+        assert_eq!(
+            StateStore::open(&state)
+                .unwrap()
+                .managed_run(&added.run.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::NeedsResume
+        );
+        fs::remove_file(&add_undo_path).unwrap();
+        let mut store = StateStore::open(&state).unwrap();
+        store
+            .remove_rule("research-rule", unix_ms().unwrap())
+            .unwrap();
+        drop(store);
+        let resumed = service.resume_library_edit_undo(&added.run.id).unwrap();
+        assert!(
+            FolderSet::load(Path::new(&resumed.workspace.folder_set_path))
+                .unwrap()
+                .folders
+                .iter()
+                .all(|folder| folder.id != added_id)
+        );
+
+        let delete = service
+            .preview_library_edit(&workspace.id, ManagedLibraryEdit::Delete { id: images_id })
+            .unwrap();
+        service.apply_library_edit(&delete).unwrap();
+
+        let mut store = StateStore::open(&state).unwrap();
+        store
+            .insert_managed_run(&ManagedRun {
+                id: "unfinished-stage".into(),
+                workspace_id: workspace.id.clone(),
+                kind: ManagedRunKind::Stage,
+                state: RunState::Planned,
+                plan_path: None,
+                apply_path: None,
+                undo_path: None,
+                started_unix_ms: unix_ms().unwrap(),
+                finished_unix_ms: None,
+                move_count: 0,
+                error: None,
+            })
+            .unwrap();
+        drop(store);
+        let description = service
+            .preview_library_edit(
+                &workspace.id,
+                ManagedLibraryEdit::EditDescription {
+                    id: documents.id,
+                    description: "Updated documents".into(),
+                },
+            )
+            .unwrap();
+        assert!(service.apply_library_edit(&description).is_err());
     }
 }

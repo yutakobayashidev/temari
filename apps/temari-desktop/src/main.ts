@@ -1,5 +1,6 @@
 import "./styles.css";
 import {
+  applyLibraryEdit,
   applyManagedWorkspace,
   chooseConfig,
   chooseSource,
@@ -12,14 +13,19 @@ import {
   getManagedWorkspace,
   listManagedWorkspaces,
   previewManagedWorkspace,
+  previewLibraryEdit,
   proposeManagedWorkspace,
   reprocessManagedFiles,
   runManagedWorkspace,
   setManagedWorkspaceEnabled,
   undoManagedMove,
   undoManagedRun,
+  undoLibraryEdit,
+  resumeLibraryEdit,
 } from "./api";
 import type {
+  LibraryEditOperation,
+  LibraryEditPreview,
   ManagedMove,
   ManagedWorkspace,
   ManagedWorkspaceStatus,
@@ -56,6 +62,8 @@ type AppState = {
   proposal: SetupProposal | null;
   setupPreview: SetupPreview | null;
   reprocessOpen: boolean;
+  libraryEditOpen: boolean;
+  libraryEditPreview: LibraryEditPreview | null;
   pendingConfirmation: PendingConfirmation | null;
 };
 
@@ -76,6 +84,8 @@ const state: AppState = {
   proposal: null,
   setupPreview: null,
   reprocessOpen: false,
+  libraryEditOpen: false,
+  libraryEditPreview: null,
   pendingConfirmation: null,
 };
 
@@ -144,7 +154,7 @@ function historyRows(): string {
         <span aria-hidden="true">→</span>
         <strong>${escapeHtml(move.destinationPath)}</strong>
       </div>
-      <span class="move-kind">${move.kind === "classify" ? "Classified" : move.kind === "adopt" ? "Kept" : "Staged"}</span>
+      <span class="move-kind">${move.kind === "classify" ? "Classified" : move.kind === "adopt" ? "Kept" : move.kind === "configure" ? "Configured" : "Staged"}</span>
       ${move.undone
         ? `<span class="undo-state">Undone</span>`
         : move.kind === "adopt"
@@ -225,6 +235,17 @@ function dashboard(): string {
           <small class="area-detail">recently indexed</small>
         </article>
       </div>
+    </section>
+
+    <section class="library-ledger" aria-labelledby="library-ledger-title">
+      <div class="section-heading compact">
+        <div><p class="eyebrow">Approved destinations</p><h2 id="library-ledger-title">Library structure</h2></div>
+        <button class="text-button" id="open-library-editor" type="button" ${workspace.enabled ? "disabled" : ""}>Edit structure</button>
+      </div>
+      <div class="library-ledger-rows">${state.status.libraryFolders.map((folder) => `<div><strong>${escapeHtml(folder.path)}</strong><span>${escapeHtml(folder.description)}</span></div>`).join("")}</div>
+      <p class="field-note">${workspace.enabled ? "Pause this workspace before editing its structure." : "Structure edits do not move existing files. Use Reprocess when files should be organized again."}</p>
+      ${state.status.latestConfiguration?.state === "completed" && !state.status.latestConfiguration.undone ? `<button class="text-button" id="undo-library-edit" type="button">Undo last structure edit</button>` : ""}
+      ${state.status.latestConfiguration && ["applying", "needs_resume"].includes(state.status.latestConfiguration.state) ? `<button class="text-button" id="resume-library-edit" type="button">Resume structure edit</button>` : ""}
     </section>
 
     <div class="dashboard-grid">
@@ -311,6 +332,33 @@ function reprocessDialog(): string {
   </dialog>`;
 }
 
+function libraryEditDialog(): string {
+  if (!state.libraryEditOpen || !state.status) return "";
+  return `<dialog class="sheet-dialog" id="library-edit-dialog" open aria-labelledby="library-edit-title">
+    <div class="sheet-backdrop" data-close-library-edit></div>
+    <section class="sheet-card library-editor">
+      <button class="dialog-close" data-close-library-edit aria-label="Close" type="button">×</button>
+      <p class="eyebrow">Approved destinations ledger</p>
+      <h2 id="library-edit-title">Edit Library structure</h2>
+      <p>These changes update future organization only. Existing files stay where they are until you use Reprocess.</p>
+      <div class="library-editor-rows">${state.status.libraryFolders.map((folder) => `
+        <article data-library-folder="${escapeAttribute(folder.id)}">
+          <label><span>Path</span><input name="path" value="${escapeAttribute(folder.path)}" /></label>
+          <button class="text-button" data-library-rename="${escapeAttribute(folder.id)}" type="button">Rename</button>
+          <label class="description"><span>Description</span><input name="description" value="${escapeAttribute(folder.description)}" /></label>
+          <button class="text-button" data-library-description="${escapeAttribute(folder.id)}" type="button">Save description</button>
+          <button class="text-button danger-text" data-library-delete="${escapeAttribute(folder.id)}" type="button">Delete</button>
+        </article>`).join("")}</div>
+      <form class="library-add" id="library-add-form">
+        <p class="eyebrow">Add destination</p>
+        <input name="path" placeholder="Work/Reports" required />
+        <input name="description" placeholder="What belongs here" required />
+        <button class="secondary-button" type="submit">Review addition</button>
+      </form>
+    </section>
+  </dialog>`;
+}
+
 function confirmationDialog(): string {
   const confirmation = state.pendingConfirmation;
   if (!confirmation) return "";
@@ -336,7 +384,7 @@ function render(): void {
       <div class="rail-boundary"><span aria-hidden="true">⌾</span><p><strong>Your boundary</strong>Only approved text reaches your configured model.</p></div>
     </aside>
     ${state.busy && !state.status && state.workspaces.length === 0 ? `<main class="loading-state">Loading managed folders…</main>` : dashboard()}
-  </div>${setupDialog()}${reprocessDialog()}${confirmationDialog()}`;
+  </div>${setupDialog()}${libraryEditDialog()}${reprocessDialog()}${confirmationDialog()}`;
   bindEvents();
 }
 
@@ -403,6 +451,39 @@ function syncProposal(): void {
   }));
 }
 
+async function reviewLibraryEdit(operation: LibraryEditOperation): Promise<void> {
+  if (!state.status || state.busy) return;
+  setBusy(true);
+  try {
+    const preview = await previewLibraryEdit(state.status.workspace.id, operation);
+    state.libraryEditPreview = preview;
+    state.libraryEditOpen = false;
+    const before = preview.beforeFolders.find((folder) => "id" in operation && folder.id === operation.id);
+    const after = preview.afterFolders.find((folder) => "id" in operation && folder.id === operation.id)
+      ?? preview.afterFolders.find((folder) => !preview.beforeFolders.some((old) => old.id === folder.id));
+    askForConfirmation({
+      title: "Apply this Library structure edit?",
+      copy: "Only the approved structure changes. Existing files do not move; use Reprocess when they should be organized again.",
+      details: [
+        ["Change", operation.kind.replace("edit_description", "description")],
+        ["Before", before ? `${before.path} — ${before.description}` : "New destination"],
+        ["After", after ? `${after.path} — ${after.description}` : "Destination removed"],
+      ],
+      confirmLabel: "Apply structure edit",
+      action: async () => {
+        await applyLibraryEdit(preview.token);
+        state.libraryEditPreview = null;
+        await refreshSelected("Library structure updated. Existing files were not moved.");
+      },
+    });
+  } catch (error) {
+    state.notice = { tone: "error", message: formatError(error) };
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
 function bindEvents(): void {
   document.querySelectorAll<HTMLElement>("[data-open-setup]").forEach((button) => button.addEventListener("click", () => {
     state.setupOpen = true;
@@ -417,6 +498,49 @@ function bindEvents(): void {
     render();
   }));
   document.querySelectorAll<HTMLButtonElement>("[data-workspace-id]").forEach((button) => button.addEventListener("click", () => void loadWorkspace(button.dataset.workspaceId!)));
+
+  document.querySelector("#open-library-editor")?.addEventListener("click", () => { state.libraryEditOpen = true; render(); });
+  document.querySelectorAll("[data-close-library-edit]").forEach((button) => button.addEventListener("click", () => { state.libraryEditOpen = false; render(); }));
+  document.querySelectorAll<HTMLButtonElement>("[data-library-rename]").forEach((button) => button.addEventListener("click", () => {
+    const row = button.closest<HTMLElement>("[data-library-folder]")!;
+    const path = row.querySelector<HTMLInputElement>('input[name="path"]')!.value.trim();
+    void reviewLibraryEdit({ kind: "rename", id: button.dataset.libraryRename!, path });
+  }));
+  document.querySelectorAll<HTMLButtonElement>("[data-library-description]").forEach((button) => button.addEventListener("click", () => {
+    const row = button.closest<HTMLElement>("[data-library-folder]")!;
+    const description = row.querySelector<HTMLInputElement>('input[name="description"]')!.value.trim();
+    void reviewLibraryEdit({ kind: "edit_description", id: button.dataset.libraryDescription!, description });
+  }));
+  document.querySelectorAll<HTMLButtonElement>("[data-library-delete]").forEach((button) => button.addEventListener("click", () => {
+    void reviewLibraryEdit({ kind: "delete", id: button.dataset.libraryDelete! });
+  }));
+  document.querySelector("#library-add-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = event.currentTarget as HTMLFormElement;
+    const values = new FormData(form);
+    void reviewLibraryEdit({ kind: "add", path: String(values.get("path") ?? "").trim(), description: String(values.get("description") ?? "").trim() });
+  });
+  document.querySelector("#undo-library-edit")?.addEventListener("click", () => {
+    if (!state.status?.latestConfiguration) return;
+    const workspaceId = state.status.workspace.id;
+    const runId = state.status.latestConfiguration.runId;
+    askForConfirmation({
+      title: "Undo the last Library structure edit?",
+      copy: "The previous approved structure returns. Existing files stay in place.",
+      details: [["Configure run", runId]],
+      confirmLabel: "Undo structure edit",
+      action: async () => { await undoLibraryEdit(workspaceId, runId); await refreshSelected("Library structure edit undone."); },
+    });
+  });
+  document.querySelector("#resume-library-edit")?.addEventListener("click", async () => {
+    if (!state.status?.latestConfiguration) return;
+    setBusy(true);
+    try {
+      await resumeLibraryEdit(state.status.workspace.id, state.status.latestConfiguration.runId);
+      await refreshSelected("Library structure recovery completed.");
+    } catch (error) { state.notice = { tone: "error", message: formatError(error) }; }
+    finally { state.busy = false; render(); }
+  });
 
   document.querySelector("#pick-setup-source")?.addEventListener("click", async () => {
     const source = await chooseSource();

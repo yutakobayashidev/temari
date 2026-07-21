@@ -21,7 +21,7 @@ export type InboxSummary = {
 
 export type ManagedRun = {
   id: string;
-  kind: "setup" | "adopt" | "stage" | "classify";
+  kind: "setup" | "adopt" | "stage" | "classify" | "configure";
   state: "planning" | "planned" | "applying" | "completed" | "noop" | "needs_resume" | "failed";
   moveCount: number;
   startedUnixMs: number;
@@ -38,11 +38,33 @@ export type ManagedWorkspaceStatus = {
     total: number;
     actionable: ManagedRun[];
   };
+  libraryFolders: LibraryFolder[];
+  latestConfiguration: null | {
+    runId: string;
+    state: ManagedRun["state"];
+    undone: boolean;
+    finishedUnixMs: number | null;
+  };
+};
+
+export type LibraryFolder = { id: string; path: string; description: string };
+
+export type LibraryEditOperation =
+  | { kind: "add"; path: string; description: string }
+  | { kind: "rename"; id: string; path: string }
+  | { kind: "edit_description"; id: string; description: string }
+  | { kind: "delete"; id: string };
+
+export type LibraryEditPreview = {
+  token: string;
+  operation: LibraryEditOperation;
+  beforeFolders: LibraryFolder[];
+  afterFolders: LibraryFolder[];
 };
 
 export type ManagedMove = {
   sessionId: string;
-  kind: "adopt" | "stage" | "classify";
+  kind: "adopt" | "stage" | "classify" | "configure";
   moveId: string;
   sourcePath: string;
   destinationPath: string;

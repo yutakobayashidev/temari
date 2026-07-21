@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
+  LibraryEditOperation,
+  LibraryEditPreview,
+  LibraryFolder,
   ManagedMove,
   ManagedRunResult,
   ManagedWorkspace,
@@ -76,6 +79,15 @@ let demoSchedule: ScheduleStatus = {
   active: false,
   intervalSeconds: 900,
 };
+let demoLibraryFolders: LibraryFolder[] = [
+  { id: "d000001", path: "Work", description: "Project documents and working material" },
+  { id: "d000002", path: "Personal", description: "Personal records and receipts" },
+  { id: "d000003", path: "Images", description: "Photos and visual assets" },
+];
+let demoLibraryPreview: LibraryEditPreview | null = null;
+let demoLibraryPreviewWorkspaceId: string | null = null;
+let demoLibraryUndoSnapshot: LibraryFolder[] | null = null;
+let demoLatestConfiguration: ManagedWorkspaceStatus["latestConfiguration"] = null;
 
 function isTauri(): boolean {
   return "__TAURI_INTERNALS__" in window;
@@ -143,6 +155,8 @@ export async function getManagedWorkspace(workspaceId: string): Promise<ManagedW
         nextEligibleUnixMs: now + 42 * 60_000,
       },
       runs: { total: 41, actionable: [] },
+      libraryFolders: structuredClone(demoLibraryFolders),
+      latestConfiguration: structuredClone(demoLatestConfiguration),
     };
   }
   return invoke<ManagedWorkspaceStatus>("managed_get_workspace", { request: { workspaceId } });
@@ -213,6 +227,60 @@ export async function setManagedWorkspaceEnabled(workspaceId: string, enabled: b
     return structuredClone(demoWorkspace(workspaceId));
   }
   return invoke<ManagedWorkspace>("managed_set_workspace_enabled", { request: { workspaceId }, enabled });
+}
+
+export async function previewLibraryEdit(
+  workspaceId: string,
+  operation: LibraryEditOperation,
+): Promise<LibraryEditPreview> {
+  if (!isTauri()) {
+    const after = structuredClone(demoLibraryFolders);
+    if (operation.kind === "add") after.push({ id: `demo-${Date.now()}`, path: operation.path, description: operation.description });
+    if (operation.kind === "rename") after.find((folder) => folder.id === operation.id)!.path = operation.path;
+    if (operation.kind === "edit_description") after.find((folder) => folder.id === operation.id)!.description = operation.description;
+    if (operation.kind === "delete") after.splice(after.findIndex((folder) => folder.id === operation.id), 1);
+    demoLibraryPreview = { token: "demo-library-edit", operation, beforeFolders: structuredClone(demoLibraryFolders), afterFolders: after };
+    demoLibraryPreviewWorkspaceId = workspaceId;
+    return structuredClone(demoLibraryPreview);
+  }
+  return invoke<LibraryEditPreview>("managed_preview_library_edit", { request: { workspaceId, operation } });
+}
+
+export async function applyLibraryEdit(previewToken: string): Promise<ManagedWorkspaceStatus> {
+  if (!isTauri()) {
+    if (!demoLibraryPreview || !demoLibraryPreviewWorkspaceId || demoLibraryPreview.token !== previewToken) throw new Error("Library edit preview expired.");
+    const workspaceId = demoLibraryPreviewWorkspaceId;
+    demoLibraryUndoSnapshot = structuredClone(demoLibraryPreview.beforeFolders);
+    demoLibraryFolders = structuredClone(demoLibraryPreview.afterFolders);
+    demoLatestConfiguration = {
+      runId: `demo-config-${Date.now()}`,
+      state: "completed",
+      undone: false,
+      finishedUnixMs: Date.now(),
+    };
+    demoLibraryPreview = null;
+    demoLibraryPreviewWorkspaceId = null;
+    return getManagedWorkspace(workspaceId);
+  }
+  return invoke<ManagedWorkspaceStatus>("managed_apply_library_edit", { request: { previewToken } });
+}
+
+export async function undoLibraryEdit(workspaceId: string, runId: string): Promise<ManagedWorkspaceStatus> {
+  if (!isTauri()) {
+    if (!demoLatestConfiguration || demoLatestConfiguration.runId !== runId || !demoLibraryUndoSnapshot) {
+      throw new Error("Library edit can no longer be undone.");
+    }
+    demoLibraryFolders = structuredClone(demoLibraryUndoSnapshot);
+    demoLibraryUndoSnapshot = null;
+    demoLatestConfiguration = { ...demoLatestConfiguration, undone: true };
+    return getManagedWorkspace(workspaceId);
+  }
+  return invoke<ManagedWorkspaceStatus>("managed_undo_library_edit", { request: { workspaceId, runId } });
+}
+
+export async function resumeLibraryEdit(workspaceId: string, runId: string): Promise<ManagedWorkspaceStatus> {
+  if (!isTauri()) return getManagedWorkspace(workspaceId);
+  return invoke<ManagedWorkspaceStatus>("managed_resume_library_edit", { request: { workspaceId, runId } });
 }
 
 export async function runManagedWorkspace(workspaceId: string): Promise<ManagedRunResult> {

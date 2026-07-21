@@ -525,6 +525,13 @@ pub fn build_managed_setup_plan(source: &Path) -> Result<ManagedSetupPlan, Error
 /// Build a read-only plan that adopts newly created root directories into
 /// Kept after managed workspace setup has completed.
 pub fn build_managed_directory_adoption_plan(source: &Path) -> Result<ManagedSetupPlan, Error> {
+    build_managed_directory_adoption_plan_excluding(source, &HashSet::new())
+}
+
+pub(crate) fn build_managed_directory_adoption_plan_excluding(
+    source: &Path,
+    excluded_identities: &HashSet<(u64, u64)>,
+) -> Result<ManagedSetupPlan, Error> {
     let (source, source_identity) = canonical_directory(source)?;
     for area in MANAGED_AREAS {
         let path = source.join(area);
@@ -554,6 +561,9 @@ pub fn build_managed_directory_adoption_plan(source: &Path) -> Result<ManagedSet
             return Err(Error::InvalidArtifact(format!(
                 "managed directory adoption requires a same-filesystem move: {name:?}"
             )));
+        }
+        if excluded_identities.contains(&(metadata.dev(), metadata.ino())) {
+            continue;
         }
         let destination = source.join("Kept").join(&name);
         if path_exists(&destination)? {
@@ -595,6 +605,14 @@ pub fn apply_managed_directory_adoption(
     plan: &ManagedSetupPlan,
     journal_path: &Path,
 ) -> Result<ManagedSetupSession, Error> {
+    apply_managed_directory_adoption_excluding(plan, journal_path, &HashSet::new())
+}
+
+pub(crate) fn apply_managed_directory_adoption_excluding(
+    plan: &ManagedSetupPlan,
+    journal_path: &Path,
+    excluded_identities: &HashSet<(u64, u64)>,
+) -> Result<ManagedSetupSession, Error> {
     plan.validate()?;
     if plan.moves.iter().any(|movement| {
         !matches!(
@@ -608,7 +626,10 @@ pub fn apply_managed_directory_adoption(
     }
     let lock = SourceLock::acquire(Path::new(&plan.source))?;
     lock.validate_source(&plan.source, &plan.source_identity)?;
-    let current = build_managed_directory_adoption_plan(Path::new(&plan.source))?;
+    let current = build_managed_directory_adoption_plan_excluding(
+        Path::new(&plan.source),
+        excluded_identities,
+    )?;
     if current != *plan {
         return Err(Error::InvalidArtifact(
             "managed source changed after directory adoption planning".into(),

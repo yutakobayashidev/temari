@@ -13,15 +13,19 @@ use directories::ProjectDirs;
 use serde::Serialize;
 use temari_core::{
     ApplySession, Config, FolderSet, InboxReconcileSummary, InboxState, LocalRule,
-    ManagedReprocessArea, ManagedReprocessSelection, ManagedRunKind, ManagedService,
-    ManagedSetupPlan, ManagedSetupSession, ManagedSetupState, ManagedSetupUndoSession,
-    ManagedUndoMoveOutcome as ManagedSetupUndoMoveOutcome, ManagedWorkspace, RuleSet, RunState,
-    SourceLock, StateStore, UndoMoveOutcome, UndoSession, UndoState, build_managed_setup_plan,
-    canonical_source_identity, fingerprint_candidate, inbox_file_candidates, resume_managed_setup,
-    undo_managed_setup, undo_session_files_with_lock, undo_session_with_lock,
+    ManagedLibraryEdit, ManagedLibraryEditPlan, ManagedReprocessArea, ManagedReprocessSelection,
+    ManagedRunKind, ManagedService, ManagedSetupPlan, ManagedSetupSession, ManagedSetupState,
+    ManagedSetupUndoSession, ManagedUndoMoveOutcome as ManagedSetupUndoMoveOutcome,
+    ManagedWorkspace, RuleSet, RunState, SourceLock, StateStore, UndoMoveOutcome, UndoSession,
+    UndoState, build_managed_setup_plan, canonical_source_identity, fingerprint_candidate,
+    inbox_file_candidates, resume_managed_setup, undo_managed_setup, undo_session_files_with_lock,
+    undo_session_with_lock,
 };
 #[cfg(test)]
-use temari_core::{apply_plan, build_stage_to_inbox_plan, root_file_candidates};
+use temari_core::{
+    ManagedLibraryEditState, ManagedLibraryEditUndoSession, apply_plan, build_stage_to_inbox_plan,
+    root_file_candidates,
+};
 
 use crate::{
     Cli, approval_mode, confirm_mutation,
@@ -177,6 +181,11 @@ pub enum ManagedCommand {
         #[command(subcommand)]
         command: RuleCommand,
     },
+    /// Inspect and edit the approved Library structure.
+    Library {
+        #[command(subcommand)]
+        command: LibraryCommand,
+    },
     /// Run one staging and classification cycle.
     Run {
         /// Managed workspace ID.
@@ -323,6 +332,78 @@ pub enum RuleCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum LibraryCommand {
+    /// Write the current approved FolderSet without changing it.
+    Show {
+        /// Managed workspace ID.
+        workspace_id: String,
+        /// Output path, or `-` for stdout.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Build a read-only Library edit Plan.
+    Plan {
+        /// Managed workspace ID.
+        workspace_id: String,
+        /// Output path for the reviewed Plan JSON.
+        #[arg(long)]
+        out: PathBuf,
+        #[command(subcommand)]
+        operation: LibraryPlanCommand,
+    },
+    /// Apply a reviewed Library edit Plan.
+    Apply {
+        /// Reviewed Library edit Plan JSON.
+        plan: PathBuf,
+        /// Confirm the binding change without prompting.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Undo a completed Library edit using a run-owned journal.
+    Undo {
+        /// Managed workspace ID.
+        workspace_id: String,
+        /// Completed Configure run ID.
+        run_id: String,
+        /// Confirm the binding change without prompting.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Resume an interrupted Library edit Apply or Undo.
+    Resume {
+        /// Managed workspace ID.
+        workspace_id: String,
+        /// Configure run ID requiring recovery.
+        run_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LibraryPlanCommand {
+    /// Add a model-visible Library destination.
+    Add {
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        description: String,
+    },
+    /// Change an approved destination path while preserving its opaque ID.
+    Rename {
+        destination_id: String,
+        #[arg(long)]
+        path: String,
+    },
+    /// Change an approved destination description.
+    Describe {
+        destination_id: String,
+        #[arg(long)]
+        description: String,
+    },
+    /// Remove an approved destination from future classification.
+    Delete { destination_id: String },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum ScheduleCommand {
     /// Print the platform scheduler definition without installing it.
     Print {
@@ -395,6 +476,7 @@ pub fn run_managed(cli: &Cli, command: &ManagedCommand) -> Result<()> {
         ManagedCommand::Remove { id, yes } => remove_workspace(cli, id, *yes),
         ManagedCommand::Reconcile { id } => reconcile_workspace(cli, id),
         ManagedCommand::Rule { command } => run_rule(cli, command),
+        ManagedCommand::Library { command } => run_library(cli, command),
         ManagedCommand::Run {
             id,
             out,
@@ -423,6 +505,150 @@ pub fn run_managed(cli: &Cli, command: &ManagedCommand) -> Result<()> {
         ManagedCommand::UndoSetup { session, out, yes } => undo_setup(cli, session, out, *yes),
         ManagedCommand::ResumeSetup { session, yes } => resume_setup(cli, session, *yes),
     }
+}
+
+fn run_library(cli: &Cli, command: &LibraryCommand) -> Result<()> {
+    match command {
+        LibraryCommand::Show { workspace_id, out } => library_show(cli, workspace_id, out),
+        LibraryCommand::Plan {
+            workspace_id,
+            out,
+            operation,
+        } => library_plan(cli, workspace_id, out, operation),
+        LibraryCommand::Apply { plan, yes } => library_apply(cli, plan, *yes),
+        LibraryCommand::Undo {
+            workspace_id,
+            run_id,
+            yes,
+        } => library_undo(cli, workspace_id, run_id, *yes),
+        LibraryCommand::Resume {
+            workspace_id,
+            run_id,
+        } => library_resume(cli, workspace_id, run_id),
+    }
+}
+
+fn library_show(cli: &Cli, workspace_id: &str, out: &Path) -> Result<()> {
+    let context = ManagedContext::new(cli)?;
+    let store = context.store()?;
+    let workspace = require_workspace(&store, workspace_id)?;
+    let folders = FolderSet::load(Path::new(&workspace.folder_set_path))?;
+    let out = resolve_artifact_output(out, Path::new(&workspace.source), "FolderSet output")?;
+    write_artifact(&out, &folders)?;
+    print_output_result(cli, &out)
+}
+
+fn library_plan(
+    cli: &Cli,
+    workspace_id: &str,
+    out: &Path,
+    operation: &LibraryPlanCommand,
+) -> Result<()> {
+    let context = ManagedContext::new(cli)?;
+    let store = context.store()?;
+    let workspace = require_workspace(&store, workspace_id)?;
+    let out = resolve_artifact_output(out, Path::new(&workspace.source), "Library edit Plan")?;
+    let operation = match operation {
+        LibraryPlanCommand::Add { path, description } => ManagedLibraryEdit::Add {
+            path: path.clone(),
+            description: description.clone(),
+        },
+        LibraryPlanCommand::Rename {
+            destination_id,
+            path,
+        } => ManagedLibraryEdit::Rename {
+            id: destination_id.clone(),
+            path: path.clone(),
+        },
+        LibraryPlanCommand::Describe {
+            destination_id,
+            description,
+        } => ManagedLibraryEdit::EditDescription {
+            id: destination_id.clone(),
+            description: description.clone(),
+        },
+        LibraryPlanCommand::Delete { destination_id } => ManagedLibraryEdit::Delete {
+            id: destination_id.clone(),
+        },
+    };
+    drop(store);
+    let plan = ManagedService::new(&context.state).preview_library_edit(workspace_id, operation)?;
+    write_artifact(&out, &plan)?;
+    print_output_result(cli, &out)
+}
+
+fn library_apply(cli: &Cli, plan_path: &Path, yes: bool) -> Result<()> {
+    let plan_path = fs::canonicalize(plan_path)
+        .with_context(|| format!("failed to resolve {}", plan_path.display()))?;
+    let plan = ManagedLibraryEditPlan::load(&plan_path)?;
+    ensure_outside(&plan_path, Path::new(&plan.source), "Library edit Plan")?;
+    confirm(cli, yes, "Apply this reviewed Library edit Plan? [y/N] ")?;
+    let context = ManagedContext::new(cli)?;
+    let result = ManagedService::new(&context.state).apply_library_edit(&plan)?;
+    print_value(cli, &result, &result.run.id)
+}
+
+fn library_undo(cli: &Cli, workspace_id: &str, run_id: &str, yes: bool) -> Result<()> {
+    let context = ManagedContext::new(cli)?;
+    let store = context.store()?;
+    let run = store
+        .managed_run(run_id)?
+        .ok_or_else(|| anyhow::anyhow!("unknown managed run {run_id:?}"))?;
+    if run.workspace_id != workspace_id {
+        bail!("managed run {run_id:?} does not belong to workspace {workspace_id:?}");
+    }
+    if run.kind != ManagedRunKind::Configure {
+        bail!("managed run {run_id:?} is not a Library Configure run");
+    }
+    let apply_path = run
+        .apply_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Library Configure run has no Apply Session"))?;
+    let journal_path = Path::new(apply_path)
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Library Configure Session has no parent directory"))?
+        .join("library-edit-undo.json");
+    drop(store);
+    confirm(cli, yes, "Undo this completed Library edit? [y/N] ")?;
+    let result = ManagedService::new(&context.state).undo_library_edit(run_id, &journal_path)?;
+    print_value(cli, &result, &result.run.id)
+}
+
+fn library_resume(cli: &Cli, workspace_id: &str, run_id: &str) -> Result<()> {
+    let context = ManagedContext::new(cli)?;
+    let store = context.store()?;
+    let run = store
+        .managed_run(run_id)?
+        .ok_or_else(|| anyhow::anyhow!("unknown managed run {run_id:?}"))?;
+    if run.workspace_id != workspace_id {
+        bail!("managed run {run_id:?} does not belong to workspace {workspace_id:?}");
+    }
+    if run.kind != ManagedRunKind::Configure {
+        bail!("managed run {run_id:?} is not a Library Configure run");
+    }
+    let state = run.state;
+    drop(store);
+    let service = ManagedService::new(&context.state);
+    match state {
+        RunState::Applying => {
+            let result = service.resume_library_edit(run_id)?;
+            print_value(cli, &result, &result.run.id)
+        }
+        RunState::NeedsResume => {
+            let result = service.resume_library_edit_undo(run_id)?;
+            print_value(cli, &result, &result.run.id)
+        }
+        _ => bail!("Library Configure run {run_id:?} is {state:?} and does not require recovery"),
+    }
+}
+
+fn resolve_artifact_output(out: &Path, source: &Path, label: &str) -> Result<PathBuf> {
+    if out == Path::new("-") {
+        return Ok(PathBuf::from("-"));
+    }
+    let out = resolved_target(out)?;
+    ensure_outside(&out, source, label)?;
+    Ok(out)
 }
 
 fn run_rule(cli: &Cli, command: &RuleCommand) -> Result<()> {
@@ -1544,6 +1770,42 @@ mod tests {
                 command: RuleCommand::Remove { yes: true, .. }
             })
         ));
+
+        let cli = Cli::try_parse_from([
+            "temari",
+            "managed",
+            "library",
+            "plan",
+            "workspace-1",
+            "--out",
+            "library-plan.json",
+            "add",
+            "--path",
+            "Research",
+            "--description",
+            "Research material",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            crate::Command::Managed(ManagedCommand::Library {
+                command: LibraryCommand::Plan {
+                    operation: LibraryPlanCommand::Add { .. },
+                    ..
+                }
+            })
+        ));
+
+        for arguments in [
+            vec!["library", "show", "workspace-1", "--out", "-"],
+            vec!["library", "apply", "plan.json", "--yes"],
+            vec!["library", "undo", "workspace-1", "run-1", "--yes"],
+            vec!["library", "resume", "workspace-1", "run-1"],
+        ] {
+            let mut command = vec!["temari", "managed"];
+            command.extend(arguments);
+            assert!(Cli::try_parse_from(command).is_ok());
+        }
     }
 
     #[test]
@@ -1638,6 +1900,127 @@ mod tests {
         assert!(resolve_undo_file_ids(&apply, &["b.txt".into(), "f000002".into()]).is_err());
         assert!(resolve_undo_file_ids(&apply, &["missing.txt".into()]).is_err());
         assert!(resolve_undo_file_ids(&apply, &["f000001".into()]).is_err());
+    }
+
+    #[test]
+    fn library_commands_show_plan_apply_undo_and_resume_run_owned_artifacts() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let source = fs::canonicalize(source).unwrap();
+        let state_path = root.path().join("state.sqlite3");
+        let config_path = root.path().join("temari.toml");
+        fs::write(
+            &config_path,
+            include_str!("../../../examples/temari.example.toml"),
+        )
+        .unwrap();
+        let raw_folders = temari_core::Proposal {
+            version: 2,
+            source: source.display().to_string(),
+            scope: temari_core::ScanScope::default(),
+            files_considered: 0,
+            folders: vec![temari_core::FolderProposal {
+                path: "Documents".into(),
+                description: "Documents".into(),
+            }],
+        }
+        .approve()
+        .unwrap();
+        let setup = build_managed_setup_plan(&source).unwrap();
+        let service = ManagedService::new(&state_path);
+        let activation = service
+            .activate_workspace(&setup, &raw_folders, &config_path, 60, 1)
+            .unwrap();
+        let workspace_id = activation.workspace.id;
+        StateStore::open(&state_path)
+            .unwrap()
+            .set_managed_workspace_enabled(&workspace_id, false, unix_ms().unwrap())
+            .unwrap();
+        let cli = Cli {
+            config: config_path,
+            state: Some(state_path.clone()),
+            json: false,
+            no_input: true,
+            no_color: true,
+            verbose: 0,
+            command: crate::Command::Managed(ManagedCommand::List),
+        };
+
+        let shown_path = root.path().join("shown-folders.json");
+        library_show(&cli, &workspace_id, &shown_path).unwrap();
+        let shown = FolderSet::load(&shown_path).unwrap();
+        assert_eq!(shown.source, source.display().to_string());
+
+        let plan_path = root.path().join("library-plan.json");
+        library_plan(
+            &cli,
+            &workspace_id,
+            &plan_path,
+            &LibraryPlanCommand::Add {
+                path: "Research".into(),
+                description: "Research material".into(),
+            },
+        )
+        .unwrap();
+        let plan = ManagedLibraryEditPlan::load(&plan_path).unwrap();
+        assert!(
+            plan.after_folders
+                .folders
+                .iter()
+                .any(|folder| folder.path == "Library/Research")
+        );
+
+        library_apply(&cli, &plan_path, true).unwrap();
+        let mut run = StateStore::open(&state_path)
+            .unwrap()
+            .managed_runs(&workspace_id)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.kind == ManagedRunKind::Configure)
+            .unwrap();
+        let run_id = run.id.clone();
+        run.state = RunState::Applying;
+        run.finished_unix_ms = None;
+        run.error = None;
+        StateStore::open(&state_path)
+            .unwrap()
+            .update_managed_run(&run)
+            .unwrap();
+        library_resume(&cli, &workspace_id, &run_id).unwrap();
+
+        library_undo(&cli, &workspace_id, &run_id, true).unwrap();
+        let mut run = StateStore::open(&state_path)
+            .unwrap()
+            .managed_run(&run_id)
+            .unwrap()
+            .unwrap();
+        let undo_path = PathBuf::from(run.undo_path.as_deref().unwrap());
+        let mut undo: ManagedLibraryEditUndoSession =
+            serde_json::from_slice(&fs::read(&undo_path).unwrap()).unwrap();
+        undo.state = ManagedLibraryEditState::Running;
+        undo.finished_unix_ms = None;
+        write_artifact(&undo_path, &undo).unwrap();
+        run.state = RunState::NeedsResume;
+        run.error = Some("Library edit Undo finalization is pending".into());
+        StateStore::open(&state_path)
+            .unwrap()
+            .update_managed_run(&run)
+            .unwrap();
+        library_resume(&cli, &workspace_id, &run_id).unwrap();
+
+        let workspace = StateStore::open(&state_path)
+            .unwrap()
+            .managed_workspace(&workspace_id)
+            .unwrap()
+            .unwrap();
+        let restored = FolderSet::load(Path::new(&workspace.folder_set_path)).unwrap();
+        assert!(
+            restored
+                .folders
+                .iter()
+                .all(|folder| folder.path != "Library/Research")
+        );
     }
 
     #[test]

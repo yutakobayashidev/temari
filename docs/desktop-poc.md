@@ -14,6 +14,7 @@ The native flow is:
 6. Inspect workspace health, Inbox deadlines, actionable runs, and detailed move history.
 7. Reprocess selected `Kept` or `Library` entries through Inbox when classification should run again.
 8. Undo a completed run or one selected move with a separate durable Undo journal.
+9. Pause a workspace to review and apply one logical Library destination edit, then Undo that Configure session when needed.
 
 ## Trust boundary
 
@@ -24,6 +25,9 @@ The native flow is:
 - Managed filesystem and model operations run on blocking workers instead of the Tauri event loop.
 - Workspace status is computed by the backend from the physical Inbox, indexed deadlines, and actionable runs. IPC responses use explicit camel-case view types rather than exposing database records.
 - History merges immutable file Apply/Undo journals and directory-adoption setup/Undo journals. File moves support session or individual Undo; directory adoption supports session Undo only so managed areas remain intact. Undo allocates the journal path in the backend and reconciles SQLite only after filesystem outcomes are known.
+- Library structure editing exposes only model-visible destinations. Add, Rename, Description, and Delete produce a new immutable `FolderSet` revision while preserving existing opaque IDs. Apply atomically updates the monitor and workspace bindings from a backend-held preview token.
+- Library edits are logical configuration changes: they do not rename directories or move existing files. The editor links back to Reprocess when existing files should pass through Inbox under the revised structure.
+- Configure Apply and Undo require a disabled workspace. System fallbacks, the final visible destination, active-rule targets, stale previews, and workspaces with unfinished runs are rejected.
 - New root directories are moved to `Kept`. A classified file manually returned to the root retains its processed identity and is left in place until the user explicitly requests reprocessing.
 - OS scheduling uses `temari-schedule`, creates shell-free systemd or launchd definitions, and requires an explicitly selected stable Temari CLI executable. Setup never installs a schedule implicitly.
 - Managed artifacts live below `ProjectDirs::state_dir()/managed-runs`, falling back to `data_local_dir()` where needed. Directories are mode `0700` and artifacts are mode `0600` on Linux and macOS.

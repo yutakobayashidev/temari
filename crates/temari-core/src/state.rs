@@ -14,7 +14,7 @@ use crate::{
     Plan, artifact::normalize_relative_path,
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -142,6 +142,7 @@ pub enum ManagedRunKind {
     Adopt,
     Stage,
     Classify,
+    Configure,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -499,6 +500,23 @@ impl StateStore {
         let transaction = self.connection.transaction()?;
         let mut workspace = managed_workspace_for_update(&transaction, id)?;
         validate_workspace_update_time(&workspace, updated_unix_ms)?;
+        if enabled {
+            let configuration_pending: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM managed_runs
+                    WHERE workspace_id = ?1 AND kind = 'configure'
+                      AND state IN ('applying', 'needs_resume')
+                 )",
+                [id],
+                |row| row.get(0),
+            )?;
+            if configuration_pending {
+                return Err(Error::InvalidState(
+                    "managed workspace cannot be enabled while a Library edit needs recovery"
+                        .into(),
+                ));
+            }
+        }
         require_changed(
             transaction.execute(
                 "UPDATE monitors SET enabled = ?2, updated_unix_ms = ?3
@@ -701,6 +719,120 @@ impl StateStore {
             "managed workspace",
             &workspace.id,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_managed_folder_set_binding(
+        &mut self,
+        workspace_id: &str,
+        edit_run_id: &str,
+        expected_path: &str,
+        expected_sha256: &str,
+        replacement_path: &str,
+        replacement_sha256: &str,
+        removed_destination_id: Option<&str>,
+        updated_unix_ms: i64,
+    ) -> Result<ManagedWorkspace, Error> {
+        validate_absolute_path("expected FolderSet path", expected_path)?;
+        validate_digest("expected FolderSet digest", expected_sha256)?;
+        validate_absolute_path("replacement FolderSet path", replacement_path)?;
+        validate_digest("replacement FolderSet digest", replacement_sha256)?;
+        let transaction = self.connection.transaction()?;
+        let mut workspace = managed_workspace_for_update(&transaction, workspace_id)?;
+        validate_workspace_update_time(&workspace, updated_unix_ms)?;
+        if workspace.enabled {
+            return Err(Error::InvalidState(
+                "managed workspace must be disabled before editing its Library".into(),
+            ));
+        }
+        if workspace.folder_set_path != expected_path
+            || workspace.folder_set_sha256 != expected_sha256
+        {
+            return Err(Error::InvalidState(
+                "managed workspace FolderSet binding changed after preview".into(),
+            ));
+        }
+        let unfinished_managed: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM managed_runs
+                WHERE workspace_id = ?1 AND id != ?2
+                  AND state IN ('planning', 'planned', 'applying', 'needs_resume')
+             )",
+            params![workspace_id, edit_run_id],
+            |row| row.get(0),
+        )?;
+        let unfinished_monitoring: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM monitor_runs
+                WHERE monitor_id = ?1
+                  AND state IN ('planning', 'planned', 'applying', 'needs_resume')
+             )",
+            [&workspace.monitor_id],
+            |row| row.get(0),
+        )?;
+        if unfinished_managed || unfinished_monitoring {
+            return Err(Error::InvalidState(
+                "Library editing requires every managed run to be finished".into(),
+            ));
+        }
+        if let Some(destination_id) = removed_destination_id {
+            let referenced: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM rules
+                    WHERE monitor_id = ?1 AND destination_id = ?2
+                      AND enabled = 1 AND deleted_unix_ms IS NULL
+                 )",
+                params![workspace.monitor_id, destination_id],
+                |row| row.get(0),
+            )?;
+            if referenced {
+                return Err(Error::InvalidState(
+                    "a Library destination referenced by an active local rule cannot be deleted"
+                        .into(),
+                ));
+            }
+        }
+        require_changed(
+            transaction.execute(
+                "UPDATE monitors
+                 SET folder_set_path = ?2, folder_set_sha256 = ?3, updated_unix_ms = ?4
+                 WHERE id = ?1 AND folder_set_path = ?5 AND folder_set_sha256 = ?6
+                   AND deleted_unix_ms IS NULL",
+                params![
+                    workspace.monitor_id,
+                    replacement_path,
+                    replacement_sha256,
+                    updated_unix_ms,
+                    expected_path,
+                    expected_sha256,
+                ],
+            )?,
+            "matching monitor FolderSet binding",
+            &workspace.monitor_id,
+        )?;
+        require_changed(
+            transaction.execute(
+                "UPDATE managed_workspaces
+                 SET folder_set_path = ?2, folder_set_sha256 = ?3, updated_unix_ms = ?4
+                 WHERE id = ?1 AND folder_set_path = ?5 AND folder_set_sha256 = ?6
+                   AND enabled = 0",
+                params![
+                    workspace_id,
+                    replacement_path,
+                    replacement_sha256,
+                    updated_unix_ms,
+                    expected_path,
+                    expected_sha256,
+                ],
+            )?,
+            "matching managed workspace FolderSet binding",
+            workspace_id,
+        )?;
+        transaction.commit()?;
+        workspace.folder_set_path = replacement_path.into();
+        workspace.folder_set_sha256 = replacement_sha256.into();
+        workspace.updated_unix_ms = updated_unix_ms;
+        Ok(workspace)
     }
 
     pub fn delete_managed_workspace(&mut self, id: &str) -> Result<(), Error> {
@@ -1153,8 +1285,10 @@ impl StateStore {
         let run = self
             .managed_run(run_id)?
             .ok_or_else(|| Error::InvalidState(format!("unknown managed run {run_id:?}")))?;
-        if matches!(run.kind, ManagedRunKind::Setup | ManagedRunKind::Adopt)
-            || run.state != RunState::Completed
+        if matches!(
+            run.kind,
+            ManagedRunKind::Setup | ManagedRunKind::Adopt | ManagedRunKind::Configure
+        ) || run.state != RunState::Completed
         {
             return Err(Error::InvalidState(
                 "managed Undo journals require a completed file-move run".into(),
@@ -1211,8 +1345,10 @@ impl StateStore {
             )
             .optional()?
             .ok_or_else(|| Error::InvalidState(format!("unknown managed run {run_id:?}")))?;
-        if matches!(kind, ManagedRunKind::Setup | ManagedRunKind::Adopt)
-            || state != RunState::Completed
+        if matches!(
+            kind,
+            ManagedRunKind::Setup | ManagedRunKind::Adopt | ManagedRunKind::Configure
+        ) || state != RunState::Completed
         {
             return Err(Error::InvalidState(
                 "managed Undo journals require a completed file-move run".into(),
@@ -1269,7 +1405,9 @@ impl StateStore {
                         ],
                     )?;
                 }
-                ManagedRunKind::Setup | ManagedRunKind::Adopt => unreachable!(),
+                ManagedRunKind::Setup | ManagedRunKind::Adopt | ManagedRunKind::Configure => {
+                    unreachable!()
+                }
             }
         }
         transaction.commit()?;
@@ -1926,6 +2064,7 @@ impl ManagedRunKind {
             Self::Adopt => "adopt",
             Self::Stage => "stage",
             Self::Classify => "classify",
+            Self::Configure => "configure",
         }
     }
 
@@ -1935,6 +2074,7 @@ impl ManagedRunKind {
             "adopt" => Ok(Self::Adopt),
             "stage" => Ok(Self::Stage),
             "classify" => Ok(Self::Classify),
+            "configure" => Ok(Self::Configure),
             other => Err(format!("unknown managed run kind {other:?}")),
         }
     }
@@ -2107,7 +2247,7 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
         CREATE TABLE IF NOT EXISTS managed_runs (
             id TEXT PRIMARY KEY,
             workspace_id TEXT NOT NULL REFERENCES managed_workspaces(id) ON DELETE CASCADE,
-            kind TEXT NOT NULL CHECK(kind IN ('setup', 'adopt', 'stage', 'classify')),
+            kind TEXT NOT NULL CHECK(kind IN ('setup', 'adopt', 'stage', 'classify', 'configure')),
             state TEXT NOT NULL CHECK(state IN (
                 'planning', 'planned', 'applying', 'completed',
                 'noop', 'failed', 'needs_resume'
@@ -2182,7 +2322,7 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
              CREATE TABLE managed_runs (
                  id TEXT PRIMARY KEY,
                  workspace_id TEXT NOT NULL REFERENCES managed_workspaces(id) ON DELETE CASCADE,
-                 kind TEXT NOT NULL CHECK(kind IN ('setup', 'adopt', 'stage', 'classify')),
+                 kind TEXT NOT NULL CHECK(kind IN ('setup', 'adopt', 'stage', 'classify', 'configure')),
                  state TEXT NOT NULL CHECK(state IN (
                      'planning', 'planned', 'applying', 'completed',
                      'noop', 'failed', 'needs_resume'
@@ -2214,6 +2354,53 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
                  ON managed_undo_journals(run_id, id);",
         )?;
     }
+    let managed_runs_support_configuration: bool = transaction.query_row(
+        "SELECT instr(COALESCE(sql, ''), '''configure''') > 0
+         FROM sqlite_master WHERE type = 'table' AND name = 'managed_runs'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !managed_runs_support_configuration {
+        transaction.execute_batch(
+            "DROP INDEX IF EXISTS managed_runs_by_workspace_time;
+             DROP INDEX IF EXISTS managed_undo_journals_by_run_time;
+             ALTER TABLE managed_undo_journals RENAME TO managed_undo_journals_v5;
+             ALTER TABLE managed_runs RENAME TO managed_runs_v5;
+             CREATE TABLE managed_runs (
+                 id TEXT PRIMARY KEY,
+                 workspace_id TEXT NOT NULL REFERENCES managed_workspaces(id) ON DELETE CASCADE,
+                 kind TEXT NOT NULL CHECK(kind IN (
+                     'setup', 'adopt', 'stage', 'classify', 'configure'
+                 )),
+                 state TEXT NOT NULL CHECK(state IN (
+                     'planning', 'planned', 'applying', 'completed',
+                     'noop', 'failed', 'needs_resume'
+                 )),
+                 plan_path TEXT,
+                 apply_path TEXT,
+                 undo_path TEXT,
+                 started_unix_ms INTEGER NOT NULL,
+                 finished_unix_ms INTEGER,
+                 move_count INTEGER NOT NULL DEFAULT 0 CHECK(move_count >= 0),
+                 error TEXT,
+                 CHECK(finished_unix_ms IS NULL OR finished_unix_ms >= started_unix_ms)
+             );
+             INSERT INTO managed_runs SELECT * FROM managed_runs_v5;
+             CREATE TABLE managed_undo_journals (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id TEXT NOT NULL REFERENCES managed_runs(id) ON DELETE CASCADE,
+                 path TEXT NOT NULL UNIQUE,
+                 created_unix_ms INTEGER NOT NULL
+             );
+             INSERT INTO managed_undo_journals SELECT * FROM managed_undo_journals_v5;
+             DROP TABLE managed_undo_journals_v5;
+             DROP TABLE managed_runs_v5;
+             CREATE INDEX managed_runs_by_workspace_time
+                 ON managed_runs(workspace_id, started_unix_ms DESC, id DESC);
+             CREATE INDEX managed_undo_journals_by_run_time
+                 ON managed_undo_journals(run_id, id);",
+        )?;
+    }
     transaction.execute(
         "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
          VALUES (1, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
@@ -2232,6 +2419,11 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
     transaction.execute(
         "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
          VALUES (4, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
+         VALUES (5, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
         [],
     )?;
     transaction.execute(
@@ -2905,6 +3097,109 @@ mod tests {
                 )
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn migrates_v5_runs_to_configure_without_losing_adoption_undo_history() {
+        let root = tempdir().unwrap();
+        let mut store = StateStore::open_in_memory().unwrap();
+        setup_workspace(&mut store, root.path());
+        store
+            .insert_managed_run(&ManagedRun {
+                id: "adopt-1".into(),
+                workspace_id: "w1".into(),
+                kind: ManagedRunKind::Adopt,
+                state: RunState::Completed,
+                plan_path: Some(root.path().join("adopt-plan.json").display().to_string()),
+                apply_path: Some(root.path().join("adopt-apply.json").display().to_string()),
+                undo_path: Some(root.path().join("adopt-undo.json").display().to_string()),
+                started_unix_ms: 200,
+                finished_unix_ms: Some(300),
+                move_count: 1,
+                error: None,
+            })
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO managed_undo_journals (run_id, path, created_unix_ms)
+                 VALUES ('adopt-1', ?1, 300)",
+                [root.path().join("adopt-undo.json").display().to_string()],
+            )
+            .unwrap();
+        store
+            .connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX managed_runs_by_workspace_time;
+                 DROP INDEX managed_undo_journals_by_run_time;
+                 ALTER TABLE managed_undo_journals RENAME TO managed_undo_journals_v6;
+                 ALTER TABLE managed_runs RENAME TO managed_runs_v6;
+                 CREATE TABLE managed_runs (
+                     id TEXT PRIMARY KEY,
+                     workspace_id TEXT NOT NULL REFERENCES managed_workspaces(id) ON DELETE CASCADE,
+                     kind TEXT NOT NULL CHECK(kind IN ('setup', 'adopt', 'stage', 'classify')),
+                     state TEXT NOT NULL CHECK(state IN (
+                         'planning', 'planned', 'applying', 'completed',
+                         'noop', 'failed', 'needs_resume'
+                     )),
+                     plan_path TEXT, apply_path TEXT, undo_path TEXT,
+                     started_unix_ms INTEGER NOT NULL, finished_unix_ms INTEGER,
+                     move_count INTEGER NOT NULL DEFAULT 0 CHECK(move_count >= 0), error TEXT,
+                     CHECK(finished_unix_ms IS NULL OR finished_unix_ms >= started_unix_ms)
+                 );
+                 INSERT INTO managed_runs SELECT * FROM managed_runs_v6;
+                 CREATE TABLE managed_undo_journals (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     run_id TEXT NOT NULL REFERENCES managed_runs(id) ON DELETE CASCADE,
+                     path TEXT NOT NULL UNIQUE, created_unix_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO managed_undo_journals SELECT * FROM managed_undo_journals_v6;
+                 DROP TABLE managed_undo_journals_v6;
+                 DROP TABLE managed_runs_v6;
+                 CREATE INDEX managed_runs_by_workspace_time
+                     ON managed_runs(workspace_id, started_unix_ms DESC, id DESC);
+                 CREATE INDEX managed_undo_journals_by_run_time
+                     ON managed_undo_journals(run_id, id);
+                 DELETE FROM schema_migrations WHERE version = 6;",
+            )
+            .unwrap();
+        store
+            .connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+
+        migrate(&mut store.connection).unwrap();
+
+        assert_eq!(
+            store.managed_run("adopt-1").unwrap().unwrap().kind,
+            ManagedRunKind::Adopt
+        );
+        assert_eq!(
+            store.managed_undo_journal_paths("adopt-1").unwrap().len(),
+            1
+        );
+        let configure = ManagedRun {
+            id: "configure-1".into(),
+            workspace_id: "w1".into(),
+            kind: ManagedRunKind::Configure,
+            state: RunState::Applying,
+            plan_path: Some(root.path().join("edit-plan.json").display().to_string()),
+            apply_path: Some(root.path().join("edit-session.json").display().to_string()),
+            undo_path: None,
+            started_unix_ms: 400,
+            finished_unix_ms: None,
+            move_count: 0,
+            error: None,
+        };
+        store.insert_managed_run(&configure).unwrap();
+        let mut invalid = configure;
+        invalid.id = "configure-invalid".into();
+        invalid.workspace_id = "missing".into();
+        assert!(store.insert_managed_run(&invalid).is_err());
     }
 
     #[test]

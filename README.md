@@ -98,15 +98,22 @@ $ temari managed reprocess <WORKSPACE_ID> \
     --from library --path Documents/old-report.pdf
 $ temari managed rule add <WORKSPACE_ID> \
     --name-glob 'invoice-*.pdf' --destination d000001 --priority 100
+$ temari managed disable <WORKSPACE_ID>
+$ temari managed library show <WORKSPACE_ID> --out library.folders.json
+$ temari managed library plan <WORKSPACE_ID> --out library-edit.plan.json \
+    add --path Research --description "Research material"
+$ temari managed library apply library-edit.plan.json --yes
 $ temari managed schedule install <WORKSPACE_ID> \
     --every-seconds 300 --executable ~/.local/bin/temari --yes
 ```
 
-The first `managed run` is read-only unless `--apply --yes` is supplied. A run adopts newly created root directories into `Kept`, stages new root files into `Inbox`, then considers only direct Inbox files whose retention and stability deadlines have passed. A file manually returned from `Library` to the root keeps its processed identity and is not staged again; explicit `managed reprocess` remains the way to request reclassification. Classification writes a normal Plan before Apply. `managed history` lists file moves and root-directory adoptions with their Undo state. `managed undo` accepts a displayed file ID or original source-relative path for file runs; directory adoption is undone as one complete session without removing the managed areas. Every Undo remains an authoritative JSON journal.
+The first `managed run` is read-only unless `--apply --yes` is supplied. A run adopts newly created root directories into `Kept`, stages new root files into `Inbox`, then considers only direct Inbox files whose retention and stability deadlines have passed. A file manually returned from `Library` to the root keeps its processed identity and is not staged again; explicit `managed reprocess` remains the way to request reclassification. A directory manually returned from `Kept`, including by Undo, is likewise left at the root; Temari derives this intent from its authoritative setup and adoption journals, while a newly created directory with the same name but a different filesystem identity is still adopted. Classification writes a normal Plan before Apply. `managed history` lists file moves and root-directory adoptions with their Undo state. `managed undo` accepts a displayed file ID or original source-relative path for file runs; directory adoption is undone as one complete session without removing the managed areas. Every Undo remains an authoritative JSON journal.
 
 Arrival time is the first local observation stored in SQLite, not file modification time. Editing or replacing a pending file resets its stability deadline. `Kept` is never recursively scanned, and `Library` is always excluded as an approved destination subtree.
 
 `managed reprocess` creates a model-free reviewed Plan from explicitly selected `Kept` or `Library` files back to `Inbox`; normal retention and classification then apply. Library supports explicit `--all`, while Kept always requires `--path`. Workspace registration can be enabled, disabled, edited, reconciled, and removed without deleting the three physical areas or JSON recovery artifacts.
+
+`managed library` edits the approved Library structure while a workspace is disabled. `show` exports the current FolderSet, and `plan add|rename|describe|delete` writes a reviewable immutable Plan. `apply` changes the workspace's FolderSet binding only: it does not move files or rename or delete physical directories. Each completed Configure run owns its recovery artifacts, so `undo <WORKSPACE_ID> <RUN_ID>` does not accept a caller-selected journal path and `resume` dispatches interrupted Apply or Undo recovery from the recorded run state.
 
 The portable monitoring engine, processed signatures, local rules, and run reconciliation remain internal Core services used by `managed`. There is no separate public monitor workflow or resident Temari daemon. Explicit `managed schedule` commands render, install, inspect, or uninstall a systemd user timer on Linux or a per-user launchd agent on macOS. Scheduled definitions run the same finite `managed run --apply --yes` service with absolute paths and no shell; installation never happens during workspace setup.
 
@@ -140,7 +147,7 @@ Document containers are parsed in memory without unpacking files. Archive expans
 temari [--config PATH] [--state PATH] [--json] [--no-input] [--no-color] [-v] <COMMAND>
 
 Commands:
-  managed init|apply|list|status|enable|disable|edit|remove|reconcile|run|reprocess|schedule|apply-run|resume-run|history|rule|undo|undo-setup|resume-setup ...
+  managed init|apply|list|status|enable|disable|edit|remove|reconcile|run|reprocess|schedule|apply-run|resume-run|history|rule|library|undo|undo-setup|resume-setup ...
   organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...  One-time cleanup
   propose <SOURCE> --out <PROPOSAL> [--include-subtree <PATH>]...
   approve <PROPOSAL> --out <FOLDER_SET>             Validate and approve it

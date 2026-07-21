@@ -15,10 +15,11 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 use temari_core::{
     ApplySession, Config, FolderProposal, FolderProposer, FolderSet, InboxState,
-    ManagedCycleResult, ManagedReprocessArea, ManagedReprocessSelection, ManagedRun,
-    ManagedRunKind, ManagedService, ManagedSetupPlan, ManagedSetupSession, ManagedSetupUndoSession,
-    ManagedSetupUndoState, ManagedUndoMoveOutcome, ManagedWorkspace, OpenAiCompatibleModel,
-    Proposal, RunState, ScanScope, SourceLock, StateStore, UndoMoveOutcome, UndoSession,
+    ManagedCycleResult, ManagedLibraryEdit, ManagedLibraryEditPlan, ManagedReprocessArea,
+    ManagedReprocessSelection, ManagedRun, ManagedRunKind, ManagedService, ManagedSetupPlan,
+    ManagedSetupSession, ManagedSetupUndoSession, ManagedSetupUndoState, ManagedUndoMoveOutcome,
+    ManagedWorkspace, OpenAiCompatibleModel, Proposal, RunState, ScanScope, SourceLock, StateStore,
+    UndoMoveOutcome, UndoSession,
     build_managed_setup_plan, inbox_file_candidates, scan_directory, select_representative_files,
     undo_session_files_with_lock, undo_session_with_lock,
 };
@@ -47,11 +48,18 @@ struct PreviewDraft {
     settle_seconds: u64,
 }
 
+#[derive(Clone)]
+struct LibraryEditDraft {
+    token: String,
+    plan: ManagedLibraryEditPlan,
+}
+
 #[derive(Default)]
 struct ManagedDrafts {
     revision: u64,
     proposal: Option<ProposalDraft>,
     preview: Option<PreviewDraft>,
+    library_edit: Option<LibraryEditDraft>,
 }
 
 impl ManagedDrafts {
@@ -59,6 +67,7 @@ impl ManagedDrafts {
         self.revision = self.revision.wrapping_add(1);
         self.proposal = None;
         self.preview = None;
+        self.library_edit = None;
         self.revision
     }
 
@@ -82,6 +91,26 @@ impl ManagedDrafts {
         self.revision = self.revision.wrapping_add(1);
         self.proposal = None;
         Ok(preview)
+    }
+
+    fn begin_library_edit(&mut self) -> u64 {
+        self.revision = self.revision.wrapping_add(1);
+        self.proposal = None;
+        self.preview = None;
+        self.library_edit = None;
+        self.revision
+    }
+
+    fn consume_library_edit(&mut self, token: &str) -> Result<LibraryEditDraft, String> {
+        if self
+            .library_edit
+            .as_ref()
+            .is_none_or(|draft| draft.token != token)
+        {
+            return Err("the reviewed Library edit is no longer active".into());
+        }
+        self.revision = self.revision.wrapping_add(1);
+        Ok(self.library_edit.take().expect("Library edit token was checked"))
     }
 }
 
@@ -169,6 +198,26 @@ pub(crate) struct ManagedUndoMoveRequest {
     pub move_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct ManagedLibraryEditPreviewRequest {
+    pub workspace_id: String,
+    pub operation: ManagedLibraryEdit,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct ManagedLibraryEditApplyRequest {
+    pub preview_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct ManagedLibraryEditUndoRequest {
+    pub workspace_id: String,
+    pub run_id: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ManagedWorkspaceView {
@@ -239,6 +288,23 @@ pub(crate) struct ManagedRunsView {
     pub actionable: Vec<ManagedRunView>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LibraryFolderView {
+    pub id: String,
+    pub path: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LibraryConfigurationView {
+    pub run_id: String,
+    pub state: RunState,
+    pub undone: bool,
+    pub finished_unix_ms: Option<i64>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ManagedWorkspaceStatus {
@@ -247,6 +313,17 @@ pub(crate) struct ManagedWorkspaceStatus {
     pub workspace: ManagedWorkspaceView,
     pub inbox: InboxSummaryView,
     pub runs: ManagedRunsView,
+    pub library_folders: Vec<LibraryFolderView>,
+    pub latest_configuration: Option<LibraryConfigurationView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LibraryEditPreviewView {
+    pub token: String,
+    pub operation: ManagedLibraryEdit,
+    pub before_folders: Vec<LibraryFolderView>,
+    pub after_folders: Vec<LibraryFolderView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -550,6 +627,117 @@ pub(crate) async fn managed_apply_workspace(
 }
 
 #[tauri::command]
+pub(crate) async fn managed_preview_library_edit(
+    request: ManagedLibraryEditPreviewRequest,
+    state: State<'_, ManagedAppState>,
+) -> Result<LibraryEditPreviewView, String> {
+    let revision = {
+        let mut drafts = state
+            .drafts
+            .lock()
+            .map_err(|_| "managed setup state is unavailable".to_owned())?;
+        drafts.begin_library_edit()
+    };
+    let token = setup_token("library-edit", revision);
+    let operation = request.operation.clone();
+    let plan = tauri::async_runtime::spawn_blocking(move || {
+        managed_service()?.preview_library_edit(&request.workspace_id, request.operation).map_err(error_text)
+    })
+    .await
+    .map_err(|error| format!("Library edit preview task failed: {error}"))??;
+    let view = LibraryEditPreviewView {
+        token: token.clone(),
+        operation,
+        before_folders: editable_library_folders(&plan.before_folders),
+        after_folders: editable_library_folders(&plan.after_folders),
+    };
+    let mut drafts = state
+        .drafts
+        .lock()
+        .map_err(|_| "managed setup state is unavailable".to_owned())?;
+    if drafts.revision != revision {
+        return Err("a newer Library edit preview replaced this result".into());
+    }
+    drafts.library_edit = Some(LibraryEditDraft { token, plan });
+    Ok(view)
+}
+
+#[tauri::command]
+pub(crate) async fn managed_apply_library_edit(
+    request: ManagedLibraryEditApplyRequest,
+    state: State<'_, ManagedAppState>,
+) -> Result<ManagedWorkspaceStatus, String> {
+    let draft = {
+        let mut drafts = state
+            .drafts
+            .lock()
+            .map_err(|_| "managed setup state is unavailable".to_owned())?;
+        drafts.consume_library_edit(&request.preview_token)?
+    };
+    let workspace_id = draft.plan.workspace_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        managed_service()?
+            .apply_library_edit(&draft.plan)
+            .map_err(error_text)
+    })
+    .await
+    .map_err(|error| format!("Library edit Apply task failed: {error}"))??;
+    with_store(|store| workspace_status(store, &workspace_id))
+}
+
+#[tauri::command]
+pub(crate) async fn managed_undo_library_edit(
+    request: ManagedLibraryEditUndoRequest,
+) -> Result<ManagedWorkspaceStatus, String> {
+    let (state_path, journal_path) = library_edit_undo_path(&request)?;
+    let workspace_id = request.workspace_id;
+    tauri::async_runtime::spawn_blocking(move || {
+        ManagedService::new(&state_path)
+            .undo_library_edit(&request.run_id, &journal_path)
+            .map_err(error_text)
+    })
+    .await
+    .map_err(|error| format!("Library edit Undo task failed: {error}"))??;
+    with_store(|store| workspace_status(store, &workspace_id))
+}
+
+#[tauri::command]
+pub(crate) async fn managed_resume_library_edit(
+    request: ManagedLibraryEditUndoRequest,
+) -> Result<ManagedWorkspaceStatus, String> {
+    let state_path = default_state_path()?;
+    let workspace_id = request.workspace_id;
+    let status_workspace_id = workspace_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = StateStore::open(&state_path).map_err(error_text)?;
+        let run = store
+            .managed_run(&request.run_id)
+            .map_err(error_text)?
+            .ok_or_else(|| format!("unknown Configure run {:?}", request.run_id))?;
+        if run.workspace_id != workspace_id {
+            return Err("Configure run does not belong to the requested workspace".into());
+        }
+        let state = run.state;
+        drop(store);
+        let service = ManagedService::new(&state_path);
+        match state {
+            RunState::Applying => service
+                .resume_library_edit(&request.run_id)
+                .map(|_| ())
+                .map_err(error_text),
+            RunState::NeedsResume => service
+                .resume_library_edit_undo(&request.run_id)
+                .map(|_| ())
+                .map_err(error_text),
+            _ => Err("Configure run does not need Resume".into()),
+        }
+    })
+    .await
+    .map_err(|error| format!("Library edit Resume task failed: {error}"))??;
+    with_store(|store| workspace_status(store, &status_workspace_id))
+}
+
+#[tauri::command]
 pub(crate) async fn managed_run(request: ManagedRunRequest) -> Result<ManagedCycleView, String> {
     if !request.apply {
         return Err("desktop managed runs require explicit Apply confirmation".into());
@@ -688,6 +876,22 @@ fn workspace_status(
     let runs = store.managed_runs(workspace_id).map_err(error_text)?;
     let now = unix_ms()?;
     let mut issues = Vec::new();
+    let library_folders = match FolderSet::load(Path::new(&workspace.folder_set_path)) {
+        Ok(folders)
+            if folders.source == workspace.source
+                && folders.sha256().map_err(error_text)? == workspace.folder_set_sha256 =>
+        {
+            editable_library_folders(&folders)
+        }
+        Ok(_) => {
+            issues.push("Library FolderSet binding does not match the workspace".into());
+            Vec::new()
+        }
+        Err(error) => {
+            issues.push(format!("Library FolderSet could not be loaded: {error}"));
+            Vec::new()
+        }
+    };
     let physical_files = match inbox_file_candidates(Path::new(&workspace.source)) {
         Ok(files) => files.len(),
         Err(error) => {
@@ -733,6 +937,15 @@ fn workspace_status(
         .filter(|item| item.state == InboxState::Pending && item.eligible_unix_ms > now)
         .map(|item| item.eligible_unix_ms)
         .min();
+    let latest_configuration = runs
+        .iter()
+        .find(|run| run.kind == ManagedRunKind::Configure)
+        .map(|run| LibraryConfigurationView {
+            run_id: run.id.clone(),
+            state: run.state,
+            undone: run.undo_path.is_some() && run.state == RunState::Completed,
+            finished_unix_ms: run.finished_unix_ms,
+        });
     let health = if !issues.is_empty() {
         "attention"
     } else if !workspace.enabled {
@@ -756,7 +969,26 @@ fn workspace_status(
             total: runs.len(),
             actionable,
         },
+        library_folders,
+        latest_configuration,
     })
+}
+
+fn editable_library_folders(folders: &FolderSet) -> Vec<LibraryFolderView> {
+    folders
+        .folders
+        .iter()
+        .filter(|folder| folder.model_visible && folder.fallback.is_none())
+        .map(|folder| LibraryFolderView {
+            id: folder.id.clone(),
+            path: folder
+                .path
+                .strip_prefix("Library/")
+                .unwrap_or(&folder.path)
+                .into(),
+            description: folder.description.clone(),
+        })
+        .collect()
 }
 
 fn propose_workspace(
@@ -1181,6 +1413,30 @@ fn allocate_undo_path(
     Err("could not allocate a unique managed Undo journal".into())
 }
 
+fn library_edit_undo_path(
+    request: &ManagedLibraryEditUndoRequest,
+) -> Result<(PathBuf, PathBuf), String> {
+    let state_path = default_state_path()?;
+    let store = StateStore::open(&state_path).map_err(error_text)?;
+    require_workspace(&store, &request.workspace_id)?;
+    let run = store
+        .managed_run(&request.run_id)
+        .map_err(error_text)?
+        .ok_or_else(|| format!("unknown Configure run {:?}", request.run_id))?;
+    if run.workspace_id != request.workspace_id || run.kind != ManagedRunKind::Configure {
+        return Err("Configure run does not belong to the requested workspace".into());
+    }
+    let apply_path = Path::new(
+        run.apply_path
+            .as_deref()
+            .ok_or_else(|| "Configure run has no Apply Session".to_owned())?,
+    );
+    let parent = apply_path
+        .parent()
+        .ok_or_else(|| "Configure Apply Session has no parent directory".to_owned())?;
+    Ok((state_path, parent.join("library-edit-undo.json")))
+}
+
 fn require_workspace(store: &StateStore, id: &str) -> Result<ManagedWorkspace, String> {
     store
         .managed_workspace(id)
@@ -1366,6 +1622,7 @@ timeout_seconds = 2
             revision: 4,
             proposal: Some(proposal_draft(source.path(), "proposal")),
             preview: Some(preview_draft(source.path(), "latest")),
+            ..ManagedDrafts::default()
         };
 
         assert!(drafts.consume_preview("stale").is_err());
@@ -1539,6 +1796,84 @@ timeout_seconds = 2
         assert_eq!(history.len(), 1);
         assert!(history[0].undone);
         assert_eq!(history[0].undo_outcome.as_deref(), Some("restored"));
+    }
+
+    #[test]
+    fn library_edit_token_is_single_use_and_status_exposes_configure_undo() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let state_path = directory.path().join("state.sqlite3");
+        let config_path = directory.path().join("config.toml");
+        write_valid_config(&config_path);
+        let folders = Proposal {
+            version: 2,
+            source: source.display().to_string(),
+            scope: ScanScope::default(),
+            files_considered: 1,
+            folders: vec![
+                FolderProposal {
+                    path: "Documents".into(),
+                    description: "Documents".into(),
+                },
+                FolderProposal {
+                    path: "Images".into(),
+                    description: "Images".into(),
+                },
+            ],
+        }
+        .approve()
+        .unwrap();
+        let service = ManagedService::new(&state_path);
+        let activation = service
+            .activate_workspace(
+                &build_managed_setup_plan(&source).unwrap(),
+                &folders,
+                &config_path,
+                259_200,
+                30,
+            )
+            .unwrap();
+        StateStore::open(&state_path)
+            .unwrap()
+            .set_managed_workspace_enabled(&activation.workspace.id, false, unix_ms().unwrap())
+            .unwrap();
+        let plan = service
+            .preview_library_edit(
+                &activation.workspace.id,
+                ManagedLibraryEdit::Add {
+                    path: "Research".into(),
+                    description: "Research material".into(),
+                },
+            )
+            .unwrap();
+        let mut drafts = ManagedDrafts::default();
+        drafts.begin_library_edit();
+        drafts.library_edit = Some(LibraryEditDraft {
+            token: "reviewed".into(),
+            plan,
+        });
+        assert!(drafts.consume_library_edit("stale").is_err());
+        let reviewed = drafts.consume_library_edit("reviewed").unwrap();
+        assert!(drafts.consume_library_edit("reviewed").is_err());
+
+        let applied = service.apply_library_edit(&reviewed.plan).unwrap();
+        let status = get_workspace_at(&state_path, &activation.workspace.id).unwrap();
+        assert!(status.library_folders.iter().any(|folder| folder.path == "Research"));
+        assert_eq!(
+            status.latest_configuration.as_ref().unwrap().run_id,
+            applied.run.id
+        );
+        let undo_path = Path::new(applied.run.apply_path.as_deref().unwrap())
+            .parent()
+            .unwrap()
+            .join("library-edit-undo.json");
+        service
+            .undo_library_edit(&applied.run.id, &undo_path)
+            .unwrap();
+        let status = get_workspace_at(&state_path, &activation.workspace.id).unwrap();
+        assert!(!status.library_folders.iter().any(|folder| folder.path == "Research"));
+        assert!(status.latest_configuration.unwrap().undone);
     }
 
     #[test]

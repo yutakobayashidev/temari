@@ -7,6 +7,7 @@ mod filesystem;
 mod lock;
 mod managed;
 mod managed_cycle;
+mod managed_library;
 mod managed_service;
 mod model;
 mod monitor;
@@ -52,8 +53,13 @@ pub use managed_cycle::{
     build_stage_to_inbox_plan, filter_inbox_candidates, inbox_file_candidates, library_folder_set,
     reprocess_file_candidates, root_file_candidates,
 };
+pub use managed_library::{
+    ManagedLibraryEdit, ManagedLibraryEditPlan, ManagedLibraryEditSession, ManagedLibraryEditState,
+    ManagedLibraryEditUndoSession,
+};
 pub use managed_service::{
-    ManagedActivationResult, ManagedCycleResult, ManagedDirectoryAdoption, ManagedService,
+    ManagedActivationResult, ManagedCycleResult, ManagedDirectoryAdoption,
+    ManagedLibraryEditResult, ManagedLibraryEditUndoResult, ManagedService,
 };
 pub use model::{
     Classification, ClassificationBasis, Classifier, ContentCandidate, FolderProposer,
