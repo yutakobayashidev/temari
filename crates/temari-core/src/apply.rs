@@ -530,6 +530,17 @@ pub fn undo_session_files(
     file_ids: &[String],
     journal_path: &Path,
 ) -> Result<UndoSession, Error> {
+    let lock = SourceLock::acquire(Path::new(&apply.source))?;
+    undo_session_files_with_lock(apply, file_ids, journal_path, &lock)
+}
+
+/// Restores selected applied files while reusing a caller-held source lock.
+pub fn undo_session_files_with_lock(
+    apply: &ApplySession,
+    file_ids: &[String],
+    journal_path: &Path,
+    lock: &SourceLock,
+) -> Result<UndoSession, Error> {
     apply.validate()?;
     if file_ids.is_empty() {
         return Err(Error::InvalidArtifact(
@@ -564,7 +575,7 @@ pub fn undo_session_files(
     let mut selected = apply.clone();
     selected.moves = moves;
     selected.directories.clear();
-    undo_session(&selected, journal_path)
+    undo_session_with_lock(&selected, journal_path, lock)
 }
 
 pub fn undo_session_with_lock(

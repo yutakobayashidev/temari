@@ -1,4 +1,8 @@
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::{BTreeSet, HashSet},
+    fs,
+    path::Path,
+};
 
 use crate::{
     Classification, ClassificationBasis, Error, FileCandidate, FolderProposal, FolderSet, Plan,
@@ -9,6 +13,27 @@ pub const KEPT_DIRECTORY: &str = "Kept";
 pub const INBOX_DIRECTORY: &str = "Inbox";
 pub const LIBRARY_DIRECTORY: &str = "Library";
 pub const STAGE_TO_INBOX_RULE_ID: &str = "managed-stage-to-inbox";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedReprocessArea {
+    Kept,
+    Library,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManagedReprocessSelection {
+    Paths(Vec<String>),
+    All,
+}
+
+impl ManagedReprocessArea {
+    fn directory(self) -> &'static str {
+        match self {
+            Self::Kept => KEPT_DIRECTORY,
+            Self::Library => LIBRARY_DIRECTORY,
+        }
+    }
+}
 
 /// Bind an approved folder set to the managed Library without changing any
 /// destination IDs or classification metadata.
@@ -69,6 +94,72 @@ pub fn inbox_file_candidates(source: &Path) -> Result<Vec<FileCandidate>, Error>
     Ok(candidates)
 }
 
+/// Enumerate explicitly selected files below Kept or Library for staging back
+/// to Inbox. Selectors are relative to the selected area. Kept deliberately
+/// has no full-area mode because it is the protected manual area.
+pub fn reprocess_file_candidates(
+    source: &Path,
+    area: ManagedReprocessArea,
+    selection: &ManagedReprocessSelection,
+) -> Result<Vec<FileCandidate>, Error> {
+    match selection {
+        ManagedReprocessSelection::All if area == ManagedReprocessArea::Kept => {
+            return Err(Error::InvalidArtifact(
+                "full reprocessing is not allowed for managed Kept".into(),
+            ));
+        }
+        ManagedReprocessSelection::Paths(selectors) if selectors.is_empty() => {
+            return Err(Error::InvalidArtifact(
+                "managed reprocessing requires at least one explicit path".into(),
+            ));
+        }
+        ManagedReprocessSelection::All | ManagedReprocessSelection::Paths(_) => {}
+    }
+
+    let (source, _) = canonical_source_identity(source)?;
+    let area_name = area.directory();
+    let area_path = source.join(area_name);
+    let (resolved_area, area_identity) = canonical_source_identity(&area_path)?;
+    if resolved_area != area_path {
+        return Err(Error::InvalidArtifact(format!(
+            "managed {area_name} must resolve inside the managed source"
+        )));
+    }
+
+    let mut paths = BTreeSet::new();
+    match selection {
+        ManagedReprocessSelection::All => {
+            collect_directory_files(&area_path, area_name, &mut paths)?;
+        }
+        ManagedReprocessSelection::Paths(selectors) => {
+            for selector in selectors {
+                collect_selected_path(&area_path, area_name, selector, &mut paths)?;
+            }
+        }
+    }
+
+    let (resolved_after_scan, identity_after_scan) = canonical_source_identity(&area_path)?;
+    if resolved_after_scan != resolved_area || identity_after_scan != area_identity {
+        return Err(Error::InvalidArtifact(format!(
+            "managed {area_name} changed while it was being scanned"
+        )));
+    }
+
+    Ok(paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, source_path)| FileCandidate {
+            id: format!("f{:06}", index + 1),
+            extension: Path::new(&source_path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+            source_path,
+        })
+        .collect())
+}
+
 /// Build the exact, model-free Plan that stages root files into Inbox.
 pub fn build_stage_to_inbox_plan(
     source: &Path,
@@ -81,7 +172,38 @@ pub fn build_stage_to_inbox_plan(
     let source_text = source
         .to_str()
         .ok_or_else(|| Error::InvalidArtifact("managed source path must be valid UTF-8".into()))?;
-    let folders = stage_folder_set(source_text, candidates.len())?;
+    let folders = stage_folder_set(source_text, ScanScope::default(), candidates.len())?;
+    build_to_inbox_plan(&source, candidates, &folders)
+}
+
+/// Build an exact, model-free Plan that returns selected Kept or Library files
+/// to Inbox. Classification still happens later through the normal managed
+/// Inbox workflow.
+pub fn build_reprocess_to_inbox_plan(
+    source: &Path,
+    area: ManagedReprocessArea,
+    candidates: &[FileCandidate],
+) -> Result<Plan, Error> {
+    for candidate in candidates {
+        validate_reprocess_candidate(area, candidate)?;
+    }
+    let (source, _) = canonical_source_identity(source)?;
+    let source_text = source
+        .to_str()
+        .ok_or_else(|| Error::InvalidArtifact("managed source path must be valid UTF-8".into()))?;
+    let folders = stage_folder_set(
+        source_text,
+        ScanScope::new(vec![area.directory().into()])?,
+        candidates.len(),
+    )?;
+    build_to_inbox_plan(&source, candidates, &folders)
+}
+
+fn build_to_inbox_plan(
+    source: &Path,
+    candidates: &[FileCandidate],
+    folders: &FolderSet,
+) -> Result<Plan, Error> {
     let inbox_id = folders
         .folders
         .iter()
@@ -99,7 +221,7 @@ pub fn build_stage_to_inbox_plan(
         })
         .collect();
     build_plan(
-        &source,
+        source,
         &folders.scope,
         candidates,
         &folders.folders,
@@ -148,11 +270,15 @@ pub fn filter_inbox_candidates(
         .collect())
 }
 
-fn stage_folder_set(source: &str, files_considered: usize) -> Result<FolderSet, Error> {
+fn stage_folder_set(
+    source: &str,
+    scope: ScanScope,
+    files_considered: usize,
+) -> Result<FolderSet, Error> {
     let folders = Proposal {
         version: 2,
         source: source.into(),
-        scope: ScanScope::default(),
+        scope,
         files_considered,
         folders: vec![FolderProposal {
             path: INBOX_DIRECTORY.into(),
@@ -162,6 +288,72 @@ fn stage_folder_set(source: &str, files_considered: usize) -> Result<FolderSet, 
     .approve()?;
     folders.validate()?;
     Ok(folders)
+}
+
+fn collect_selected_path(
+    area_path: &Path,
+    area_name: &str,
+    selector: &str,
+    paths: &mut BTreeSet<String>,
+) -> Result<(), Error> {
+    crate::artifact::normalize_relative_path(selector)?;
+    let selected = area_path.join(selector);
+    if let Some(parent) = Path::new(selector).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        crate::filesystem::verify_existing_directory_chain(
+            area_path,
+            parent.to_str().ok_or_else(|| {
+                Error::InvalidArtifact("managed selector parent must be valid UTF-8".into())
+            })?,
+        )?;
+    }
+    let metadata = fs::symlink_metadata(&selected).map_err(|source| Error::FileSystem {
+        action: "inspect managed reprocessing selector",
+        path: selected.display().to_string(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(Error::InvalidArtifact(format!(
+            "managed reprocessing selector must not be a symlink: {selector:?}"
+        )));
+    }
+    if metadata.is_file() {
+        paths.insert(format!("{area_name}/{selector}"));
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        crate::filesystem::verify_existing_directory_chain(area_path, selector)?;
+        return collect_directory_files(&selected, &format!("{area_name}/{selector}"), paths);
+    }
+    Err(Error::InvalidArtifact(format!(
+        "managed reprocessing selector is not a regular file or directory: {selector:?}"
+    )))
+}
+
+fn collect_directory_files(
+    directory: &Path,
+    relative_prefix: &str,
+    paths: &mut BTreeSet<String>,
+) -> Result<(), Error> {
+    let (resolved, identity) = canonical_source_identity(directory)?;
+    if resolved != directory {
+        return Err(Error::InvalidArtifact(format!(
+            "managed reprocessing directory must not be a symlink: {:?}",
+            directory.display().to_string()
+        )));
+    }
+    let files = scan_directory(&resolved, &ScanScope::new(vec![".".into()])?, &[])?;
+    let (resolved_after_scan, identity_after_scan) = canonical_source_identity(directory)?;
+    if resolved_after_scan != resolved || identity_after_scan != identity {
+        return Err(Error::InvalidArtifact(
+            "managed reprocessing directory changed while it was being scanned".into(),
+        ));
+    }
+    for file in files {
+        paths.insert(format!("{relative_prefix}/{}", file.source_path));
+    }
+    Ok(())
 }
 
 fn validate_root_candidate(candidate: &FileCandidate) -> Result<(), Error> {
@@ -178,6 +370,30 @@ fn validate_root_candidate(candidate: &FileCandidate) -> Result<(), Error> {
             "managed-area name cannot be staged as a root file: {:?}",
             candidate.source_path
         )));
+    }
+    Ok(())
+}
+
+fn validate_reprocess_candidate(
+    area: ManagedReprocessArea,
+    candidate: &FileCandidate,
+) -> Result<(), Error> {
+    validate_candidate_id(candidate)?;
+    crate::artifact::normalize_relative_path(&candidate.source_path)?;
+    let relative = candidate
+        .source_path
+        .strip_prefix(&format!("{}/", area.directory()))
+        .ok_or_else(|| {
+            Error::InvalidArtifact(format!(
+                "managed reprocessing candidate is outside {}: {:?}",
+                area.directory(),
+                candidate.source_path
+            ))
+        })?;
+    if relative.is_empty() {
+        return Err(Error::InvalidArtifact(
+            "managed reprocessing candidate must identify a file".into(),
+        ));
     }
     Ok(())
 }
@@ -332,6 +548,149 @@ mod tests {
     }
 
     #[test]
+    fn scans_only_explicit_kept_paths_with_stable_deduplication() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join(KEPT_DIRECTORY)).unwrap();
+        fs::create_dir(root.path().join(LIBRARY_DIRECTORY)).unwrap();
+        fs::create_dir_all(root.path().join("Kept/Project/Nested")).unwrap();
+        fs::write(root.path().join("Kept/manual.txt"), b"manual").unwrap();
+        fs::write(root.path().join("Kept/Project/a.txt"), b"a").unwrap();
+        fs::write(root.path().join("Kept/Project/Nested/z.PDF"), b"z").unwrap();
+        fs::write(root.path().join("Kept/not-selected.txt"), b"ignored").unwrap();
+        symlink(
+            root.path().join("Kept/not-selected.txt"),
+            root.path().join("Kept/Project/linked.txt"),
+        )
+        .unwrap();
+
+        let selection = ManagedReprocessSelection::Paths(vec![
+            "Project".into(),
+            "manual.txt".into(),
+            "Project/Nested/z.PDF".into(),
+        ]);
+        let candidates =
+            reprocess_file_candidates(root.path(), ManagedReprocessArea::Kept, &selection).unwrap();
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|file| (
+                    file.id.as_str(),
+                    file.source_path.as_str(),
+                    file.extension.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("f000001", "Kept/Project/Nested/z.PDF", "pdf"),
+                ("f000002", "Kept/Project/a.txt", "txt"),
+                ("f000003", "Kept/manual.txt", "txt"),
+            ]
+        );
+        assert_eq!(
+            candidates,
+            reprocess_file_candidates(root.path(), ManagedReprocessArea::Kept, &selection,)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn allows_full_library_selection_but_rejects_full_kept_selection() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join(KEPT_DIRECTORY)).unwrap();
+        fs::create_dir_all(root.path().join("Library/Reports/2026")).unwrap();
+        fs::write(root.path().join("Library/root.txt"), b"root").unwrap();
+        fs::write(
+            root.path().join("Library/Reports/2026/report.pdf"),
+            b"report",
+        )
+        .unwrap();
+
+        let candidates = reprocess_file_candidates(
+            root.path(),
+            ManagedReprocessArea::Library,
+            &ManagedReprocessSelection::All,
+        )
+        .unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|file| file.source_path.as_str())
+                .collect::<Vec<_>>(),
+            ["Library/Reports/2026/report.pdf", "Library/root.txt"]
+        );
+
+        let error = reprocess_file_candidates(
+            root.path(),
+            ManagedReprocessArea::Kept,
+            &ManagedReprocessSelection::All,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not allowed"));
+    }
+
+    #[test]
+    fn rejects_empty_escaping_and_symlink_reprocessing_selectors() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join(KEPT_DIRECTORY)).unwrap();
+        fs::create_dir(root.path().join(LIBRARY_DIRECTORY)).unwrap();
+        fs::write(root.path().join("outside.txt"), b"outside").unwrap();
+        symlink(
+            root.path().join("outside.txt"),
+            root.path().join("Kept/linked.txt"),
+        )
+        .unwrap();
+
+        for selectors in [Vec::new(), vec!["../outside.txt".into()]] {
+            assert!(
+                reprocess_file_candidates(
+                    root.path(),
+                    ManagedReprocessArea::Kept,
+                    &ManagedReprocessSelection::Paths(selectors),
+                )
+                .is_err()
+            );
+        }
+        let error = reprocess_file_candidates(
+            root.path(),
+            ManagedReprocessArea::Kept,
+            &ManagedReprocessSelection::Paths(vec!["linked.txt".into()]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must not be a symlink"));
+
+        fs::create_dir(root.path().join("Kept/InvalidName")).unwrap();
+        File::create(
+            root.path()
+                .join("Kept/InvalidName")
+                .join(OsString::from_vec(vec![0xff])),
+        )
+        .unwrap();
+        assert!(
+            reprocess_file_candidates(
+                root.path(),
+                ManagedReprocessArea::Kept,
+                &ManagedReprocessSelection::Paths(vec!["InvalidName".into()]),
+            )
+            .is_err()
+        );
+
+        let linked_root = tempdir().unwrap();
+        symlink(
+            root.path().join(LIBRARY_DIRECTORY),
+            linked_root.path().join(LIBRARY_DIRECTORY),
+        )
+        .unwrap();
+        assert!(
+            reprocess_file_candidates(
+                linked_root.path(),
+                ManagedReprocessArea::Library,
+                &ManagedReprocessSelection::All,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn rejects_non_utf8_scan_entries() {
         let root = tempdir().unwrap();
         File::create(root.path().join(OsString::from_vec(vec![0xff]))).unwrap();
@@ -363,6 +722,127 @@ mod tests {
                 .count(),
             crate::FallbackCategory::ALL.len()
         );
+    }
+
+    #[test]
+    fn builds_a_collision_safe_rule_plan_from_library_to_inbox() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join(KEPT_DIRECTORY)).unwrap();
+        fs::create_dir(root.path().join(INBOX_DIRECTORY)).unwrap();
+        fs::create_dir_all(root.path().join("Library/Alpha")).unwrap();
+        fs::create_dir_all(root.path().join("Library/Beta")).unwrap();
+        fs::write(root.path().join("Library/Alpha/report.txt"), b"alpha").unwrap();
+        fs::write(root.path().join("Library/Beta/report.txt"), b"beta").unwrap();
+
+        let candidates = reprocess_file_candidates(
+            root.path(),
+            ManagedReprocessArea::Library,
+            &ManagedReprocessSelection::All,
+        )
+        .unwrap();
+        let plan =
+            build_reprocess_to_inbox_plan(root.path(), ManagedReprocessArea::Library, &candidates)
+                .unwrap();
+
+        plan.validate().unwrap();
+        assert_eq!(plan.scope.recursive_roots, [LIBRARY_DIRECTORY]);
+        assert_eq!(
+            plan.entries
+                .iter()
+                .map(|entry| (
+                    entry.source_path.as_str(),
+                    entry.destination_path.as_str(),
+                    entry.classification_basis,
+                    entry.rule_id.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "Library/Alpha/report.txt",
+                    "Inbox/report.txt",
+                    ClassificationBasis::Rule,
+                    Some(STAGE_TO_INBOX_RULE_ID),
+                ),
+                (
+                    "Library/Beta/report.txt",
+                    "Inbox/report 1.txt",
+                    ClassificationBasis::Rule,
+                    Some(STAGE_TO_INBOX_RULE_ID),
+                ),
+            ]
+        );
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.destination_id.starts_with('d'))
+        );
+    }
+
+    #[test]
+    fn reprocess_plan_rejects_candidates_from_another_area_and_symlinks() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join(KEPT_DIRECTORY)).unwrap();
+        fs::create_dir(root.path().join(INBOX_DIRECTORY)).unwrap();
+        fs::create_dir(root.path().join(LIBRARY_DIRECTORY)).unwrap();
+        fs::write(root.path().join("Kept/manual.txt"), b"manual").unwrap();
+        fs::write(root.path().join("Library/target.txt"), b"target").unwrap();
+        symlink(
+            root.path().join("Library/target.txt"),
+            root.path().join("Library/linked.txt"),
+        )
+        .unwrap();
+
+        assert!(
+            build_reprocess_to_inbox_plan(
+                root.path(),
+                ManagedReprocessArea::Library,
+                &[candidate("f1", "Kept/manual.txt")],
+            )
+            .is_err()
+        );
+        assert!(
+            build_reprocess_to_inbox_plan(
+                root.path(),
+                ManagedReprocessArea::Library,
+                &[candidate("f1", "Library/linked.txt")],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn applies_and_undoes_an_explicit_kept_reprocessing_plan() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        fs::create_dir(root.path().join(KEPT_DIRECTORY)).unwrap();
+        fs::create_dir(root.path().join(INBOX_DIRECTORY)).unwrap();
+        fs::create_dir(root.path().join(LIBRARY_DIRECTORY)).unwrap();
+        fs::write(root.path().join("Kept/manual.txt"), b"manual").unwrap();
+
+        let candidates = reprocess_file_candidates(
+            root.path(),
+            ManagedReprocessArea::Kept,
+            &ManagedReprocessSelection::Paths(vec!["manual.txt".into()]),
+        )
+        .unwrap();
+        let plan =
+            build_reprocess_to_inbox_plan(root.path(), ManagedReprocessArea::Kept, &candidates)
+                .unwrap();
+        let applied = crate::apply_plan(&plan, &journals.path().join("apply.json")).unwrap();
+
+        assert!(!root.path().join("Kept/manual.txt").exists());
+        assert_eq!(
+            fs::read(root.path().join("Inbox/manual.txt")).unwrap(),
+            b"manual"
+        );
+
+        let undone = crate::undo_session(&applied, &journals.path().join("undo.json")).unwrap();
+        assert_eq!(undone.state, crate::UndoState::Completed);
+        assert_eq!(
+            fs::read(root.path().join("Kept/manual.txt")).unwrap(),
+            b"manual"
+        );
+        assert!(!root.path().join("Inbox/manual.txt").exists());
     }
 
     #[test]

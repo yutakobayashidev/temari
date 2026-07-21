@@ -3,6 +3,7 @@
 ## Status
 
 - Accepted
+- Extended by [ADR 0014](0014-schedule-finite-managed-runs.md), which defines explicit standing authorization through per-user platform schedulers.
 - Public CLI portions are superseded by ADR 0013; the storage and internal-service decisions remain active.
 
 ## Decision Drivers

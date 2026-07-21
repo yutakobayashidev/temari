@@ -9,7 +9,8 @@ The implementation will evolve, but the experimental CLI contract will be redesi
 ```text
 temari [global options] managed init <SOURCE> --out <SETUP_PLAN>
 temari [global options] managed apply <SETUP_PLAN> --folders <FOLDER_SET> --out <RUN_DIR> [--yes]
-temari [global options] managed list|status|run|apply-run|resume-run|history|undo ...
+temari [global options] managed list|status|enable|disable|edit|remove|reconcile ...
+temari [global options] managed run|reprocess|schedule|apply-run|resume-run|history|undo ...
 temari [global options] managed rule add|list|enable|disable|remove ...
 temari [global options] managed undo-setup|resume-setup ...
 temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...
@@ -102,10 +103,14 @@ temari [global options] resume <APPLY_SESSION> [--yes]
 
 - `init` is read-only. It inventories the complete source root and writes a `ManagedSetupPlan` that creates `Kept`, `Inbox`, and `Library`, moves existing real directories to Kept, and moves existing regular files to Inbox. It rejects reserved-name collisions, special entries, non-portable names, stale source identity, and cross-filesystem directory entries.
 - `apply` confirms that exact setup Plan, writes a durable setup journal before mutation, then registers the completed workspace with a Library-prefixed FolderSet. Retention and stability windows are fixed in the workspace definition.
-- `run` is finite. It first writes a local Plan for new root files to Inbox, observes Inbox fingerprints in SQLite, and writes a classification Plan only for files past both deadlines. Without `--apply --yes`, Plans remain reviewable and no file moves.
+- `run` is finite. It first writes a local Plan for new root files to Inbox, reconciles Inbox fingerprints in SQLite, and writes a classification Plan only for files past both deadlines. Without `--apply --yes`, Plans remain reviewable and no file moves. Omitted `--out` creates a private unique artifact directory below the state directory.
+- `enable` and `disable` atomically update the workspace and its internal monitor. Disabled workspaces reject new runs and Apply but still permit recovery. `edit` changes retention and stability windows and recalculates only pending deadlines. `remove` requires a disabled idle workspace and deletes only registration and mutable indexes; files and JSON artifacts remain.
+- `reconcile` removes stale pending Inbox rows and recognizes manually returned files without treating SQLite as filesystem proof. `status` reports health, physical and indexed Inbox counts, eligibility, and actionable runs without contacting the model.
+- `reprocess` creates a model-free Plan that stages explicitly selected Kept or Library files back to Inbox. Kept always requires area-relative `--path` selectors; Library additionally accepts explicit `--all`. Normal retention, rules, model privacy, Plan, Apply, and Undo behavior then applies.
+- `schedule print|install|status|uninstall` manages explicit per-user systemd timers or launchd agents. Installed definitions call a stable absolute executable and absolute config/state paths without a shell. `--executable` preserves a user-facing launcher path, while garbage-collectable Nix store paths are rejected. Installation validates before its separate confirmation and rejects environment-backed API keys. Uninstall keeps definitions when the scheduler cannot be stopped.
 - `apply-run` applies a previously recorded stage or classification Plan by run ID and exact digest.
-- `resume-run` conservatively reconciles and resumes a running Apply journal, then synchronizes both the managed run index and Inbox state. Terminal runs are immutable.
-- `history` lists recent indexed moves. `undo` resolves a completed run to its ApplySession and restores either the complete session or repeated `--file <FILE_ID>` selections. Selected-file Undo never removes shared directories.
+- `resume-run` conservatively reconciles a running or already-completed Apply journal, then synchronizes the Inbox index before marking the managed run completed. A completed filesystem Apply with interrupted index finalization remains resumable. Other terminal runs are immutable.
+- `history` lists each recent indexed move with file ID, original path, destination, and accumulated Undo state. `undo` resolves a completed run to its ApplySession and restores either the complete session or repeated `--file <FILE_ID_OR_SOURCE_PATH>` selections. It keeps the source lock through atomic journal and Inbox reconciliation. Every individual Undo journal is indexed without replacing earlier Undo state, and selected-file Undo never removes shared directories.
 - `rule` manages case-insensitive basename globs for one workspace. Rules select reviewed opaque destination IDs, run before model classification, use descending priority and stable rule-ID ordering, and never store executable paths.
 - `undo-setup` and `resume-setup` operate only from their versioned setup journals. Setup Undo refuses a changed kept directory, occupied original path, or changed area identity.
 - SQLite stores mutable retention and history indexes only. Setup Plans, normal Plans, Apply sessions, and Undo sessions remain authoritative JSON artifacts outside the managed source.
@@ -153,7 +158,9 @@ $ temari organize ~/Downloads --include-subtree Receipts --include-subtree Work 
 $ temari managed init ~/Downloads --out downloads.setup-plan.json
 $ temari managed apply downloads.setup-plan.json --folders downloads.folders.json --out downloads-setup
 $ temari managed run <WORKSPACE_ID> --out downloads-cycle
-$ temari managed run <WORKSPACE_ID> --out downloads-cycle-apply --apply --yes
+$ temari managed run <WORKSPACE_ID> --apply --yes
+$ temari managed reprocess <WORKSPACE_ID> --from kept --path Projects --apply --yes
+$ temari managed schedule install <WORKSPACE_ID> --every-seconds 300 --executable ~/.local/bin/temari --yes
 $ temari managed history <WORKSPACE_ID>
 $ temari managed rule add <WORKSPACE_ID> --name-glob 'invoice-*.pdf' --destination d000001
 ```
@@ -177,3 +184,4 @@ $ temari approve downloads.proposal.json --accept-all --no-input --out downloads
 9. Add ambiguity-aware per-run content consent without making primitive commands interactive. Completed.
 10. Make managed workspaces the only public recurring workflow. Completed.
 11. Add a GUI adapter over the same application services. In progress as a proof of concept.
+12. Add explicit finite-run scheduling, workspace lifecycle management, detailed move history, and reprocessing through Inbox. Completed.

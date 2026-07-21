@@ -20,6 +20,9 @@
 - Preserve the canonical `propose -> approve -> plan -> apply -> undo` command boundaries. The interactive `organize` command must orchestrate the same application services.
 - Keep `organize` as TTY-only orchestration; non-interactive callers use the primitive commands. Preserve both destination approval and exact apply confirmation.
 - Keep `managed` as the only public recurring organization workflow. Monitoring records and services are internal implementation details; expose local rules, history, apply, resume, and undo through managed workspace IDs instead of a second monitor-oriented CLI.
+- Keep scheduled execution finite and explicit. Platform schedulers may invoke `managed run`, but workspace setup and enablement must never install a daemon or schedule implicitly; generated definitions must use absolute arguments without a shell or embedded secrets.
+- Reprocess protected or classified files only through a reviewed model-free Plan back to Inbox. Do not classify directly from Kept or inside Library, and do not clear processed markers before the staging Apply succeeds.
+- Keep workspace lifecycle metadata transactional with its internal monitor. Registration removal must leave physical areas and authoritative JSON artifacts untouched.
 - Resume may update only a `running` ApplySession after conservative filesystem reconciliation. Completed, failed, and partial-failure sessions are immutable, and undo must reject a running session.
 - No telemetry or cloud model provider is enabled by default.
 

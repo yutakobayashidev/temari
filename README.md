@@ -42,7 +42,7 @@ $ cargo run -p temari-cli -- managed apply downloads.setup-plan.json \
     --out ~/.local/state/temari/downloads-setup
 ```
 
-This creates `Kept`, `Inbox`, and `Library`. Run one reviewed cycle with `temari managed run <WORKSPACE_ID> --out <RUN_DIR>`, then add `--apply --yes` when the generated Plans should be applied.
+This creates `Kept`, `Inbox`, and `Library`. Run one reviewed cycle with `temari managed run <WORKSPACE_ID>`; Temari allocates a private artifact directory below its state directory. Add `--apply --yes` when the generated Plans should be applied, or keep `--out <RUN_DIR>` when a caller needs an explicit location.
 
 For a one-time folder cleanup instead of ongoing management, use the TTY-only `organize` command:
 
@@ -92,17 +92,25 @@ $ temari managed apply downloads.setup-plan.json \
     --out ~/.local/state/temari/downloads-setup --yes
 $ temari managed list
 $ temari managed status <WORKSPACE_ID>
-$ temari managed run <WORKSPACE_ID> \
-    --out ~/.local/state/temari/managed-runs
+$ temari managed run <WORKSPACE_ID>
+$ temari managed run <WORKSPACE_ID> --apply --yes
+$ temari managed reprocess <WORKSPACE_ID> \
+    --from library --path Documents/old-report.pdf
 $ temari managed rule add <WORKSPACE_ID> \
     --name-glob 'invoice-*.pdf' --destination d000001 --priority 100
+$ temari managed schedule install <WORKSPACE_ID> \
+    --every-seconds 300 --executable ~/.local/bin/temari --yes
 ```
 
-The first `managed run` is read-only unless `--apply --yes` is supplied. A run first stages new root files into `Inbox`, then considers only direct Inbox files whose retention and stability deadlines have passed. Classification writes a normal Plan before Apply. Recent run records resolve back to authoritative JSON journals for full-session or selected-file Undo.
+The first `managed run` is read-only unless `--apply --yes` is supplied. A run first stages new root files into `Inbox`, then considers only direct Inbox files whose retention and stability deadlines have passed. Classification writes a normal Plan before Apply. `managed history` lists each source-to-destination move and its Undo state; `managed undo` accepts either the displayed file ID or original source-relative path. Every Undo remains a separate authoritative JSON journal.
 
 Arrival time is the first local observation stored in SQLite, not file modification time. Editing or replacing a pending file resets its stability deadline. `Kept` is never recursively scanned, and `Library` is always excluded as an approved destination subtree.
 
-The portable monitoring engine, processed signatures, local rules, and run reconciliation remain internal Core services used by `managed`. There is no separate public monitor workflow and no daemon is installed implicitly.
+`managed reprocess` creates a model-free reviewed Plan from explicitly selected `Kept` or `Library` files back to `Inbox`; normal retention and classification then apply. Library supports explicit `--all`, while Kept always requires `--path`. Workspace registration can be enabled, disabled, edited, reconciled, and removed without deleting the three physical areas or JSON recovery artifacts.
+
+The portable monitoring engine, processed signatures, local rules, and run reconciliation remain internal Core services used by `managed`. There is no separate public monitor workflow or resident Temari daemon. Explicit `managed schedule` commands render, install, inspect, or uninstall a systemd user timer on Linux or a per-user launchd agent on macOS. Scheduled definitions run the same finite `managed run --apply --yes` service with absolute paths and no shell; installation never happens during workspace setup.
+
+Schedule installation requires an owner-only configuration and state database. It rejects `model.api_key_env` because user schedulers do not reliably inherit an interactive shell environment; use an owner-only inline `model.api_key`, or print the definition and install a separately reviewed environment configuration yourself. A Nix store executable is also rejected because garbage collection can invalidate a persistent schedule; pass `--executable` pointing to a stable launcher such as `~/.local/bin/temari`. Uninstall verifies that the timer or agent stopped before removing its owned definition. Uninstall a workspace schedule before removing its registration.
 
 The approval command previews every destination and asks for confirmation when stdin and stderr are terminals. For a proposal that has already been reviewed by an agent or script, make acceptance explicit:
 
@@ -132,7 +140,7 @@ Document containers are parsed in memory without unpacking files. Archive expans
 temari [--config PATH] [--state PATH] [--json] [--no-input] [--no-color] [-v] <COMMAND>
 
 Commands:
-  managed init|apply|list|status|run|apply-run|resume-run|history|rule|undo|undo-setup|resume-setup ...
+  managed init|apply|list|status|enable|disable|edit|remove|reconcile|run|reprocess|schedule|apply-run|resume-run|history|rule|undo|undo-setup|resume-setup ...
   organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...  One-time cleanup
   propose <SOURCE> --out <PROPOSAL> [--include-subtree <PATH>]...
   approve <PROPOSAL> --out <FOLDER_SET>             Validate and approve it
@@ -159,7 +167,7 @@ The workflow follows five explicit trust boundaries:
 4. `apply`: after confirmation, local code creates only required approved directories and performs validated moves while atomically updating an audit journal.
 5. `undo`: local code conservatively reverses recorded moves and removes only unchanged, empty directories created by that apply session.
 
-The managed workflow is the primary product surface. `organize` remains a one-time convenience, and the six primitive commands remain available for agents and recovery. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for artifact persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits, [ADR 0008](docs/adr/0008-use-sqlite-for-monitoring-state.md) for internal monitoring state, [ADR 0009](docs/adr/0009-request-per-run-content-consent.md) for consent, [ADR 0010](docs/adr/0010-load-desktop-config-from-platform-directory.md) for desktop configuration and private credentials, [ADR 0011](docs/adr/0011-apply-backend-held-desktop-plans.md) for confirmed desktop Apply and Undo, [ADR 0012](docs/adr/0012-adopt-managed-three-area-workspaces.md) for protected, staged, and classified areas, and [ADR 0013](docs/adr/0013-make-managed-the-primary-cli.md) for the public CLI boundary.
+The managed workflow is the primary product surface. `organize` remains a one-time convenience, and the six primitive commands remain available for agents and recovery. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for artifact persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits, [ADR 0008](docs/adr/0008-use-sqlite-for-monitoring-state.md) for internal monitoring state, [ADR 0009](docs/adr/0009-request-per-run-content-consent.md) for consent, [ADR 0010](docs/adr/0010-load-desktop-config-from-platform-directory.md) for desktop configuration and private credentials, [ADR 0011](docs/adr/0011-apply-backend-held-desktop-plans.md) for confirmed desktop Apply and Undo, [ADR 0012](docs/adr/0012-adopt-managed-three-area-workspaces.md) for protected, staged, and classified areas, [ADR 0013](docs/adr/0013-make-managed-the-primary-cli.md) for the public CLI boundary, [ADR 0014](docs/adr/0014-schedule-finite-managed-runs.md) for explicit OS scheduling, and [ADR 0015](docs/adr/0015-reprocess-managed-files-through-inbox.md) for protected and classified file reprocessing.
 
 Example schemas are available for a model-created [proposal](examples/proposal.example.json) and a locally approved [folder set](examples/folders.example.json). Their source paths are illustrative and must match the canonical source used by `plan`.
 

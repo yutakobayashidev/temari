@@ -1,32 +1,55 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, IsTerminal},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use serde::Serialize;
 use temari_core::{
-    ApplySession, ApplyState, Config, FolderSet, InboxState, LocalContentExtractor, LocalRule,
-    ManagedRun, ManagedRunKind, ManagedSetupPlan, ManagedSetupSession, ManagedSetupState,
-    ManagedWorkspace, MonitorRecord, MonitoringOptions, OpenAiCompatibleModel, Plan, RuleSet,
-    RunState, StateStore, UndoMoveOutcome, UndoState, apply_managed_setup, apply_monitoring_plan,
-    apply_plan, build_managed_setup_plan, build_stage_to_inbox_plan, canonical_source_identity,
-    filter_inbox_candidates, fingerprint_candidate, inbox_file_candidates, library_folder_set,
-    persist_monitoring_plan, plan_monitor_candidates, resume_managed_setup, root_file_candidates,
-    undo_managed_setup, undo_session, undo_session_files,
+    ApplySession, ApplyState, Config, FolderSet, InboxReconcileSummary, InboxState,
+    LocalContentExtractor, LocalRule, ManagedReprocessArea, ManagedReprocessSelection, ManagedRun,
+    ManagedRunKind, ManagedSetupPlan, ManagedSetupSession, ManagedSetupState, ManagedWorkspace,
+    MonitorRecord, MonitoringOptions, OpenAiCompatibleModel, Plan, RuleSet, RunState, SourceLock,
+    StateStore, UndoMoveOutcome, UndoSession, UndoState, apply_managed_setup,
+    apply_monitoring_plan, apply_plan, build_managed_setup_plan, build_reprocess_to_inbox_plan,
+    build_stage_to_inbox_plan, canonical_source_identity, filter_inbox_candidates,
+    fingerprint_candidate, inbox_file_candidates, library_folder_set, persist_monitoring_plan,
+    plan_monitor_candidates, reprocess_file_candidates, resume_managed_setup, root_file_candidates,
+    undo_managed_setup, undo_session_files_with_lock, undo_session_with_lock,
 };
 
 use crate::{
-    Cli, approval_mode, confirm_mutation, create_run_directory, print_output_result, write_artifact,
+    Cli, approval_mode, confirm_mutation, create_run_directory,
+    managed_schedule::{
+        ScheduleSpec, SchedulerPlatform, install_schedule, render_schedule, schedule_status,
+        uninstall_schedule,
+    },
+    print_output_result, write_artifact,
 };
 
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ReprocessArea {
+    Kept,
+    Library,
+}
+
+impl From<ReprocessArea> for ManagedReprocessArea {
+    fn from(value: ReprocessArea) -> Self {
+        match value {
+            ReprocessArea::Kept => Self::Kept,
+            ReprocessArea::Library => Self::Library,
+        }
+    }
+}
 
 #[derive(Serialize)]
 struct ManagedWorkspaceView<'a> {
@@ -67,6 +90,18 @@ struct ManagedRuleView<'a> {
     destination_id: &'a str,
     priority: i32,
     enabled: bool,
+}
+
+#[derive(Serialize)]
+struct ManagedMoveView {
+    run_id: String,
+    kind: ManagedRunKind,
+    file_id: String,
+    source_path: String,
+    destination_path: String,
+    undone: bool,
+    undo_outcome: Option<UndoMoveOutcome>,
+    finished_unix_ms: Option<i64>,
 }
 
 impl<'a> ManagedRuleView<'a> {
@@ -119,6 +154,26 @@ pub enum ManagedCommand {
         /// Managed workspace ID.
         id: String,
     },
+    /// Enable new managed runs for a workspace.
+    Enable { id: String },
+    /// Disable new managed runs without changing files or recovery artifacts.
+    Disable { id: String },
+    /// Change Inbox retention and stability windows.
+    Edit {
+        id: String,
+        #[arg(long)]
+        retention_seconds: Option<u64>,
+        #[arg(long)]
+        settle_seconds: Option<u64>,
+    },
+    /// Remove only the workspace registration and mutable indexes.
+    Remove {
+        id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Reconcile the Inbox filesystem with its mutable SQLite index.
+    Reconcile { id: String },
     /// Configure deterministic local routing rules for managed workspaces.
     Rule {
         #[command(subcommand)]
@@ -128,15 +183,43 @@ pub enum ManagedCommand {
     Run {
         /// Managed workspace ID.
         id: String,
-        /// New directory for cycle artifacts and journals.
+        /// New directory for cycle artifacts and journals. Defaults below the state directory.
         #[arg(long)]
-        out: PathBuf,
+        out: Option<PathBuf>,
         /// Apply each generated plan after writing it.
         #[arg(long)]
         apply: bool,
         /// Confirm filesystem mutations without prompting.
         #[arg(long)]
         yes: bool,
+    },
+    /// Move selected protected or classified files back through Inbox.
+    Reprocess {
+        /// Managed workspace ID.
+        id: String,
+        /// Managed area containing the selected paths.
+        #[arg(long, value_enum)]
+        from: ReprocessArea,
+        /// Area-relative file or directory to include; repeat for multiple paths.
+        #[arg(long = "path", conflicts_with = "all")]
+        paths: Vec<String>,
+        /// Reprocess every file in Library. Not allowed for Kept.
+        #[arg(long, conflicts_with = "paths")]
+        all: bool,
+        /// New directory for the reviewed Plan and optional Apply journal.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Apply the generated Plan after writing it.
+        #[arg(long)]
+        apply: bool,
+        /// Confirm filesystem mutation without prompting.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Configure explicit per-user scheduling for finite managed runs.
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
     },
     /// Apply one previously reviewed managed run.
     ApplyRun {
@@ -169,7 +252,7 @@ pub enum ManagedCommand {
         /// New directory for the Undo journal.
         #[arg(long)]
         out: PathBuf,
-        /// Original source-relative file to undo; repeat for multiple files.
+        /// File ID or original source-relative path to undo; repeat for multiple files.
         #[arg(long = "file")]
         files: Vec<String>,
         /// Confirm the filesystem mutation without prompting.
@@ -241,6 +324,48 @@ pub enum RuleCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum ScheduleCommand {
+    /// Print the platform scheduler definition without installing it.
+    Print {
+        workspace_id: String,
+        /// Stable executable path used by the scheduler.
+        #[arg(long)]
+        executable: Option<PathBuf>,
+        #[arg(long, default_value_t = 300)]
+        every_seconds: u32,
+        #[arg(long, value_enum, default_value_t)]
+        platform: SchedulerPlatform,
+    },
+    /// Install and start the per-user scheduler definition.
+    Install {
+        workspace_id: String,
+        /// Stable executable path used by the scheduler.
+        #[arg(long)]
+        executable: Option<PathBuf>,
+        #[arg(long, default_value_t = 300)]
+        every_seconds: u32,
+        #[arg(long, value_enum, default_value_t)]
+        platform: SchedulerPlatform,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show whether the workspace scheduler is installed and active.
+    Status {
+        workspace_id: String,
+        #[arg(long, value_enum, default_value_t)]
+        platform: SchedulerPlatform,
+    },
+    /// Stop and remove only this workspace's scheduler definition.
+    Uninstall {
+        workspace_id: String,
+        #[arg(long, value_enum, default_value_t)]
+        platform: SchedulerPlatform,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 pub fn run_managed(cli: &Cli, command: &ManagedCommand) -> Result<()> {
     match command {
         ManagedCommand::Init { source, out } => init(cli, source, out),
@@ -262,13 +387,32 @@ pub fn run_managed(cli: &Cli, command: &ManagedCommand) -> Result<()> {
         ),
         ManagedCommand::List => list(cli),
         ManagedCommand::Status { id } => status(cli, id),
+        ManagedCommand::Enable { id } => set_workspace_enabled(cli, id, true),
+        ManagedCommand::Disable { id } => set_workspace_enabled(cli, id, false),
+        ManagedCommand::Edit {
+            id,
+            retention_seconds,
+            settle_seconds,
+        } => edit_workspace(cli, id, *retention_seconds, *settle_seconds),
+        ManagedCommand::Remove { id, yes } => remove_workspace(cli, id, *yes),
+        ManagedCommand::Reconcile { id } => reconcile_workspace(cli, id),
         ManagedCommand::Rule { command } => run_rule(cli, command),
         ManagedCommand::Run {
             id,
             out,
             apply,
             yes,
-        } => run_cycle(cli, id, out, *apply, *yes),
+        } => run_cycle(cli, id, out.as_deref(), *apply, *yes),
+        ManagedCommand::Reprocess {
+            id,
+            from,
+            paths,
+            all,
+            out,
+            apply,
+            yes,
+        } => reprocess(cli, id, *from, paths, *all, out.as_deref(), *apply, *yes),
+        ManagedCommand::Schedule { command } => run_schedule(cli, command),
         ManagedCommand::ApplyRun { run_id, yes } => apply_saved_run(cli, run_id, *yes),
         ManagedCommand::ResumeRun { run_id, yes } => resume_run(cli, run_id, *yes),
         ManagedCommand::History { id, limit } => history(cli, id, *limit),
@@ -304,6 +448,110 @@ fn run_rule(cli: &Cli, command: &RuleCommand) -> Result<()> {
         RuleCommand::Disable { rule_id } => set_rule_enabled(cli, rule_id, false),
         RuleCommand::Remove { rule_id, yes } => remove_rule(cli, rule_id, *yes),
     }
+}
+
+fn run_schedule(cli: &Cli, command: &ScheduleCommand) -> Result<()> {
+    match command {
+        ScheduleCommand::Print {
+            workspace_id,
+            executable,
+            every_seconds,
+            platform,
+        } => {
+            let spec = schedule_spec(
+                cli,
+                workspace_id,
+                executable.as_deref(),
+                *every_seconds,
+                false,
+            )?;
+            let definitions = render_schedule(&spec, *platform)?;
+            if cli.json {
+                print_json(&definitions)
+            } else {
+                for definition in definitions {
+                    println!("# {}", definition.path.display());
+                    print!("{}", definition.contents);
+                }
+                Ok(())
+            }
+        }
+        ScheduleCommand::Install {
+            workspace_id,
+            executable,
+            every_seconds,
+            platform,
+            yes,
+        } => {
+            let spec = schedule_spec(
+                cli,
+                workspace_id,
+                executable.as_deref(),
+                *every_seconds,
+                true,
+            )?;
+            let resolved_platform = platform.resolve()?;
+            let prompt = format!(
+                "Install a {resolved_platform:?} user schedule every {} seconds for {}? [y/N] ",
+                spec.interval_seconds(),
+                spec.source().display()
+            );
+            confirm(cli, *yes, &prompt)?;
+            let status = install_schedule(&spec, *platform)?;
+            print_value(cli, &status, "installed")
+        }
+        ScheduleCommand::Status {
+            workspace_id,
+            platform,
+        } => {
+            let status = schedule_status(workspace_id, *platform)?;
+            print_value(
+                cli,
+                &status,
+                if status.active { "active" } else { "inactive" },
+            )
+        }
+        ScheduleCommand::Uninstall {
+            workspace_id,
+            platform,
+            yes,
+        } => {
+            confirm(cli, *yes, "Stop and remove this user schedule? [y/N] ")?;
+            let status = uninstall_schedule(workspace_id, *platform)?;
+            print_value(cli, &status, "uninstalled")
+        }
+    }
+}
+
+fn schedule_spec(
+    cli: &Cli,
+    workspace_id: &str,
+    executable: Option<&Path>,
+    every_seconds: u32,
+    reject_environment_key: bool,
+) -> Result<ScheduleSpec> {
+    let context = ManagedContext::new(cli)?;
+    let store = context.store()?;
+    let workspace = require_workspace(&store, workspace_id)?;
+    validate_workspace(&context, &store, &workspace)?;
+    let config = Config::load(&cli.config)
+        .with_context(|| format!("failed to load {}", cli.config.display()))?;
+    if reject_environment_key && config.model.api_key_env.is_some() {
+        bail!(
+            "scheduled runs cannot inherit model.api_key_env reliably; use an owner-only config with model.api_key or install the schedule manually with an explicit environment"
+        );
+    }
+    let executable = executable
+        .map(Path::to_path_buf)
+        .unwrap_or(std::env::current_exe()?);
+    ScheduleSpec::new(
+        workspace_id,
+        &executable,
+        &cli.config,
+        &context.state,
+        Path::new(&workspace.source),
+        every_seconds,
+    )
 }
 
 fn init(cli: &Cli, source: &Path, out: &Path) -> Result<()> {
@@ -472,29 +720,150 @@ fn list(cli: &Cli) -> Result<()> {
 }
 
 fn status(cli: &Cli, id: &str) -> Result<()> {
-    let store = ManagedContext::new(cli)?.store()?;
+    let context = ManagedContext::new(cli)?;
+    let store = context.store()?;
     let workspace = require_workspace(&store, id)?;
     let inbox = store.inbox_items(id)?;
     let runs = store.managed_runs(id)?;
-    if cli.json {
-        print_json(&serde_json::json!({
-            "workspace": ManagedWorkspaceView::from(&workspace),
-            "inbox": inbox,
-            "runs": runs,
-        }))
+    let now = unix_ms()?;
+    let mut issues = Vec::new();
+    if let Err(error) = validate_workspace_binding(&context, &store, &workspace) {
+        issues.push(error.to_string());
+    }
+    let physical_inbox_files = match inbox_file_candidates(Path::new(&workspace.source)) {
+        Ok(files) => files.len(),
+        Err(error) => {
+            issues.push(format!("Inbox scan failed: {error}"));
+            0
+        }
+    };
+    let count_state = |state| inbox.iter().filter(|item| item.state == state).count();
+    let eligible_now = inbox
+        .iter()
+        .filter(|item| item.state == InboxState::Pending && item.eligible_unix_ms <= now)
+        .count();
+    let next_eligible_unix_ms = inbox
+        .iter()
+        .filter(|item| item.state == InboxState::Pending && item.eligible_unix_ms > now)
+        .map(|item| item.eligible_unix_ms)
+        .min();
+    let actionable_runs = runs
+        .iter()
+        .filter(|run| {
+            matches!(
+                run.state,
+                RunState::Planned | RunState::Applying | RunState::NeedsResume | RunState::Failed
+            )
+        })
+        .collect::<Vec<_>>();
+    if !actionable_runs.is_empty() {
+        issues.push(format!("{} run(s) need attention", actionable_runs.len()));
+    }
+    let health = if !issues.is_empty() {
+        "attention"
+    } else if !workspace.enabled {
+        "disabled"
     } else {
+        "healthy"
+    };
+    let value = serde_json::json!({
+        "health": health,
+        "issues": issues,
+        "workspace": ManagedWorkspaceView::from(&workspace),
+        "inbox": {
+            "physical_files": physical_inbox_files,
+            "indexed_pending": count_state(InboxState::Pending),
+            "indexed_planned": count_state(InboxState::Planned),
+            "indexed_moved": count_state(InboxState::Moved),
+            "eligible_now": eligible_now,
+            "next_eligible_unix_ms": next_eligible_unix_ms,
+        },
+        "runs": {
+            "total": runs.len(),
+            "actionable": actionable_runs,
+        },
+    });
+    if cli.json {
+        print_json(&value)
+    } else {
+        println!("Health: {health}");
         println!("Workspace: {}", workspace.id);
         println!("Source: {}", workspace.source);
-        println!("Inbox items: {}", inbox.len());
-        println!("Runs: {}", runs.len());
-        for item in inbox {
-            println!(
-                "  {:?}\t{}\teligible {}",
-                item.state, item.relative_path, item.eligible_unix_ms
-            );
+        println!(
+            "Inbox: {physical_inbox_files} files, {} pending, {} planned, {} eligible now",
+            count_state(InboxState::Pending),
+            count_state(InboxState::Planned),
+            eligible_now
+        );
+        if let Some(next) = next_eligible_unix_ms {
+            println!("Next eligible: {next}");
+        }
+        for issue in value["issues"].as_array().into_iter().flatten() {
+            println!("Attention: {}", issue.as_str().unwrap_or("unknown issue"));
         }
         Ok(())
     }
+}
+
+fn set_workspace_enabled(cli: &Cli, id: &str, enabled: bool) -> Result<()> {
+    let context = ManagedContext::new(cli)?;
+    let mut store = context.store()?;
+    let workspace = require_workspace(&store, id)?;
+    if enabled {
+        validate_workspace_binding(&context, &store, &workspace)?;
+    }
+    let workspace = store.set_managed_workspace_enabled(id, enabled, unix_ms()?)?;
+    print_value(
+        cli,
+        &ManagedWorkspaceView::from(&workspace),
+        if enabled { "enabled" } else { "disabled" },
+    )
+}
+
+fn edit_workspace(
+    cli: &Cli,
+    id: &str,
+    retention_seconds: Option<u64>,
+    settle_seconds: Option<u64>,
+) -> Result<()> {
+    if retention_seconds.is_none() && settle_seconds.is_none() {
+        bail!("managed edit requires --retention-seconds or --settle-seconds");
+    }
+    let context = ManagedContext::new(cli)?;
+    let mut store = context.store()?;
+    let current = require_workspace(&store, id)?;
+    let retention = retention_seconds.unwrap_or(current.retention_seconds);
+    let settle = settle_seconds.unwrap_or(current.settle_seconds);
+    validate_activation_durations(retention, settle)?;
+    let workspace = store.update_managed_workspace_windows(id, retention, settle, unix_ms()?)?;
+    print_value(cli, &ManagedWorkspaceView::from(&workspace), &workspace.id)
+}
+
+fn remove_workspace(cli: &Cli, id: &str, yes: bool) -> Result<()> {
+    confirm(
+        cli,
+        yes,
+        "Remove this workspace registration and mutable indexes? Files and JSON artifacts remain. [y/N] ",
+    )?;
+    let context = ManagedContext::new(cli)?;
+    let mut store = context.store()?;
+    let workspace = require_workspace(&store, id)?;
+    let _lock = temari_core::SourceLock::acquire(Path::new(&workspace.source))?;
+    store.remove_managed_workspace_registration(id, unix_ms()?)?;
+    print_value(
+        cli,
+        &serde_json::json!({ "id": id, "state": "removed" }),
+        "removed",
+    )
+}
+
+fn reconcile_workspace(cli: &Cli, id: &str) -> Result<()> {
+    let context = ManagedContext::new(cli)?;
+    let mut store = context.store()?;
+    let workspace = require_workspace(&store, id)?;
+    validate_workspace_binding(&context, &store, &workspace)?;
+    let summary = reconcile_inbox(&mut store, &workspace, unix_ms()?)?;
+    print_value(cli, &summary, "reconciled")
 }
 
 fn add_rule(
@@ -623,7 +992,7 @@ fn managed_rule_folders(store: &StateStore, workspace: &ManagedWorkspace) -> Res
     Ok(folders)
 }
 
-fn run_cycle(cli: &Cli, id: &str, out: &Path, apply: bool, yes: bool) -> Result<()> {
+fn run_cycle(cli: &Cli, id: &str, out: Option<&Path>, apply: bool, yes: bool) -> Result<()> {
     if apply != yes {
         bail!("--apply and --yes must be supplied together");
     }
@@ -632,8 +1001,7 @@ fn run_cycle(cli: &Cli, id: &str, out: &Path, apply: bool, yes: bool) -> Result<
     let workspace = require_workspace(&store, id)?;
     validate_workspace(&context, &store, &workspace)?;
     let source = Path::new(&workspace.source);
-    create_run_directory(out, source)?;
-    let out = fs::canonicalize(out)?;
+    let out = prepare_managed_run_directory(&context, &workspace, out, "cycle")?;
 
     let mut results = Vec::new();
     let root_candidates = root_file_candidates(source)?;
@@ -660,8 +1028,12 @@ fn run_cycle(cli: &Cli, id: &str, out: &Path, apply: bool, yes: bool) -> Result<
     )?);
 
     if cli.json {
-        print_json(&results)
+        print_json(&serde_json::json!({
+            "artifact_directory": out,
+            "runs": results,
+        }))
     } else {
+        println!("Artifacts: {}", out.display());
         for result in results {
             println!(
                 "{}\t{:?}\t{:?}\t{} moves{}",
@@ -678,6 +1050,57 @@ fn run_cycle(cli: &Cli, id: &str, out: &Path, apply: bool, yes: bool) -> Result<
         }
         Ok(())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reprocess(
+    cli: &Cli,
+    id: &str,
+    from: ReprocessArea,
+    paths: &[String],
+    all: bool,
+    out: Option<&Path>,
+    apply: bool,
+    yes: bool,
+) -> Result<()> {
+    if apply != yes {
+        bail!("--apply and --yes must be supplied together");
+    }
+    let selection = if all {
+        ManagedReprocessSelection::All
+    } else if paths.is_empty() {
+        bail!("reprocess requires at least one --path or --all");
+    } else {
+        ManagedReprocessSelection::Paths(paths.to_vec())
+    };
+    let area = ManagedReprocessArea::from(from);
+    let context = ManagedContext::new(cli)?;
+    let mut store = context.store()?;
+    let workspace = require_workspace(&store, id)?;
+    validate_workspace(&context, &store, &workspace)?;
+    let source = Path::new(&workspace.source);
+    let candidates = reprocess_file_candidates(source, area, &selection)?;
+    if candidates.is_empty() {
+        bail!("the selected managed area contains no regular files");
+    }
+    let out = prepare_managed_run_directory(&context, &workspace, out, "reprocess")?;
+    let plan = build_reprocess_to_inbox_plan(source, area, &candidates)?;
+    let plan_path = out.join("reprocess-plan.json");
+    write_artifact(&plan_path, &plan)?;
+    let id = new_id("managed-reprocess")?;
+    let mut run = planned_run(&id, &workspace.id, ManagedRunKind::Stage, &plan_path, &plan)?;
+    store.insert_managed_run(&run)?;
+    if apply {
+        apply_indexed_run(&mut store, &workspace, &mut run)?;
+    }
+    print_value(
+        cli,
+        &serde_json::json!({
+            "artifact_directory": out,
+            "run": run,
+        }),
+        &run.id,
+    )
 }
 
 fn run_stage(
@@ -806,32 +1229,36 @@ fn resume_run(cli: &Cli, run_id: &str, yes: bool) -> Result<()> {
     let mut run = store
         .managed_run(run_id)?
         .ok_or_else(|| anyhow::anyhow!("unknown managed run {run_id:?}"))?;
-    if run.state != RunState::NeedsResume {
+    if !matches!(run.state, RunState::Applying | RunState::NeedsResume) {
         bail!("managed run {run_id:?} does not need resume");
     }
     let workspace = require_workspace(&store, &run.workspace_id)?;
-    validate_workspace(&context, &store, &workspace)?;
+    validate_workspace_binding(&context, &store, &workspace)?;
     let apply_path = run
         .apply_path
         .clone()
         .ok_or_else(|| anyhow::anyhow!("managed run has no Apply session"))?;
     let current = ApplySession::load(Path::new(&apply_path))?;
-    if current.state != ApplyState::Running {
-        bail!(
-            "managed Apply session is not running; found {:?}",
-            current.state
-        );
-    }
-    let session = match temari_core::resume_apply_session(Path::new(&apply_path)) {
-        Ok(session) => session,
-        Err(error) => {
-            finalize_apply_error(
-                &mut store,
-                &mut run,
-                Path::new(&apply_path),
-                &error.to_string(),
-            )?;
-            return Err(error.into());
+    let session = match current.state {
+        ApplyState::Running => match temari_core::resume_apply_session(Path::new(&apply_path)) {
+            Ok(session) => session,
+            Err(error) => {
+                finalize_apply_error(
+                    &mut store,
+                    &mut run,
+                    Path::new(&apply_path),
+                    &error.to_string(),
+                )?;
+                return Err(error.into());
+            }
+        },
+        ApplyState::Completed => current,
+        state => {
+            run.state = RunState::Failed;
+            run.finished_unix_ms = Some(unix_ms()?);
+            run.error = Some(format!("apply session finished with {state:?}"));
+            store.update_managed_run(&run)?;
+            bail!("managed Apply session is not resumable; found {state:?}");
         }
     };
     let plan_path = run
@@ -843,17 +1270,8 @@ fn resume_run(cli: &Cli, run_id: &str, yes: bool) -> Result<()> {
         store.reconcile_applying_runs(Some(&workspace.monitor_id), unix_ms()?)?;
     }
     if session.state == ApplyState::Completed {
-        run.state = RunState::Completed;
-        run.finished_unix_ms = Some(unix_ms()?);
-        run.error = None;
-        store.update_managed_run(&run)?;
-        match run.kind {
-            ManagedRunKind::Stage => observe_inbox(&mut store, &workspace, unix_ms()?)?,
-            ManagedRunKind::Classify => {
-                mark_inbox_entries(&mut store, &workspace, &plan, InboxState::Moved, &run.id)?
-            }
-            ManagedRunKind::Setup => bail!("setup runs use managed resume-setup"),
-        }
+        mark_apply_finalization_pending(&mut store, &mut run)?;
+        finalize_completed_apply(&mut store, &workspace, &mut run, &plan)?;
     } else {
         run.state = if session.state == ApplyState::Running {
             RunState::NeedsResume
@@ -912,59 +1330,152 @@ fn apply_indexed_run(
         store.update_managed_run(run)?;
         bail!("managed apply finished with {:?}", session.state);
     }
+    mark_apply_finalization_pending(store, run)?;
+    finalize_completed_apply(store, workspace, run, &plan)
+}
+
+fn mark_apply_finalization_pending(store: &mut StateStore, run: &mut ManagedRun) -> Result<()> {
+    run.state = RunState::NeedsResume;
+    run.finished_unix_ms = Some(unix_ms()?);
+    run.error = Some("apply completed; state finalization is pending".into());
+    store.update_managed_run(run)?;
+    Ok(())
+}
+
+fn finalize_completed_apply(
+    store: &mut StateStore,
+    workspace: &ManagedWorkspace,
+    run: &mut ManagedRun,
+    plan: &Plan,
+) -> Result<()> {
+    match run.kind {
+        ManagedRunKind::Stage => complete_stage_index(store, workspace, plan, unix_ms()?)?,
+        ManagedRunKind::Classify => {
+            mark_inbox_entries(store, workspace, plan, InboxState::Moved, &run.id)?
+        }
+        ManagedRunKind::Setup => bail!("setup runs use managed resume-setup"),
+    }
     run.state = RunState::Completed;
     run.finished_unix_ms = Some(unix_ms()?);
+    run.error = None;
     store.update_managed_run(run)?;
-    match run.kind {
-        ManagedRunKind::Stage => observe_inbox(store, workspace, unix_ms()?)?,
-        ManagedRunKind::Classify => {
-            mark_inbox_entries(store, workspace, &plan, InboxState::Moved, &run.id)?
-        }
-        ManagedRunKind::Setup => unreachable!(),
-    }
     Ok(())
+}
+
+fn complete_stage_index(
+    store: &mut StateStore,
+    workspace: &ManagedWorkspace,
+    plan: &Plan,
+    observed_unix_ms: i64,
+) -> Result<()> {
+    for entry in &plan.entries {
+        store.forget_processed_file(
+            &workspace.monitor_id,
+            entry.source_fingerprint.identity.clone(),
+        )?;
+    }
+    observe_inbox(store, workspace, observed_unix_ms)
 }
 
 fn history(cli: &Cli, id: &str, limit: u32) -> Result<()> {
     let store = ManagedContext::new(cli)?.store()?;
     require_workspace(&store, id)?;
-    let runs = store.recent_managed_moves(id, limit)?;
+    let moves = managed_move_history(&store, id, limit)?;
     if cli.json {
-        print_json(&runs)
+        print_json(&moves)
     } else {
-        for run in runs {
+        for movement in moves {
             println!(
-                "{}\t{:?}\t{:?}\t{} moves\t{}",
-                run.id, run.kind, run.state, run.move_count, run.started_unix_ms
+                "{}\t{:?}\t{}\t{}\t{} -> {}",
+                movement.run_id,
+                movement.kind,
+                if movement.undone { "undone" } else { "active" },
+                movement.file_id,
+                movement.source_path,
+                movement.destination_path,
             );
         }
         Ok(())
     }
 }
 
+fn managed_move_history(
+    store: &StateStore,
+    workspace_id: &str,
+    limit: u32,
+) -> Result<Vec<ManagedMoveView>> {
+    let runs = store.recent_managed_moves(workspace_id, limit)?;
+    let mut moves = Vec::new();
+    for run in runs {
+        let apply_path = run
+            .apply_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("managed run {:?} has no Apply session", run.id))?;
+        let apply = ApplySession::load(Path::new(apply_path))?;
+        let mut undo_paths = store.managed_undo_journal_paths(&run.id)?;
+        if let Some(path) = run.undo_path.as_ref()
+            && !undo_paths.contains(path)
+        {
+            undo_paths.push(path.clone());
+        }
+        let mut undo_outcomes = HashMap::new();
+        for path in undo_paths {
+            for movement in UndoSession::load(Path::new(&path))?.moves {
+                undo_outcomes.insert(movement.file_id, movement.outcome);
+            }
+        }
+        for movement in apply.moves {
+            let undo_outcome = undo_outcomes.get(&movement.file_id).cloned();
+            let undone = matches!(
+                undo_outcome,
+                Some(UndoMoveOutcome::Restored | UndoMoveOutcome::AlreadyRestored)
+            );
+            moves.push(ManagedMoveView {
+                run_id: run.id.clone(),
+                kind: run.kind,
+                file_id: movement.file_id,
+                source_path: movement.source_path,
+                destination_path: movement.destination_path,
+                undone,
+                undo_outcome,
+                finished_unix_ms: run.finished_unix_ms,
+            });
+            if moves.len() == limit as usize {
+                return Ok(moves);
+            }
+        }
+    }
+    Ok(moves)
+}
+
 fn undo_run(cli: &Cli, run_id: &str, out: &Path, files: &[String], yes: bool) -> Result<()> {
     confirm(cli, yes, "Undo this managed run? [y/N] ")?;
+    let out = resolved_target(out)?;
     let context = ManagedContext::new(cli)?;
     let mut store = context.store()?;
-    let mut run = store
+    let run = store
         .managed_run(run_id)?
         .ok_or_else(|| anyhow::anyhow!("unknown managed run {run_id:?}"))?;
     if run.state != RunState::Completed {
         bail!("managed run must be completed before Undo");
+    }
+    if run.kind == ManagedRunKind::Setup {
+        bail!("managed setup runs must be undone with managed undo-setup");
     }
     let apply_path = run
         .apply_path
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("managed run has no Apply session"))?;
     let apply = ApplySession::load(Path::new(apply_path))?;
-    let undo = if files.is_empty() {
-        undo_session(&apply, out)?
+    let selected_file_ids = resolve_undo_file_ids(&apply, files)?;
+    let workspace = require_workspace(&store, &run.workspace_id)?;
+    let lock = SourceLock::acquire(Path::new(&workspace.source))?;
+    let undo = if selected_file_ids.is_empty() {
+        undo_session_with_lock(&apply, &out, &lock)?
     } else {
-        undo_session_files(&apply, files, out)?
+        undo_session_files_with_lock(&apply, &selected_file_ids, &out, &lock)?
     };
-    run.undo_path = Some(path_text(out, "managed Undo session")?);
-    store.update_managed_run(&run)?;
-
+    let undo_path = path_text(&out, "managed Undo session")?;
     let restored = undo
         .moves
         .iter()
@@ -976,45 +1487,13 @@ fn undo_run(cli: &Cli, run_id: &str, out: &Path, files: &[String], yes: bool) ->
         })
         .map(|movement| movement.file_id.as_str())
         .collect::<HashSet<_>>();
-    let classify_monitor_id = if run.kind == ManagedRunKind::Classify {
-        Some(require_workspace(&store, &run.workspace_id)?.monitor_id)
-    } else {
-        None
-    };
-    for movement in apply
+    let restored_identities = apply
         .moves
         .iter()
         .filter(|movement| restored.contains(movement.file_id.as_str()))
-    {
-        match run.kind {
-            ManagedRunKind::Stage => {
-                if store
-                    .inbox_item(&run.workspace_id, movement.fingerprint.identity.clone())?
-                    .is_some()
-                {
-                    store.delete_inbox_item(
-                        &run.workspace_id,
-                        movement.fingerprint.identity.clone(),
-                    )?;
-                }
-            }
-            ManagedRunKind::Classify => {
-                store.set_inbox_item_state(
-                    &run.workspace_id,
-                    movement.fingerprint.identity.clone(),
-                    InboxState::Pending,
-                    None,
-                )?;
-                store.forget_processed_file(
-                    classify_monitor_id
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("classify run has no monitor ID"))?,
-                    movement.fingerprint.identity.clone(),
-                )?;
-            }
-            ManagedRunKind::Setup => {}
-        }
-    }
+        .map(|movement| movement.fingerprint.identity.clone())
+        .collect::<Vec<_>>();
+    store.finalize_managed_undo(&run.id, &undo_path, &restored_identities, unix_ms()?)?;
     if undo.state != UndoState::Completed {
         bail!(
             "managed Undo finished with {:?}; inspect {}",
@@ -1022,7 +1501,36 @@ fn undo_run(cli: &Cli, run_id: &str, out: &Path, files: &[String], yes: bool) ->
             out.display()
         );
     }
-    print_output_result(cli, out)
+    print_output_result(cli, &out)
+}
+
+fn resolve_undo_file_ids(apply: &ApplySession, selectors: &[String]) -> Result<Vec<String>> {
+    let mut resolved = Vec::with_capacity(selectors.len());
+    let mut seen = HashSet::new();
+    for selector in selectors {
+        let matches = apply
+            .moves
+            .iter()
+            .filter(|movement| movement.file_id == *selector || movement.source_path == *selector)
+            .collect::<Vec<_>>();
+        let movement = match matches.as_slice() {
+            [] => bail!(
+                "managed Undo selector {selector:?} is neither a file ID nor an original source path"
+            ),
+            [movement] => movement,
+            _ => bail!(
+                "managed Undo selector {selector:?} is ambiguous; use the file ID shown by managed history"
+            ),
+        };
+        if !seen.insert(movement.file_id.as_str()) {
+            bail!(
+                "managed Undo selects file {:?} more than once",
+                movement.file_id
+            );
+        }
+        resolved.push(movement.file_id.clone());
+    }
+    Ok(resolved)
 }
 
 fn undo_setup(cli: &Cli, session: &Path, out: &Path, yes: bool) -> Result<()> {
@@ -1054,11 +1562,35 @@ fn resume_setup(cli: &Cli, session: &Path, yes: bool) -> Result<()> {
 }
 
 fn observe_inbox(store: &mut StateStore, workspace: &ManagedWorkspace, now: i64) -> Result<()> {
+    reconcile_inbox(store, workspace, now)?;
+    Ok(())
+}
+
+fn reconcile_inbox(
+    store: &mut StateStore,
+    workspace: &ManagedWorkspace,
+    now: i64,
+) -> Result<InboxReconcileSummary> {
+    let previously_moved = store
+        .inbox_items(&workspace.id)?
+        .into_iter()
+        .filter(|item| item.state == InboxState::Moved)
+        .map(|item| (item.file_identity.device, item.file_identity.inode))
+        .collect::<HashSet<_>>();
+    let mut observed = Vec::new();
     for candidate in inbox_file_candidates(Path::new(&workspace.source))? {
         let fingerprint = fingerprint_candidate(Path::new(&workspace.source), &candidate)?;
+        observed.push(fingerprint.identity.clone());
         store.upsert_observation(&workspace.id, &fingerprint, &candidate.source_path, now)?;
     }
-    Ok(())
+    let summary = store.reconcile_inbox_index(&workspace.id, &observed)?;
+    for identity in observed
+        .into_iter()
+        .filter(|identity| previously_moved.contains(&(identity.device, identity.inode)))
+    {
+        store.forget_processed_file(&workspace.monitor_id, identity)?;
+    }
+    Ok(summary)
 }
 
 fn mark_inbox_entries(
@@ -1120,6 +1652,14 @@ fn validate_workspace(
     if !workspace.enabled {
         bail!("managed workspace is disabled");
     }
+    validate_workspace_binding(context, store, workspace)
+}
+
+fn validate_workspace_binding(
+    context: &ManagedContext,
+    store: &StateStore,
+    workspace: &ManagedWorkspace,
+) -> Result<()> {
     let (source, identity) = canonical_source_identity(Path::new(&workspace.source))?;
     if source != Path::new(&workspace.source) || identity != workspace.source_identity {
         bail!("managed workspace source identity changed");
@@ -1136,8 +1676,17 @@ fn validate_workspace(
     if monitor.source != workspace.source
         || monitor.source_identity != workspace.source_identity
         || monitor.folder_set_sha256 != workspace.folder_set_sha256
+        || monitor.enabled != workspace.enabled
     {
         bail!("managed monitor no longer matches its workspace");
+    }
+    for area in ["Kept", "Inbox", "Library"] {
+        let path = source.join(area);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to inspect managed area {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("managed area is not a real directory: {}", path.display());
+        }
     }
     Ok(())
 }
@@ -1209,7 +1758,7 @@ fn deactivate_undone_setup(cli: &Cli, session: &Path) -> Result<()> {
         .with_context(|| format!("failed to resolve {}", session.display()))?;
     let context = ManagedContext::new(cli)?;
     let mut store = context.store()?;
-    let Some(mut workspace) = store.managed_workspaces()?.into_iter().find(|workspace| {
+    let Some(workspace) = store.managed_workspaces()?.into_iter().find(|workspace| {
         workspace
             .setup_session_path
             .as_deref()
@@ -1217,10 +1766,7 @@ fn deactivate_undone_setup(cli: &Cli, session: &Path) -> Result<()> {
     }) else {
         return Ok(());
     };
-    store.set_monitor_enabled(&workspace.monitor_id, false, unix_ms()?)?;
-    workspace.enabled = false;
-    workspace.updated_unix_ms = unix_ms()?;
-    store.update_managed_workspace(&workspace)?;
+    store.set_managed_workspace_enabled(&workspace.id, false, unix_ms()?)?;
     Ok(())
 }
 
@@ -1252,6 +1798,68 @@ impl ManagedContext {
         StateStore::open(&self.state)
             .with_context(|| format!("failed to open managed state {}", self.state.display()))
     }
+
+    fn automatic_run_path(&self, workspace_id: &str, kind: &str) -> Result<PathBuf> {
+        let state_parent = self
+            .state
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("managed state database has no parent directory"))?;
+        let root = state_parent.join("managed-runs");
+        ensure_private_real_directory(&root)?;
+        let workspace_root = root.join(workspace_id);
+        ensure_private_real_directory(&workspace_root)?;
+        Ok(workspace_root.join(new_id(kind)?))
+    }
+}
+
+fn prepare_managed_run_directory(
+    context: &ManagedContext,
+    workspace: &ManagedWorkspace,
+    requested: Option<&Path>,
+    kind: &str,
+) -> Result<PathBuf> {
+    let path = match requested {
+        Some(path) => path.to_path_buf(),
+        None => context.automatic_run_path(&workspace.id, kind)?,
+    };
+    create_run_directory(&path, Path::new(&workspace.source))?;
+    Ok(fs::canonicalize(path)?)
+}
+
+fn ensure_private_real_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!(
+                "managed artifact parent is not a real directory: {}",
+                path.display()
+            )
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(path).with_context(|| {
+                format!(
+                    "failed to create managed artifact directory {}",
+                    path.display()
+                )
+            })?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect managed artifact directory {}",
+                    path.display()
+                )
+            });
+        }
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    if fs::canonicalize(path)? != path {
+        bail!(
+            "managed artifact directory must not resolve through a symlink: {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn confirm(cli: &Cli, yes: bool, prompt: &str) -> Result<()> {
@@ -1460,6 +2068,93 @@ mod tests {
     }
 
     #[test]
+    fn parses_managed_lifecycle_reprocess_and_schedule_commands() {
+        let cli = Cli::try_parse_from([
+            "temari",
+            "managed",
+            "reprocess",
+            "workspace-1",
+            "--from",
+            "library",
+            "--all",
+            "--apply",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            crate::Command::Managed(ManagedCommand::Reprocess {
+                from: ReprocessArea::Library,
+                all: true,
+                out: None,
+                ..
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "temari",
+            "managed",
+            "schedule",
+            "print",
+            "workspace-1",
+            "--platform",
+            "systemd",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            crate::Command::Managed(ManagedCommand::Schedule {
+                command: ScheduleCommand::Print {
+                    every_seconds: 300,
+                    platform: SchedulerPlatform::Systemd,
+                    ..
+                }
+            })
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "temari",
+                "managed",
+                "reprocess",
+                "workspace-1",
+                "--from",
+                "kept",
+                "--all",
+                "--path",
+                "Projects",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn undo_selectors_accept_file_ids_or_source_paths_and_reject_ambiguity() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("a.txt"), b"a").unwrap();
+        fs::write(source.join("b.txt"), b"b").unwrap();
+        fs::write(source.join("f000001"), b"ambiguous").unwrap();
+        fs::create_dir(source.join("Inbox")).unwrap();
+        let plan =
+            build_stage_to_inbox_plan(&source, &root_file_candidates(&source).unwrap()).unwrap();
+        let apply = apply_plan(&plan, &root.path().join("apply.json")).unwrap();
+
+        assert_eq!(
+            resolve_undo_file_ids(&apply, &["b.txt".into()]).unwrap(),
+            ["f000002"]
+        );
+        assert_eq!(
+            resolve_undo_file_ids(&apply, &["f000002".into()]).unwrap(),
+            ["f000002"]
+        );
+        assert!(resolve_undo_file_ids(&apply, &["b.txt".into(), "f000002".into()]).is_err());
+        assert!(resolve_undo_file_ids(&apply, &["missing.txt".into()]).is_err());
+        assert!(resolve_undo_file_ids(&apply, &["f000001".into()]).is_err());
+    }
+
+    #[test]
     fn activates_stages_and_undoes_a_managed_workspace() {
         let root = tempdir().unwrap();
         let source = root.path().join("source");
@@ -1518,6 +2213,18 @@ mod tests {
 
         let store = StateStore::open(&state_path).unwrap();
         let workspace = store.managed_workspaces().unwrap().pop().unwrap();
+        let setup_run = store
+            .managed_runs(&workspace.id)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.kind == ManagedRunKind::Setup)
+            .unwrap();
+        assert!(
+            store
+                .recent_managed_moves(&workspace.id, 20)
+                .unwrap()
+                .is_empty()
+        );
         let managed_folders = FolderSet::load(Path::new(&workspace.folder_set_path)).unwrap();
         assert!(
             managed_folders
@@ -1534,6 +2241,16 @@ mod tests {
             .clone();
         drop(store);
 
+        let setup_undo_error = undo_run(
+            &cli,
+            &setup_run.id,
+            &root.path().join("invalid-setup-undo.json"),
+            &[],
+            true,
+        )
+        .unwrap_err();
+        assert!(setup_undo_error.to_string().contains("managed undo-setup"));
+
         add_rule(&cli, &workspace.id, "*.txt", &destination_id, 100, true).unwrap();
         let store = StateStore::open(&state_path).unwrap();
         let rule = store
@@ -1546,21 +2263,47 @@ mod tests {
         set_rule_enabled(&cli, &rule.id, true).unwrap();
 
         fs::write(source.join("fresh.txt"), b"fresh").unwrap();
+        fs::write(source.join("other.txt"), b"other").unwrap();
         let cycle_root = root.path().join("cycle");
-        run_cycle(&cli, &workspace.id, &cycle_root, true, true).unwrap();
+        run_cycle(&cli, &workspace.id, Some(&cycle_root), true, true).unwrap();
         assert!(source.join("Inbox/fresh.txt").is_file());
-        let store = StateStore::open(&state_path).unwrap();
-        let stage = store
+        assert!(source.join("Inbox/other.txt").is_file());
+        let mut store = StateStore::open(&state_path).unwrap();
+        let mut stage = store
             .managed_runs(&workspace.id)
             .unwrap()
             .into_iter()
             .find(|run| run.kind == ManagedRunKind::Stage)
             .unwrap();
         assert_eq!(stage.state, RunState::Completed);
+        stage.state = RunState::NeedsResume;
+        stage.error = Some("apply completed; state finalization is pending".into());
+        store.update_managed_run(&stage).unwrap();
+        drop(store);
+        resume_run(&cli, &stage.id, true).unwrap();
+        let store = StateStore::open(&state_path).unwrap();
+        stage = store.managed_run(&stage.id).unwrap().unwrap();
+        assert_eq!(stage.state, RunState::Completed);
+        assert_eq!(stage.error, None);
+        let moves = managed_move_history(&store, &workspace.id, 20).unwrap();
+        assert_eq!(moves.len(), 2);
+        assert!(moves.iter().all(|movement| movement.run_id == stage.id));
+        let fresh_move = moves
+            .iter()
+            .find(|movement| movement.source_path == "fresh.txt")
+            .unwrap();
+        assert_eq!(fresh_move.destination_path, "Inbox/fresh.txt");
+        assert!(!fresh_move.undone);
+        let other_file_id = moves
+            .iter()
+            .find(|movement| movement.source_path == "other.txt")
+            .unwrap()
+            .file_id
+            .clone();
         drop(store);
 
         let undo_path = root.path().join("stage-undo.json");
-        undo_run(&cli, &stage.id, &undo_path, &[], true).unwrap();
+        undo_run(&cli, &stage.id, &undo_path, &["fresh.txt".into()], true).unwrap();
         assert!(source.join("fresh.txt").is_file());
         let store = StateStore::open(&state_path).unwrap();
         assert!(
@@ -1570,11 +2313,41 @@ mod tests {
                 .iter()
                 .all(|item| item.relative_path != "Inbox/fresh.txt")
         );
+        let moves = managed_move_history(&store, &workspace.id, 20).unwrap();
+        assert_eq!(moves.len(), 2);
+        let fresh_move = moves
+            .iter()
+            .find(|movement| movement.source_path == "fresh.txt")
+            .unwrap();
+        assert!(fresh_move.undone);
+        assert!(matches!(
+            fresh_move.undo_outcome,
+            Some(UndoMoveOutcome::Restored)
+        ));
+        assert!(
+            !moves
+                .iter()
+                .find(|movement| movement.source_path == "other.txt")
+                .unwrap()
+                .undone
+        );
+        drop(store);
+
+        let second_undo_path = root.path().join("stage-undo-other.json");
+        undo_run(&cli, &stage.id, &second_undo_path, &[other_file_id], true).unwrap();
+        assert!(source.join("other.txt").is_file());
+        let store = StateStore::open(&state_path).unwrap();
+        let moves = managed_move_history(&store, &workspace.id, 20).unwrap();
+        assert!(moves.iter().all(|movement| movement.undone));
+        let undo_paths = store.managed_undo_journal_paths(&stage.id).unwrap();
+        assert_eq!(undo_paths.len(), 2);
+        assert!(undo_paths.contains(&undo_path.display().to_string()));
+        assert!(undo_paths.contains(&second_undo_path.display().to_string()));
         drop(store);
 
         std::thread::sleep(std::time::Duration::from_millis(1_100));
         let classify_root = root.path().join("classify-cycle");
-        run_cycle(&cli, &workspace.id, &classify_root, true, true).unwrap();
+        run_cycle(&cli, &workspace.id, Some(&classify_root), true, true).unwrap();
         assert!(source.join("Library/Documents/baseline.txt").is_file());
         let store = StateStore::open(&state_path).unwrap();
         let classify = store
@@ -1606,8 +2379,56 @@ mod tests {
         drop(store);
 
         let reclassify_root = root.path().join("reclassify-cycle");
-        run_cycle(&cli, &workspace.id, &reclassify_root, true, true).unwrap();
+        run_cycle(&cli, &workspace.id, Some(&reclassify_root), true, true).unwrap();
         assert!(source.join("Library/Documents/baseline.txt").is_file());
+
+        let reprocess_root = root.path().join("reprocess-cycle");
+        reprocess(
+            &cli,
+            &workspace.id,
+            ReprocessArea::Library,
+            &["Documents/baseline.txt".into()],
+            false,
+            Some(&reprocess_root),
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(source.join("Inbox/baseline.txt").is_file());
+        let store = StateStore::open(&state_path).unwrap();
+        let reprocess_run = store
+            .managed_runs(&workspace.id)
+            .unwrap()
+            .into_iter()
+            .find(|run| {
+                run.plan_path
+                    .as_deref()
+                    .is_some_and(|path| path.ends_with("reprocess-plan.json"))
+            })
+            .unwrap();
+        drop(store);
+        undo_run(
+            &cli,
+            &reprocess_run.id,
+            &root.path().join("reprocess-undo.json"),
+            &[],
+            true,
+        )
+        .unwrap();
+        assert!(source.join("Library/Documents/baseline.txt").is_file());
+
+        set_workspace_enabled(&cli, &workspace.id, false).unwrap();
+        assert!(run_cycle(&cli, &workspace.id, None, false, false).is_err());
+        reconcile_workspace(&cli, &workspace.id).unwrap();
+        edit_workspace(&cli, &workspace.id, Some(2), Some(1)).unwrap();
+        set_workspace_enabled(&cli, &workspace.id, true).unwrap();
+        run_cycle(&cli, &workspace.id, None, true, true).unwrap();
+        let automatic_runs = state_path
+            .parent()
+            .unwrap()
+            .join("managed-runs")
+            .join(&workspace.id);
+        assert!(automatic_runs.read_dir().unwrap().next().is_some());
 
         set_rule_enabled(&cli, &rule.id, false).unwrap();
         let store = StateStore::open(&state_path).unwrap();
@@ -1638,5 +2459,15 @@ mod tests {
         )
         .unwrap();
         assert!(list_rules(&cli, &workspace.id).is_err());
+        set_workspace_enabled(&cli, &workspace.id, false).unwrap();
+        remove_workspace(&cli, &workspace.id, true).unwrap();
+        assert!(
+            StateStore::open(&state_path)
+                .unwrap()
+                .managed_workspace(&workspace.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(source.join("Library/Documents/baseline.txt").is_file());
     }
 }

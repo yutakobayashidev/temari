@@ -3,7 +3,7 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
-  outputs = { nixpkgs, ... }:
+  outputs = { self, nixpkgs, ... }:
     let
       systems = [
         "aarch64-darwin"
@@ -14,6 +14,30 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
+      packages = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in
+        {
+          default = pkgs.rustPlatform.buildRustPackage {
+            pname = "temari";
+            version = "0.1.0";
+            src = pkgs.lib.cleanSource ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [ "-p" "temari-cli" ];
+            cargoTestFlags = [ "--workspace" ];
+          };
+        }
+      );
+
+      apps = forAllSystems (system: {
+        default = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/temari";
+        };
+      });
+
       devShells = forAllSystems (
         system:
         let

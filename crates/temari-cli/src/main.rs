@@ -20,6 +20,7 @@ use temari_core::{
 use tempfile::NamedTempFile;
 
 mod managed;
+mod managed_schedule;
 
 use managed::ManagedCommand;
 

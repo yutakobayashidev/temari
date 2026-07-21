@@ -19,7 +19,7 @@ pub use apply::{
     UndoDirectoryOutcome, UndoDirectoryRecord, UndoMoveOutcome, UndoMoveRecord, UndoSession,
     UndoState, apply_plan, apply_plan_with_lock, preflight_apply, preflight_resume, preflight_undo,
     resume_apply_session, resume_apply_session_with_lock, undo_session, undo_session_files,
-    undo_session_with_lock,
+    undo_session_files_with_lock, undo_session_with_lock,
 };
 pub use artifact::{
     ApprovedFolder, FallbackCategory, FolderProposal, FolderSet, Proposal, ScanScope,
@@ -45,9 +45,10 @@ pub use managed::{
     resume_managed_setup_with_lock, undo_managed_setup, undo_managed_setup_with_lock,
 };
 pub use managed_cycle::{
-    INBOX_DIRECTORY, KEPT_DIRECTORY, LIBRARY_DIRECTORY, STAGE_TO_INBOX_RULE_ID,
+    INBOX_DIRECTORY, KEPT_DIRECTORY, LIBRARY_DIRECTORY, ManagedReprocessArea,
+    ManagedReprocessSelection, STAGE_TO_INBOX_RULE_ID, build_reprocess_to_inbox_plan,
     build_stage_to_inbox_plan, filter_inbox_candidates, inbox_file_candidates, library_folder_set,
-    root_file_candidates,
+    reprocess_file_candidates, root_file_candidates,
 };
 pub use model::{
     Classification, ClassificationBasis, Classifier, ContentCandidate, FolderProposer,
@@ -61,8 +62,9 @@ pub use plan::{Plan, PlanEntry, build_plan};
 pub use rules::{LocalRule, RuleMatch, RuleSet};
 pub use scan::{FileCandidate, scan_directory, select_representative_files};
 pub use state::{
-    InboxItem, InboxState, ManagedRun, ManagedRunKind, ManagedWorkspace, MonitorRecord,
-    MonitoringRun, ProcessedFileRecord, ReconcileSummary, RunState, StagedFileRecord, StateStore,
+    InboxItem, InboxReconcileSummary, InboxState, ManagedRun, ManagedRunKind, ManagedWorkspace,
+    MonitorRecord, MonitoringRun, ProcessedFileRecord, ReconcileSummary, RunState,
+    StagedFileRecord, StateStore,
 };
 
 use thiserror::Error;

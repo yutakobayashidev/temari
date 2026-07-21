@@ -3,6 +3,7 @@
 ## Status
 
 - Accepted
+- Extended by [ADR 0014](0014-schedule-finite-managed-runs.md).
 
 ## Decision Drivers
 
@@ -31,7 +32,7 @@ The CLI has not been released and the repository explicitly avoids compatibility
 - Keep `temari organize` as a TTY-only, one-time cleanup orchestrator.
 - Keep `propose`, `approve`, `plan`, `apply`, `undo`, and `resume` as advanced primitives for agents, scripts, artifact inspection, and recovery.
 - Retain monitoring records, processed signatures, rules, polling-independent cycle services, and reconciliation inside `temari-core`. Do not expose internal monitor IDs as the normal user model.
-- Do not install a daemon or continuous foreground loop. A future scheduler or GUI must call the same finite managed application services.
+- Do not install a daemon or continuous foreground loop. ADR 0014 later permits a separately confirmed platform scheduler that calls the same finite managed application services.
 
 ## Consequences
 

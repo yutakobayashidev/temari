@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -13,7 +14,7 @@ use crate::{
     Plan, artifact::normalize_relative_path,
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -163,6 +164,12 @@ pub struct ReconcileSummary {
     pub needs_resume: usize,
     pub failed: usize,
     pub needs_attention: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct InboxReconcileSummary {
+    pub deleted_stale_pending: usize,
+    pub reset_returned: usize,
 }
 
 pub struct StateStore {
@@ -480,6 +487,186 @@ impl StateStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn set_managed_workspace_enabled(
+        &mut self,
+        id: &str,
+        enabled: bool,
+        updated_unix_ms: i64,
+    ) -> Result<ManagedWorkspace, Error> {
+        let transaction = self.connection.transaction()?;
+        let mut workspace = managed_workspace_for_update(&transaction, id)?;
+        validate_workspace_update_time(&workspace, updated_unix_ms)?;
+        require_changed(
+            transaction.execute(
+                "UPDATE monitors SET enabled = ?2, updated_unix_ms = ?3
+                 WHERE id = ?1 AND deleted_unix_ms IS NULL",
+                params![workspace.monitor_id, enabled, updated_unix_ms],
+            )?,
+            "active workspace monitor",
+            &workspace.monitor_id,
+        )?;
+        require_changed(
+            transaction.execute(
+                "UPDATE managed_workspaces SET enabled = ?2, updated_unix_ms = ?3
+                 WHERE id = ?1",
+                params![id, enabled, updated_unix_ms],
+            )?,
+            "managed workspace",
+            id,
+        )?;
+        transaction.commit()?;
+        workspace.enabled = enabled;
+        workspace.updated_unix_ms = updated_unix_ms;
+        Ok(workspace)
+    }
+
+    pub fn update_managed_workspace_windows(
+        &mut self,
+        id: &str,
+        retention_seconds: u64,
+        settle_seconds: u64,
+        updated_unix_ms: i64,
+    ) -> Result<ManagedWorkspace, Error> {
+        let retention_ms = duration_millis(retention_seconds, "workspace retention")?;
+        let settle_ms = duration_millis(settle_seconds, "inbox settle window")?;
+        if retention_seconds == 0 || settle_seconds == 0 {
+            return Err(Error::InvalidState(
+                "workspace retention and settle windows must be greater than zero".into(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        let mut workspace = managed_workspace_for_update(&transaction, id)?;
+        validate_workspace_update_time(&workspace, updated_unix_ms)?;
+        let pending = {
+            let mut statement = transaction.prepare(
+                "SELECT file_device, file_inode, first_seen_unix_ms, stable_since_unix_ms
+                 FROM inbox_items WHERE workspace_id = ?1 AND state = 'pending'",
+            )?;
+            let rows = statement.query_map([id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut deadlines = Vec::with_capacity(pending.len());
+        for (device, inode, first_seen, stable_since) in pending {
+            let eligible = first_seen
+                .checked_add(retention_ms)
+                .and_then(|retention_deadline| {
+                    stable_since
+                        .checked_add(settle_ms)
+                        .map(|settle_deadline| retention_deadline.max(settle_deadline))
+                })
+                .ok_or_else(|| {
+                    Error::InvalidState("inbox eligibility timestamp overflow".into())
+                })?;
+            deadlines.push((device, inode, eligible));
+        }
+        require_changed(
+            transaction.execute(
+                "UPDATE managed_workspaces
+                 SET retention_seconds = ?2, settle_seconds = ?3, updated_unix_ms = ?4
+                 WHERE id = ?1",
+                params![
+                    id,
+                    to_i64(retention_seconds, "workspace retention")?,
+                    to_i64(settle_seconds, "inbox settle window")?,
+                    updated_unix_ms,
+                ],
+            )?,
+            "managed workspace",
+            id,
+        )?;
+        for (device, inode, eligible) in deadlines {
+            transaction.execute(
+                "UPDATE inbox_items SET eligible_unix_ms = ?4
+                 WHERE workspace_id = ?1 AND file_device = ?2 AND file_inode = ?3
+                   AND state = 'pending'",
+                params![id, device, inode, eligible],
+            )?;
+        }
+        transaction.commit()?;
+        workspace.retention_seconds = retention_seconds;
+        workspace.settle_seconds = settle_seconds;
+        workspace.updated_unix_ms = updated_unix_ms;
+        Ok(workspace)
+    }
+
+    pub fn remove_managed_workspace_registration(
+        &mut self,
+        id: &str,
+        deleted_unix_ms: i64,
+    ) -> Result<(), Error> {
+        let transaction = self.connection.transaction()?;
+        let workspace = managed_workspace_for_update(&transaction, id)?;
+        validate_workspace_update_time(&workspace, deleted_unix_ms)?;
+        if workspace.enabled {
+            return Err(Error::InvalidState(
+                "managed workspace must be disabled before removal".into(),
+            ));
+        }
+        let monitor_enabled: bool = transaction.query_row(
+            "SELECT enabled FROM monitors WHERE id = ?1 AND deleted_unix_ms IS NULL",
+            [&workspace.monitor_id],
+            |row| row.get(0),
+        )?;
+        if monitor_enabled {
+            return Err(Error::InvalidState(
+                "managed workspace monitor must be disabled before removal".into(),
+            ));
+        }
+        let unfinished_managed: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM managed_runs
+                WHERE workspace_id = ?1
+                  AND state IN ('planning', 'planned', 'applying', 'needs_resume')
+             )",
+            [id],
+            |row| row.get(0),
+        )?;
+        let unfinished_monitoring: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM monitor_runs
+                WHERE monitor_id = ?1
+                  AND state IN ('planning', 'planned', 'applying', 'needs_resume')
+             )",
+            [&workspace.monitor_id],
+            |row| row.get(0),
+        )?;
+        if unfinished_managed || unfinished_monitoring {
+            return Err(Error::InvalidState(
+                "managed workspace has an unfinished or resumable run".into(),
+            ));
+        }
+        require_changed(
+            transaction.execute("DELETE FROM managed_workspaces WHERE id = ?1", [id])?,
+            "managed workspace",
+            id,
+        )?;
+        transaction.execute(
+            "UPDATE rules
+             SET enabled = 0, deleted_unix_ms = ?2, updated_unix_ms = ?2
+             WHERE monitor_id = ?1 AND deleted_unix_ms IS NULL",
+            params![workspace.monitor_id, deleted_unix_ms],
+        )?;
+        require_changed(
+            transaction.execute(
+                "UPDATE monitors
+                 SET enabled = 0, deleted_unix_ms = ?2, updated_unix_ms = ?2
+                 WHERE id = ?1 AND enabled = 0 AND deleted_unix_ms IS NULL",
+                params![workspace.monitor_id, deleted_unix_ms],
+            )?,
+            "disabled workspace monitor",
+            &workspace.monitor_id,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn update_managed_workspace(&mut self, workspace: &ManagedWorkspace) -> Result<(), Error> {
         validate_managed_workspace(workspace)?;
         validate_workspace_monitor(&self.connection, workspace)?;
@@ -740,6 +927,83 @@ impl StateStore {
         )
     }
 
+    pub fn reconcile_inbox_index(
+        &mut self,
+        workspace_id: &str,
+        observed_inbox_identities: &[FsIdentity],
+    ) -> Result<InboxReconcileSummary, Error> {
+        validate_identifier("workspace ID", workspace_id)?;
+        let observed = observed_inbox_identities
+            .iter()
+            .map(|identity| (identity.device, identity.inode))
+            .collect::<HashSet<_>>();
+        if observed.len() != observed_inbox_identities.len() {
+            return Err(Error::InvalidState(
+                "Inbox reconciliation contains duplicate filesystem identities".into(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        managed_workspace_for_update(&transaction, workspace_id)?;
+        let indexed = {
+            let mut statement = transaction.prepare(
+                "SELECT i.file_device, i.file_inode, i.state, r.state
+                 FROM inbox_items AS i
+                 LEFT JOIN managed_runs AS r ON r.id = i.last_run_id
+                 WHERE i.workspace_id = ?1 ORDER BY i.relative_path",
+            )?;
+            let rows = statement.query_map([workspace_id], |row| {
+                let device = parse_u64_column(row.get(0)?, 0)?;
+                let inode = parse_u64_column(row.get(1)?, 1)?;
+                let state = InboxState::parse(&row.get::<_, String>(2)?)
+                    .map_err(|error| conversion_error(2, error))?;
+                let run_state = row
+                    .get::<_, Option<String>>(3)?
+                    .map(|value| {
+                        RunState::parse(&value).map_err(|error| conversion_error(3, error))
+                    })
+                    .transpose()?;
+                Ok((device, inode, state, run_state))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut summary = InboxReconcileSummary::default();
+        for (device, inode, state, _) in &indexed {
+            if *state == InboxState::Pending && !observed.contains(&(*device, *inode)) {
+                summary.deleted_stale_pending += transaction.execute(
+                    "DELETE FROM inbox_items
+                     WHERE workspace_id = ?1 AND file_device = ?2 AND file_inode = ?3
+                       AND state = 'pending'",
+                    params![workspace_id, device.to_string(), inode.to_string()],
+                )?;
+            }
+        }
+        for (device, inode, state, run_state) in indexed {
+            let returned = match state {
+                InboxState::Pending => false,
+                InboxState::Moved => true,
+                InboxState::Planned => !matches!(
+                    run_state,
+                    Some(
+                        RunState::Planning
+                            | RunState::Planned
+                            | RunState::Applying
+                            | RunState::NeedsResume
+                    )
+                ),
+            };
+            if returned && observed.contains(&(device, inode)) {
+                summary.reset_returned += transaction.execute(
+                    "UPDATE inbox_items SET state = 'pending', last_run_id = NULL
+                     WHERE workspace_id = ?1 AND file_device = ?2 AND file_inode = ?3
+                       AND state != 'pending'",
+                    params![workspace_id, device.to_string(), inode.to_string()],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(summary)
+    }
+
     pub fn insert_managed_run(&mut self, run: &ManagedRun) -> Result<(), Error> {
         validate_managed_run(run)?;
         self.connection.execute(
@@ -864,13 +1128,152 @@ impl StateStore {
             "SELECT id, workspace_id, kind, state, plan_path, apply_path,
                     undo_path, started_unix_ms, finished_unix_ms, move_count, error
              FROM managed_runs
-             WHERE workspace_id = ?1 AND state = 'completed' AND move_count > 0
+             WHERE workspace_id = ?1 AND kind != 'setup'
+               AND state = 'completed' AND move_count > 0
              ORDER BY finished_unix_ms DESC, id DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(
             params![workspace_id, i64::from(limit)],
             managed_run_from_row,
         )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn record_managed_undo_journal(
+        &mut self,
+        run_id: &str,
+        path: &str,
+        created_unix_ms: i64,
+    ) -> Result<(), Error> {
+        validate_absolute_path("managed Undo journal path", path)?;
+        let run = self
+            .managed_run(run_id)?
+            .ok_or_else(|| Error::InvalidState(format!("unknown managed run {run_id:?}")))?;
+        if run.kind == ManagedRunKind::Setup || run.state != RunState::Completed {
+            return Err(Error::InvalidState(
+                "managed Undo journals require a completed file-move run".into(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT INTO managed_undo_journals (run_id, path, created_unix_ms)
+             VALUES (?1, ?2, ?3)",
+            params![run_id, path, created_unix_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically records an Undo journal and reconciles state for restored files.
+    pub fn finalize_managed_undo(
+        &mut self,
+        run_id: &str,
+        path: &str,
+        restored: &[FsIdentity],
+        created_unix_ms: i64,
+    ) -> Result<(), Error> {
+        validate_identifier("managed run ID", run_id)?;
+        validate_absolute_path("managed Undo journal path", path)?;
+        let identities = restored
+            .iter()
+            .map(|identity| (identity.device, identity.inode))
+            .collect::<HashSet<_>>();
+        if identities.len() != restored.len() {
+            return Err(Error::InvalidState(
+                "managed Undo contains duplicate restored filesystem identities".into(),
+            ));
+        }
+
+        let transaction = self.connection.transaction()?;
+        let (workspace_id, monitor_id, kind, state) = transaction
+            .query_row(
+                "SELECT r.workspace_id, w.monitor_id, r.kind, r.state
+                 FROM managed_runs AS r
+                 JOIN managed_workspaces AS w ON w.id = r.workspace_id
+                 WHERE r.id = ?1",
+                [run_id],
+                |row| {
+                    let kind = ManagedRunKind::parse(&row.get::<_, String>(2)?)
+                        .map_err(|error| conversion_error(2, error))?;
+                    let state = RunState::parse(&row.get::<_, String>(3)?)
+                        .map_err(|error| conversion_error(3, error))?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        kind,
+                        state,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::InvalidState(format!("unknown managed run {run_id:?}")))?;
+        if kind == ManagedRunKind::Setup || state != RunState::Completed {
+            return Err(Error::InvalidState(
+                "managed Undo journals require a completed file-move run".into(),
+            ));
+        }
+
+        transaction.execute(
+            "INSERT INTO managed_undo_journals (run_id, path, created_unix_ms)
+             VALUES (?1, ?2, ?3)",
+            params![run_id, path, created_unix_ms],
+        )?;
+        require_changed(
+            transaction.execute(
+                "UPDATE managed_runs SET undo_path = ?2 WHERE id = ?1",
+                params![run_id, path],
+            )?,
+            "managed run",
+            run_id,
+        )?;
+        for identity in restored {
+            match kind {
+                ManagedRunKind::Stage => {
+                    transaction.execute(
+                        "DELETE FROM inbox_items
+                         WHERE workspace_id = ?1 AND file_device = ?2 AND file_inode = ?3",
+                        params![
+                            workspace_id,
+                            identity.device.to_string(),
+                            identity.inode.to_string()
+                        ],
+                    )?;
+                }
+                ManagedRunKind::Classify => {
+                    require_changed(
+                        transaction.execute(
+                            "UPDATE inbox_items SET state = 'pending', last_run_id = NULL
+                             WHERE workspace_id = ?1 AND file_device = ?2 AND file_inode = ?3",
+                            params![
+                                workspace_id,
+                                identity.device.to_string(),
+                                identity.inode.to_string()
+                            ],
+                        )?,
+                        "inbox item",
+                        &format!("{workspace_id}:{}:{}", identity.device, identity.inode),
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM processed_files
+                         WHERE monitor_id = ?1 AND file_device = ?2 AND file_inode = ?3",
+                        params![
+                            monitor_id,
+                            identity.device.to_string(),
+                            identity.inode.to_string()
+                        ],
+                    )?;
+                }
+                ManagedRunKind::Setup => unreachable!(),
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn managed_undo_journal_paths(&self, run_id: &str) -> Result<Vec<String>, Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT path FROM managed_undo_journals
+             WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map([run_id], |row| row.get(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -1687,6 +2090,14 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
         );
         CREATE INDEX IF NOT EXISTS managed_runs_by_workspace_time
             ON managed_runs(workspace_id, started_unix_ms DESC, id DESC);
+        CREATE TABLE IF NOT EXISTS managed_undo_journals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL REFERENCES managed_runs(id) ON DELETE CASCADE,
+            path TEXT NOT NULL UNIQUE,
+            created_unix_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS managed_undo_journals_by_run_time
+            ON managed_undo_journals(run_id, id);
         CREATE TABLE IF NOT EXISTS inbox_items (
             workspace_id TEXT NOT NULL REFERENCES managed_workspaces(id) ON DELETE CASCADE,
             file_device TEXT NOT NULL,
@@ -1712,6 +2123,11 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
     transaction.execute(
         "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
          VALUES (1, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
+         VALUES (2, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
         [],
     )?;
     transaction.execute(
@@ -1802,6 +2218,38 @@ fn managed_workspace_from_row(row: &Row<'_>) -> rusqlite::Result<ManagedWorkspac
         created_unix_ms: row.get(11)?,
         updated_unix_ms: row.get(12)?,
     })
+}
+
+fn managed_workspace_for_update(
+    transaction: &Transaction<'_>,
+    id: &str,
+) -> Result<ManagedWorkspace, Error> {
+    validate_identifier("workspace ID", id)?;
+    let workspace = transaction
+        .query_row(
+            "SELECT id, monitor_id, source, source_device, source_inode, folder_set_path,
+                    folder_set_sha256, retention_seconds, settle_seconds, enabled,
+                    setup_session_path, created_unix_ms, updated_unix_ms
+             FROM managed_workspaces WHERE id = ?1",
+            [id],
+            managed_workspace_from_row,
+        )
+        .optional()?
+        .ok_or_else(|| Error::InvalidState(format!("unknown managed workspace {id:?}")))?;
+    validate_workspace_monitor(transaction, &workspace)?;
+    Ok(workspace)
+}
+
+fn validate_workspace_update_time(
+    workspace: &ManagedWorkspace,
+    updated_unix_ms: i64,
+) -> Result<(), Error> {
+    if updated_unix_ms < workspace.updated_unix_ms {
+        return Err(Error::InvalidState(
+            "managed workspace update time must not move backwards".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn inbox_item_from_row(row: &Row<'_>) -> rusqlite::Result<InboxItem> {
@@ -2267,12 +2715,12 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
     }
 
     #[test]
-    fn migrates_schema_v1_database_to_managed_schema_v2() {
+    fn migrates_schema_v1_database_to_current_managed_schema() {
         let mut connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
@@ -2293,9 +2741,14 @@ mod tests {
                     0
                 ),)
                 .unwrap(),
-            2
+            SCHEMA_VERSION
         );
-        for table in ["managed_workspaces", "inbox_items", "managed_runs"] {
+        for table in [
+            "managed_workspaces",
+            "inbox_items",
+            "managed_runs",
+            "managed_undo_journals",
+        ] {
             assert!(
                 connection
                     .query_row(
@@ -2306,6 +2759,45 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    #[test]
+    fn migrates_schema_v2_database_to_undo_journal_index() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_unix_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO schema_migrations VALUES (1, 0);
+                 INSERT INTO schema_migrations VALUES (2, 0);",
+            )
+            .unwrap();
+
+        migrate(&mut connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert!(
+            connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM sqlite_schema
+                        WHERE type = 'table' AND name = 'managed_undo_journals'
+                    )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2604,6 +3096,401 @@ mod tests {
     }
 
     #[test]
+    fn workspace_enablement_is_atomic_with_its_monitor() {
+        let root = tempdir().unwrap();
+        let mut store = StateStore::open_in_memory().unwrap();
+        setup_workspace(&mut store, root.path());
+
+        let disabled = store
+            .set_managed_workspace_enabled("w1", false, 200)
+            .unwrap();
+        assert!(!disabled.enabled);
+        assert!(!store.monitor("m1").unwrap().unwrap().enabled);
+
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_workspace_enable
+                 BEFORE UPDATE ON managed_workspaces
+                 WHEN NEW.enabled = 1
+                 BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .set_managed_workspace_enabled("w1", true, 300)
+                .is_err()
+        );
+        assert!(!store.managed_workspace("w1").unwrap().unwrap().enabled);
+        assert!(!store.monitor("m1").unwrap().unwrap().enabled);
+    }
+
+    #[test]
+    fn updating_windows_recalculates_only_pending_items_and_rolls_back() {
+        let root = tempdir().unwrap();
+        let mut store = StateStore::open_in_memory().unwrap();
+        setup_workspace(&mut store, root.path());
+        let pending_identity = FsIdentity {
+            device: 1,
+            inode: 1,
+        };
+        let moved_identity = FsIdentity {
+            device: 1,
+            inode: 2,
+        };
+        for (identity, path) in [
+            (pending_identity.clone(), "Inbox/pending.txt"),
+            (moved_identity.clone(), "Inbox/moved.txt"),
+        ] {
+            store
+                .upsert_observation(
+                    "w1",
+                    &FileFingerprint {
+                        identity,
+                        size: 1,
+                        sha256: DIGEST_A.into(),
+                    },
+                    path,
+                    1_000,
+                )
+                .unwrap();
+        }
+        store
+            .insert_managed_run(&ManagedRun {
+                id: "run1".into(),
+                workspace_id: "w1".into(),
+                kind: ManagedRunKind::Classify,
+                state: RunState::Completed,
+                plan_path: Some(root.path().join("plan.json").display().to_string()),
+                apply_path: Some(root.path().join("apply.json").display().to_string()),
+                undo_path: None,
+                started_unix_ms: 1_000,
+                finished_unix_ms: Some(2_000),
+                move_count: 1,
+                error: None,
+            })
+            .unwrap();
+        store
+            .set_inbox_item_state(
+                "w1",
+                moved_identity.clone(),
+                InboxState::Moved,
+                Some("run1"),
+            )
+            .unwrap();
+
+        let updated = store
+            .update_managed_workspace_windows("w1", 10, 5, 200)
+            .unwrap();
+        assert_eq!((updated.retention_seconds, updated.settle_seconds), (10, 5));
+        assert_eq!(
+            store
+                .inbox_item("w1", pending_identity.clone())
+                .unwrap()
+                .unwrap()
+                .eligible_unix_ms,
+            11_000
+        );
+        assert_eq!(
+            store
+                .inbox_item("w1", moved_identity)
+                .unwrap()
+                .unwrap()
+                .eligible_unix_ms,
+            101_000
+        );
+
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_pending_deadline_update
+                 BEFORE UPDATE OF eligible_unix_ms ON inbox_items
+                 BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .update_managed_workspace_windows("w1", 20, 10, 300)
+                .is_err()
+        );
+        let unchanged = store.managed_workspace("w1").unwrap().unwrap();
+        assert_eq!(
+            (unchanged.retention_seconds, unchanged.settle_seconds),
+            (10, 5)
+        );
+        assert_eq!(
+            store
+                .inbox_item("w1", pending_identity)
+                .unwrap()
+                .unwrap()
+                .eligible_unix_ms,
+            11_000
+        );
+    }
+
+    #[test]
+    fn removing_registration_requires_disabled_idle_state_and_is_atomic() {
+        let root = tempdir().unwrap();
+        let mut store = StateStore::open_in_memory().unwrap();
+        setup_workspace(&mut store, root.path());
+        store
+            .insert_rule(
+                &LocalRule {
+                    id: "rule1".into(),
+                    monitor_id: "m1".into(),
+                    name_glob: "*.txt".into(),
+                    destination_id: "d1".into(),
+                    priority: 50,
+                    enabled: true,
+                },
+                100,
+            )
+            .unwrap();
+        store
+            .set_managed_workspace_enabled("w1", false, 200)
+            .unwrap();
+        store
+            .insert_managed_run(&ManagedRun {
+                id: "run1".into(),
+                workspace_id: "w1".into(),
+                kind: ManagedRunKind::Stage,
+                state: RunState::Planned,
+                plan_path: Some(root.path().join("plan.json").display().to_string()),
+                apply_path: None,
+                undo_path: None,
+                started_unix_ms: 200,
+                finished_unix_ms: None,
+                move_count: 1,
+                error: None,
+            })
+            .unwrap();
+
+        assert!(
+            store
+                .remove_managed_workspace_registration("w1", 300)
+                .is_err()
+        );
+        assert!(store.managed_workspace("w1").unwrap().is_some());
+        assert!(
+            store
+                .monitor("m1")
+                .unwrap()
+                .unwrap()
+                .deleted_unix_ms
+                .is_none()
+        );
+        assert!(store.rule("rule1").unwrap().is_some());
+
+        store.delete_managed_run("run1").unwrap();
+        store
+            .remove_managed_workspace_registration("w1", 300)
+            .unwrap();
+        assert!(store.managed_workspace("w1").unwrap().is_none());
+        let monitor = store.monitor("m1").unwrap().unwrap();
+        assert!(!monitor.enabled);
+        assert_eq!(monitor.deleted_unix_ms, Some(300));
+        assert!(store.rule("rule1").unwrap().is_none());
+    }
+
+    #[test]
+    fn inbox_reconcile_deletes_stale_pending_and_resets_returned_items() {
+        let root = tempdir().unwrap();
+        let mut store = StateStore::open_in_memory().unwrap();
+        setup_workspace(&mut store, root.path());
+        let identities = (1..=5)
+            .map(|inode| FsIdentity { device: 1, inode })
+            .collect::<Vec<_>>();
+        for (identity, path) in identities.iter().zip([
+            "Inbox/stale.txt",
+            "Inbox/pending.txt",
+            "Inbox/moved.txt",
+            "Inbox/planned.txt",
+            "Inbox/live-planned.txt",
+        ]) {
+            store
+                .upsert_observation(
+                    "w1",
+                    &FileFingerprint {
+                        identity: identity.clone(),
+                        size: 1,
+                        sha256: DIGEST_A.into(),
+                    },
+                    path,
+                    1_000,
+                )
+                .unwrap();
+        }
+        store
+            .insert_managed_run(&ManagedRun {
+                id: "run1".into(),
+                workspace_id: "w1".into(),
+                kind: ManagedRunKind::Classify,
+                state: RunState::Completed,
+                plan_path: Some(root.path().join("plan.json").display().to_string()),
+                apply_path: Some(root.path().join("apply.json").display().to_string()),
+                undo_path: None,
+                started_unix_ms: 1_000,
+                finished_unix_ms: Some(2_000),
+                move_count: 2,
+                error: None,
+            })
+            .unwrap();
+        store
+            .set_inbox_item_state("w1", identities[2].clone(), InboxState::Moved, Some("run1"))
+            .unwrap();
+        store
+            .set_inbox_item_state(
+                "w1",
+                identities[3].clone(),
+                InboxState::Planned,
+                Some("run1"),
+            )
+            .unwrap();
+        store
+            .insert_managed_run(&ManagedRun {
+                id: "run2".into(),
+                workspace_id: "w1".into(),
+                kind: ManagedRunKind::Classify,
+                state: RunState::Planned,
+                plan_path: Some(root.path().join("live-plan.json").display().to_string()),
+                apply_path: None,
+                undo_path: None,
+                started_unix_ms: 3_000,
+                finished_unix_ms: None,
+                move_count: 1,
+                error: None,
+            })
+            .unwrap();
+        store
+            .set_inbox_item_state(
+                "w1",
+                identities[4].clone(),
+                InboxState::Planned,
+                Some("run2"),
+            )
+            .unwrap();
+
+        let summary = store
+            .reconcile_inbox_index(
+                "w1",
+                &[
+                    identities[1].clone(),
+                    identities[2].clone(),
+                    identities[3].clone(),
+                    identities[4].clone(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            summary,
+            InboxReconcileSummary {
+                deleted_stale_pending: 1,
+                reset_returned: 2,
+            }
+        );
+        assert!(
+            store
+                .inbox_item("w1", identities[0].clone())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .inbox_item("w1", identities[2].clone())
+                .unwrap()
+                .unwrap()
+                .state,
+            InboxState::Pending
+        );
+        assert_eq!(
+            store
+                .inbox_item("w1", identities[3].clone())
+                .unwrap()
+                .unwrap()
+                .state,
+            InboxState::Pending
+        );
+        assert_eq!(
+            store
+                .inbox_item("w1", identities[4].clone())
+                .unwrap()
+                .unwrap()
+                .state,
+            InboxState::Planned
+        );
+    }
+
+    #[test]
+    fn inbox_reconcile_rolls_back_all_changes_on_failure() {
+        let root = tempdir().unwrap();
+        let mut store = StateStore::open_in_memory().unwrap();
+        setup_workspace(&mut store, root.path());
+        let stale = FsIdentity {
+            device: 1,
+            inode: 1,
+        };
+        let returned = FsIdentity {
+            device: 1,
+            inode: 2,
+        };
+        for (identity, path) in [
+            (stale.clone(), "Inbox/stale.txt"),
+            (returned.clone(), "Inbox/returned.txt"),
+        ] {
+            store
+                .upsert_observation(
+                    "w1",
+                    &FileFingerprint {
+                        identity,
+                        size: 1,
+                        sha256: DIGEST_A.into(),
+                    },
+                    path,
+                    1_000,
+                )
+                .unwrap();
+        }
+        store
+            .insert_managed_run(&ManagedRun {
+                id: "run1".into(),
+                workspace_id: "w1".into(),
+                kind: ManagedRunKind::Classify,
+                state: RunState::Completed,
+                plan_path: Some(root.path().join("plan.json").display().to_string()),
+                apply_path: Some(root.path().join("apply.json").display().to_string()),
+                undo_path: None,
+                started_unix_ms: 1_000,
+                finished_unix_ms: Some(2_000),
+                move_count: 1,
+                error: None,
+            })
+            .unwrap();
+        store
+            .set_inbox_item_state("w1", returned.clone(), InboxState::Moved, Some("run1"))
+            .unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_returned_reset
+                 BEFORE UPDATE OF state ON inbox_items
+                 WHEN OLD.state != 'pending'
+                 BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .reconcile_inbox_index("w1", std::slice::from_ref(&returned))
+                .is_err()
+        );
+        assert!(store.inbox_item("w1", stale).unwrap().is_some());
+        assert_eq!(
+            store.inbox_item("w1", returned).unwrap().unwrap().state,
+            InboxState::Moved
+        );
+    }
+
+    #[test]
     fn inbox_eligibility_requires_retention_and_a_stable_settle_window() {
         let root = tempdir().unwrap();
         let mut store = StateStore::open_in_memory().unwrap();
@@ -2717,15 +3604,128 @@ mod tests {
         };
         store.insert_managed_run(&run).unwrap();
         assert_eq!(store.managed_run("run1").unwrap(), Some(run.clone()));
-        assert_eq!(store.recent_managed_moves("w1", 10).unwrap(), [run.clone()]);
+        assert!(store.recent_managed_moves("w1", 10).unwrap().is_empty());
 
         run.undo_path = Some(root.path().join("undo.json").display().to_string());
         store.update_managed_run(&run).unwrap();
         assert_eq!(store.managed_runs("w1").unwrap(), [run]);
 
+        let file_run = ManagedRun {
+            id: "run2".into(),
+            workspace_id: "w1".into(),
+            kind: ManagedRunKind::Stage,
+            state: RunState::Completed,
+            plan_path: Some(root.path().join("stage-plan.json").display().to_string()),
+            apply_path: Some(root.path().join("stage-apply.json").display().to_string()),
+            undo_path: None,
+            started_unix_ms: 3_000,
+            finished_unix_ms: Some(4_000),
+            move_count: 1,
+            error: None,
+        };
+        store.insert_managed_run(&file_run).unwrap();
+        assert_eq!(
+            store.recent_managed_moves("w1", 10).unwrap(),
+            std::slice::from_ref(&file_run)
+        );
+
+        let undo_one = root.path().join("undo-one.json").display().to_string();
+        let undo_two = root.path().join("undo-two.json").display().to_string();
+        store
+            .record_managed_undo_journal("run2", &undo_one, 5_000)
+            .unwrap();
+        store
+            .record_managed_undo_journal("run2", &undo_two, 6_000)
+            .unwrap();
+        assert_eq!(
+            store.managed_undo_journal_paths("run2").unwrap(),
+            [undo_one, undo_two]
+        );
+        assert!(
+            store
+                .record_managed_undo_journal(
+                    "run1",
+                    &root.path().join("bad.json").display().to_string(),
+                    7_000
+                )
+                .is_err()
+        );
+
         store.delete_managed_run("run1").unwrap();
-        assert!(store.managed_runs("w1").unwrap().is_empty());
+        assert_eq!(store.managed_runs("w1").unwrap(), [file_run]);
         assert!(store.recent_managed_moves("w1", 0).is_err());
+    }
+
+    #[test]
+    fn managed_undo_finalization_is_atomic_and_retryable() {
+        let root = tempdir().unwrap();
+        let mut store = StateStore::open_in_memory().unwrap();
+        setup_workspace(&mut store, root.path());
+        let identity = FsIdentity {
+            device: 7,
+            inode: 11,
+        };
+        store
+            .upsert_observation(
+                "w1",
+                &FileFingerprint {
+                    identity: identity.clone(),
+                    size: 1,
+                    sha256: DIGEST_A.into(),
+                },
+                "Inbox/report.txt",
+                1_000,
+            )
+            .unwrap();
+        store
+            .insert_managed_run(&ManagedRun {
+                id: "run1".into(),
+                workspace_id: "w1".into(),
+                kind: ManagedRunKind::Stage,
+                state: RunState::Completed,
+                plan_path: Some(root.path().join("plan.json").display().to_string()),
+                apply_path: Some(root.path().join("apply.json").display().to_string()),
+                undo_path: None,
+                started_unix_ms: 1_000,
+                finished_unix_ms: Some(2_000),
+                move_count: 1,
+                error: None,
+            })
+            .unwrap();
+        let undo_path = root.path().join("undo.json").display().to_string();
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_undo_run_update
+                 BEFORE UPDATE OF undo_path ON managed_runs
+                 BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .finalize_managed_undo("run1", &undo_path, std::slice::from_ref(&identity), 3_000)
+                .is_err()
+        );
+        assert!(store.managed_undo_journal_paths("run1").unwrap().is_empty());
+        assert!(store.inbox_item("w1", identity.clone()).unwrap().is_some());
+
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER fail_undo_run_update")
+            .unwrap();
+        store
+            .finalize_managed_undo("run1", &undo_path, std::slice::from_ref(&identity), 3_000)
+            .unwrap();
+        assert_eq!(
+            store.managed_undo_journal_paths("run1").unwrap(),
+            std::slice::from_ref(&undo_path)
+        );
+        assert_eq!(
+            store.managed_run("run1").unwrap().unwrap().undo_path,
+            Some(undo_path)
+        );
+        assert!(store.inbox_item("w1", identity).unwrap().is_none());
     }
 
     #[test]

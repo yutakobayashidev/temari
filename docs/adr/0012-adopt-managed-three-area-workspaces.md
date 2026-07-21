@@ -3,6 +3,7 @@
 ## Status
 
 - Accepted
+- Extended by [ADR 0014](0014-schedule-finite-managed-runs.md) and [ADR 0015](0015-reprocess-managed-files-through-inbox.md).
 
 ## Decision Drivers
 
@@ -41,7 +42,7 @@ These names and artifacts are local product concepts. The design does not depend
 - Record Inbox arrival from Temari's first observation, never from filesystem modification time. A file becomes eligible only after both its retention deadline and a stability window. Content or size changes preserve first observation but reset stability and return the item to pending.
 - Use SQLite for managed workspace definitions, Inbox eligibility, and recent-run indexes. JSON artifacts remain authoritative for setup, apply, resume, and undo. Database loss must not make completed filesystem operations unrecoverable.
 - Support recent move undo by completed session and by selected file IDs. Individual undo restores only selected files and does not remove shared destination directories.
-- Keep background execution out of scope. The first managed CLI runs finite setup, planning, apply, history, and recovery commands; a future service may orchestrate the same application services.
+- Keep background execution out of the initial implementation. The managed CLI runs finite setup, planning, apply, history, and recovery commands. ADR 0014 later adopts explicit platform scheduling of the same finite run service without adding a daemon.
 
 ## Consequences
 
