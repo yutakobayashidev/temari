@@ -13,7 +13,9 @@ pub use apply::{
     UndoState, apply_plan, preflight_apply, preflight_resume, preflight_undo, resume_apply_session,
     undo_session,
 };
-pub use artifact::{ApprovedFolder, FallbackCategory, FolderProposal, FolderSet, Proposal};
+pub use artifact::{
+    ApprovedFolder, FallbackCategory, FolderProposal, FolderSet, Proposal, ScanScope,
+};
 pub use classification::{
     ClassificationOptions, ClassificationSummary, ContentExtractor, LocalContentExtractor,
     classify_files,

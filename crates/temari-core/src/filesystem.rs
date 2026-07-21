@@ -99,6 +99,23 @@ pub(crate) fn verify_directory_chain(root: &Path, relative: &str) -> Result<(), 
     Ok(())
 }
 
+pub(crate) fn verify_existing_directory_chain(root: &Path, relative: &str) -> Result<(), Error> {
+    normalize_relative_path(relative)?;
+    let mut current = root.to_path_buf();
+    for component in relative.split('/') {
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|source| io_error("inspect", &current, source))?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(Error::InvalidArtifact(format!(
+                "source component must be a real directory: {:?}",
+                current.display().to_string()
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn path_exists(path: &Path) -> Result<bool, Error> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),

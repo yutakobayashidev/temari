@@ -42,7 +42,7 @@ pub enum NameDecision {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ContentCandidate {
     pub file_id: String,
-    pub name: String,
+    pub source_path: String,
     pub content: String,
 }
 
@@ -330,7 +330,7 @@ mod tests {
             .classify_names(
                 &[FileCandidate {
                     id: "f000001".into(),
-                    name: "report.pdf".into(),
+                    source_path: "report.pdf".into(),
                     extension: "pdf".into(),
                 }],
                 &[ApprovedFolder {
@@ -404,7 +404,7 @@ mod tests {
             .propose_folders(
                 &[FileCandidate {
                     id: "f000001".into(),
-                    name: "report.pdf".into(),
+                    source_path: "report.pdf".into(),
                     extension: "pdf".into(),
                 }],
                 8,

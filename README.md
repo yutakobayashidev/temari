@@ -10,6 +10,7 @@ Proposal, approval, and planning are read-only. Filesystem changes require a sep
 - Approval adds deterministic `Others/*` fallbacks as opaque destinations. Automatically added fallbacks are local-only; an identically named user destination is reused.
 - The entire response is rejected if it contains an unknown file ID, unknown destination ID, duplicate result, or missing result.
 - Symlinks, directories, and paths outside the source root are excluded from classification.
+- Root-level files are always included. Recursive traversal is opt-in through artifact-bound source-relative subtrees, and approved destination subtrees are excluded to prevent reprocessing.
 - Plans contain local SHA-256, size, device, and inode fingerprints. These values and raw files are never sent to the model. Extracted text is neither logged nor persisted.
 - Apply revalidates the source root, fingerprints, real directory components, and unoccupied destinations before mutation. It never overwrites.
 - Undo restores only recorded moves whose identity and content still match, and removes only session-created directories that remain empty.
@@ -45,6 +46,17 @@ $ cargo run -p temari-cli -- apply downloads.plan.json --out downloads.apply.jso
 $ cargo run -p temari-cli -- undo downloads.apply.json --out downloads.undo.json
 ```
 
+To include selected existing directories recursively, repeat `--include-subtree`. Use `.` only when the entire source tree should be included:
+
+```console
+$ cargo run -p temari-cli -- propose ~/Downloads \
+    --include-subtree Receipts --include-subtree Work --out downloads.proposal.json
+$ cargo run -p temari-cli -- organize ~/Downloads \
+    --include-subtree . --out downloads-run
+```
+
+The selected scope is stored in the proposal, approved folder set, and plan. `plan` does not accept a replacement scope.
+
 If an apply journal remains `running` after a crash, reconcile and continue it explicitly:
 
 ```console
@@ -77,13 +89,13 @@ The name pass runs for every file. Only `needs_content` results use local UTF-8 
 temari [--config PATH] [--json] [--no-input] [--no-color] [-v] <COMMAND>
 
 Commands:
-  propose <SOURCE> --out <PROPOSAL>                 Propose a folder hierarchy
+  propose <SOURCE> --out <PROPOSAL> [--include-subtree <PATH>]...
   approve <PROPOSAL> --out <FOLDER_SET>             Validate and approve it
   plan <SOURCE> --folders <FOLDER_SET> --out <PLAN> Classify files without changing them
   apply <PLAN> --out <APPLY_SESSION> [--yes]         Create directories and move files
   undo <APPLY_SESSION> --out <UNDO_SESSION> [--yes] Restore safely recorded moves
   resume <APPLY_SESSION> [--yes]                     Reconcile and continue a running apply
-  organize <SOURCE> --out <RUN_DIR>                  Run the guided TTY workflow
+  organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...
 ```
 
 - Artifact paths go to stdout. Read-only commands accept `--out -` to emit artifact JSON. Apply and undo require persistent journal paths outside the organized source.
@@ -103,7 +115,7 @@ The workflow follows five explicit trust boundaries:
 4. `apply`: after confirmation, local code creates only required approved directories and performs validated moves while atomically updating an audit journal.
 5. `undo`: local code conservatively reverses recorded moves and removes only unchanged, empty directories created by that apply session.
 
-All five primitive stages, explicit crash resume, and the interactive `organize` orchestrator are implemented. Background monitoring remains future work. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for persistence, and [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification and privacy.
+All five primitive stages, explicit crash resume, and the interactive `organize` orchestrator are implemented. Background monitoring remains future work. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification and privacy, and [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope.
 
 Example schemas are available for a model-created [proposal](examples/proposal.example.json) and a locally approved [folder set](examples/folders.example.json). Their source paths are illustrative and must match the canonical source used by `plan`.
 

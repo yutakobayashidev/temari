@@ -9,6 +9,7 @@ use std::{
 use crate::{
     ApprovedFolder, Classification, ClassificationBasis, Classifier, ContentCandidate,
     ContentPolicy, Error, FallbackCategory, FileCandidate, NameClassification, NameDecision,
+    artifact::normalize_relative_path, filesystem::verify_existing_directory_chain,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -50,10 +51,16 @@ impl ContentExtractor for LocalContentExtractor {
         max_chars: usize,
         max_file_bytes: u64,
     ) -> Option<ContentCandidate> {
-        if !is_direct_child_name(&file.name) {
+        if normalize_relative_path(&file.source_path).is_err() {
             return None;
         }
-        let path = source.join(&file.name);
+        let parent = Path::new(&file.source_path).parent()?;
+        if !parent.as_os_str().is_empty()
+            && verify_existing_directory_chain(source, parent.to_str()?).is_err()
+        {
+            return None;
+        }
+        let path = source.join(&file.source_path);
         let metadata = fs::symlink_metadata(&path).ok()?;
         if !metadata.file_type().is_file() || metadata.len() > max_file_bytes {
             return None;
@@ -71,7 +78,7 @@ impl ContentExtractor for LocalContentExtractor {
         }
         Some(ContentCandidate {
             file_id: file.id.clone(),
-            name: file.name.clone(),
+            source_path: file.source_path.clone(),
             content,
         })
     }
@@ -87,10 +94,10 @@ pub fn classify_files<C: Classifier, E: ContentExtractor>(
 ) -> Result<ClassificationSummary, Error> {
     validate_options(options)?;
     for file in files {
-        if !is_direct_child_name(&file.name) {
+        if normalize_relative_path(&file.source_path).is_err() {
             return Err(Error::InvalidArtifact(format!(
-                "classification input is not a direct child file name: {:?}",
-                file.name
+                "classification input is not a normalized relative source path: {:?}",
+                file.source_path
             )));
         }
     }
@@ -352,14 +359,6 @@ fn is_direct_text_extension(extension: &str) -> bool {
     )
 }
 
-fn is_direct_child_name(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains(['/', '\\'])
-        && !name.chars().any(char::is_control)
-}
-
 fn fallback_category(extension: &str) -> FallbackCategory {
     match extension.to_ascii_lowercase().as_str() {
         "pdf" => FallbackCategory::Pdf,
@@ -434,7 +433,7 @@ mod tests {
                 .iter()
                 .map(|file| NameClassification {
                     file_id: file.id.clone(),
-                    decision: if file.name.starts_with("clear") {
+                    decision: if file.source_path.starts_with("clear") {
                         NameDecision::Destination {
                             destination_id: folders[0].id.clone(),
                         }
@@ -468,8 +467,9 @@ mod tests {
 
     fn folders(source: &Path) -> Vec<ApprovedFolder> {
         Proposal {
-            version: 1,
+            version: 2,
             source: source.display().to_string(),
+            scope: crate::ScanScope::default(),
             files_considered: 2,
             folders: vec![FolderProposal {
                 path: "Documents".into(),
@@ -501,17 +501,17 @@ mod tests {
         let files = vec![
             FileCandidate {
                 id: "f1".into(),
-                name: "clear.txt".into(),
+                source_path: "clear.txt".into(),
                 extension: "txt".into(),
             },
             FileCandidate {
                 id: "f2".into(),
-                name: "ambiguous.txt".into(),
+                source_path: "ambiguous.txt".into(),
                 extension: "txt".into(),
             },
             FileCandidate {
                 id: "f3".into(),
-                name: "ambiguous.png".into(),
+                source_path: "ambiguous.png".into(),
                 extension: "PNG".into(),
             },
         ];
@@ -558,7 +558,7 @@ mod tests {
         fs::write(source.path().join("ambiguous.txt"), "private content").unwrap();
         let files = vec![FileCandidate {
             id: "f1".into(),
-            name: "ambiguous.txt".into(),
+            source_path: "ambiguous.txt".into(),
             extension: "txt".into(),
         }];
         let folders = folders(source.path());
@@ -579,8 +579,14 @@ mod tests {
 
         assert_eq!(result.by_fallback, 1);
         assert!(classifier.content_calls.borrow().is_empty());
-        let plan =
-            crate::build_plan(source.path(), &files, &folders, result.classifications).unwrap();
+        let plan = crate::build_plan(
+            source.path(),
+            &crate::ScanScope::default(),
+            &files,
+            &folders,
+            result.classifications,
+        )
+        .unwrap();
         let artifact = serde_json::to_string(&plan).unwrap();
         assert!(!artifact.contains("private content"));
     }
@@ -591,7 +597,7 @@ mod tests {
         let files: Vec<_> = (0..51)
             .map(|index| FileCandidate {
                 id: format!("f{index:06}"),
-                name: format!("clear-{index}.txt"),
+                source_path: format!("clear-{index}.txt"),
                 extension: "txt".into(),
             })
             .collect();
@@ -620,7 +626,7 @@ mod tests {
         let source = tempdir().unwrap();
         let files = vec![FileCandidate {
             id: "f1".into(),
-            name: "clear.txt".into(),
+            source_path: "clear.txt".into(),
             extension: "txt".into(),
         }];
         let folders = folders(source.path());
@@ -647,12 +653,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_path_like_file_name_before_content_extraction() {
+    fn rejects_parent_traversal_before_content_extraction() {
         let source = tempdir().unwrap();
         let folders = folders(source.path());
         let files = vec![FileCandidate {
             id: "f1".into(),
-            name: "../secret.txt".into(),
+            source_path: "../secret.txt".into(),
             extension: "txt".into(),
         }];
         let classifier = FakeClassifier {
@@ -670,7 +676,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("direct child"));
+        assert!(error.to_string().contains("relative source path"));
         assert!(classifier.name_calls.borrow().is_empty());
     }
 }

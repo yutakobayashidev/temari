@@ -10,10 +10,11 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ApprovedFolder, Classification, ClassificationBasis, Error, FileCandidate, FileFingerprint,
-    FsIdentity,
+    FsIdentity, ScanScope,
     artifact::normalize_relative_path,
     filesystem::{
         canonical_directory, checked_join, fingerprint, path_exists, verify_directory_chain,
+        verify_existing_directory_chain,
     },
 };
 
@@ -23,6 +24,7 @@ pub struct Plan {
     pub version: u32,
     pub source: String,
     pub source_identity: FsIdentity,
+    pub scope: ScanScope,
     pub collision_policy: CollisionPolicy,
     pub folders: Vec<ApprovedFolder>,
     pub directories: Vec<String>,
@@ -39,7 +41,7 @@ pub enum CollisionPolicy {
 #[serde(deny_unknown_fields)]
 pub struct PlanEntry {
     pub file_id: String,
-    pub file_name: String,
+    pub source_path: String,
     pub source_fingerprint: FileFingerprint,
     pub destination_id: String,
     pub requested_destination: String,
@@ -60,12 +62,13 @@ impl Plan {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        if self.version != 2 {
+        if self.version != 3 {
             return Err(Error::InvalidArtifact(format!(
-                "unsupported plan version {}; expected 2",
+                "unsupported plan version {}; expected 3",
                 self.version
             )));
         }
+        self.scope.validate()?;
         let source = Path::new(&self.source);
         if !source.is_absolute() || self.source.chars().any(char::is_control) {
             return Err(Error::InvalidArtifact(
@@ -93,11 +96,12 @@ impl Plan {
         }
 
         let mut file_ids = HashSet::new();
-        let mut file_names = HashSet::new();
+        let mut source_paths = HashSet::new();
         let mut destinations = HashSet::new();
         let folder_set = crate::FolderSet {
-            version: 2,
+            version: 3,
             source: self.source.clone(),
+            scope: self.scope.clone(),
             folders: self.folders.clone(),
         };
         folder_set.validate()?;
@@ -113,11 +117,27 @@ impl Plan {
                     entry.file_id
                 )));
             }
-            validate_file_name(&entry.file_name)?;
-            if !file_names.insert(entry.file_name.as_str()) {
+            normalize_relative_path(&entry.source_path)?;
+            if !self.scope.contains(&entry.source_path) {
+                return Err(Error::InvalidArtifact(format!(
+                    "planned source is outside the approved scope: {:?}",
+                    entry.source_path
+                )));
+            }
+            if !source_paths.insert(entry.source_path.as_str()) {
                 return Err(Error::InvalidArtifact(format!(
                     "duplicate planned source file {:?}",
-                    entry.file_name
+                    entry.source_path
+                )));
+            }
+            if self
+                .folders
+                .iter()
+                .any(|folder| path_in_subtree(&entry.source_path, &folder.path))
+            {
+                return Err(Error::InvalidArtifact(format!(
+                    "planned source is inside an approved destination: {:?}",
+                    entry.source_path
                 )));
             }
             let folder = folders_by_id
@@ -130,7 +150,8 @@ impl Plan {
                 })?;
             normalize_relative_path(&entry.requested_destination)?;
             normalize_relative_path(&entry.destination_path)?;
-            let expected_requested = format!("{}/{}", folder.path, entry.file_name);
+            let file_name = relative_file_name(&entry.source_path)?;
+            let expected_requested = format!("{}/{}", folder.path, file_name);
             if entry.requested_destination != expected_requested
                 || destination_parent(&entry.destination_path)? != folder.path
             {
@@ -195,6 +216,7 @@ impl Plan {
 
 pub fn build_plan(
     source: &Path,
+    scope: &ScanScope,
     files: &[FileCandidate],
     folders: &[ApprovedFolder],
     classifications: Vec<Classification>,
@@ -207,6 +229,7 @@ pub fn build_plan(
         )));
     }
     let (canonical_source, source_identity) = canonical_directory(source)?;
+    scope.validate()?;
     let files_by_id: HashMap<_, _> = files.iter().map(|file| (&file.id, file)).collect();
     let folders_by_id: HashMap<_, _> = folders.iter().map(|folder| (&folder.id, folder)).collect();
     let mut classified = Vec::with_capacity(classifications.len());
@@ -237,15 +260,41 @@ pub fn build_plan(
     let mut missing_directories = BTreeSet::new();
     let mut entries = Vec::with_capacity(classified.len());
     for (classification, file, folder) in classified {
-        validate_file_name(&file.name)?;
+        normalize_relative_path(&file.source_path)?;
+        if !scope.contains(&file.source_path) {
+            return Err(Error::InvalidArtifact(format!(
+                "planned source is outside the approved scope: {:?}",
+                file.source_path
+            )));
+        }
+        if folders
+            .iter()
+            .any(|approved| path_in_subtree(&file.source_path, &approved.path))
+        {
+            return Err(Error::InvalidArtifact(format!(
+                "planned source is inside an approved destination: {:?}",
+                file.source_path
+            )));
+        }
+        let file_name = relative_file_name(&file.source_path)?;
         verify_directory_chain(&canonical_source, &folder.path)?;
-        let source_path = canonical_source.join(&file.name);
+        if let Some(parent) = Path::new(&file.source_path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            verify_existing_directory_chain(
+                &canonical_source,
+                parent.to_str().ok_or_else(|| {
+                    Error::InvalidArtifact("source parent path must be valid UTF-8".into())
+                })?,
+            )?;
+        }
+        let source_path = canonical_source.join(&file.source_path);
         let source_fingerprint = fingerprint(&source_path)?;
-        let requested_destination = format!("{}/{}", folder.path, file.name);
+        let requested_destination = format!("{}/{}", folder.path, file_name);
         let destination_path = resolve_collision(
             &canonical_source,
             &folder.path,
-            &file.name,
+            file_name,
             &reserved_destinations,
         )?;
         reserved_destinations.insert(destination_path.clone());
@@ -256,7 +305,7 @@ pub fn build_plan(
         )?;
         entries.push(PlanEntry {
             file_id: classification.file_id,
-            file_name: file.name.clone(),
+            source_path: file.source_path.clone(),
             source_fingerprint,
             destination_id: classification.destination_id,
             requested_destination,
@@ -277,9 +326,10 @@ pub fn build_plan(
         ));
     }
     let plan = Plan {
-        version: 2,
+        version: 3,
         source: source_text.to_owned(),
         source_identity,
+        scope: scope.clone(),
         collision_policy: CollisionPolicy::Rename,
         folders: folders.to_vec(),
         directories,
@@ -386,6 +436,18 @@ fn validate_file_name(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
+fn relative_file_name(path: &str) -> Result<&str, Error> {
+    let name = path.rsplit('/').next().unwrap_or_default();
+    validate_file_name(name)?;
+    Ok(name)
+}
+
+fn path_in_subtree(path: &str, subtree: &str) -> bool {
+    let path = path.to_lowercase();
+    let subtree = subtree.to_lowercase();
+    path == subtree || path.starts_with(&format!("{subtree}/"))
+}
+
 fn validate_fingerprint(fingerprint: &FileFingerprint) -> Result<(), Error> {
     if fingerprint.sha256.len() != 64
         || !fingerprint
@@ -418,7 +480,7 @@ mod tests {
     fn file(id: &str, name: &str) -> FileCandidate {
         FileCandidate {
             id: id.into(),
-            name: name.into(),
+            source_path: name.into(),
             extension: Path::new(name)
                 .extension()
                 .and_then(|value| value.to_str())
@@ -429,8 +491,9 @@ mod tests {
 
     fn folders() -> Vec<ApprovedFolder> {
         crate::Proposal {
-            version: 1,
+            version: 2,
             source: "/tmp/inbox".into(),
+            scope: ScanScope::default(),
             files_considered: 1,
             folders: vec![crate::FolderProposal {
                 path: "Documents/Reports".into(),
@@ -459,6 +522,7 @@ mod tests {
         let folders = folders();
         let plan = build_plan(
             root.path(),
+            &ScanScope::default(),
             &[file("f1", "report.txt")],
             &folders,
             vec![classification("f1", "d000001")],
@@ -487,7 +551,14 @@ mod tests {
         ];
 
         let folders = folders();
-        let plan = build_plan(root.path(), &files, &folders, classifications).unwrap();
+        let plan = build_plan(
+            root.path(),
+            &ScanScope::default(),
+            &files,
+            &folders,
+            classifications,
+        )
+        .unwrap();
 
         assert_eq!(
             plan.entries[0].destination_path,
@@ -506,6 +577,7 @@ mod tests {
         let folders = folders();
         let error = build_plan(
             root.path(),
+            &ScanScope::default(),
             &[file("f1", "report.txt")],
             &folders,
             vec![classification("f1", "invented")],
@@ -522,6 +594,7 @@ mod tests {
         let folders = folders();
         let error = build_plan(
             root.path(),
+            &ScanScope::default(),
             &[file("f1", "report.txt")],
             &folders,
             Vec::new(),
@@ -529,5 +602,76 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("expected 1"));
+    }
+
+    #[test]
+    fn nested_duplicate_basenames_keep_distinct_sources_and_destinations() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("incoming/a")).unwrap();
+        fs::create_dir_all(root.path().join("incoming/b")).unwrap();
+        fs::write(root.path().join("incoming/a/report.txt"), b"one").unwrap();
+        fs::write(root.path().join("incoming/b/report.txt"), b"two").unwrap();
+        let scope = ScanScope::new(vec!["incoming".into()]).unwrap();
+        let files = [
+            file("f1", "incoming/a/report.txt"),
+            file("f2", "incoming/b/report.txt"),
+        ];
+        let folders = folders();
+
+        let plan = build_plan(
+            root.path(),
+            &scope,
+            &files,
+            &folders,
+            vec![
+                classification("f1", "d000001"),
+                classification("f2", "d000001"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(plan.entries[0].source_path, "incoming/a/report.txt");
+        assert_eq!(plan.entries[1].source_path, "incoming/b/report.txt");
+        assert_eq!(
+            plan.entries[0].destination_path,
+            "Documents/Reports/report.txt"
+        );
+        assert_eq!(
+            plan.entries[1].destination_path,
+            "Documents/Reports/report 1.txt"
+        );
+    }
+
+    #[test]
+    fn rejects_nested_source_outside_scope_or_inside_destination() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("nested")).unwrap();
+        fs::write(root.path().join("nested/report.txt"), b"report").unwrap();
+        let folders = folders();
+        let outside = build_plan(
+            root.path(),
+            &ScanScope::default(),
+            &[file("f1", "nested/report.txt")],
+            &folders,
+            vec![classification("f1", "d000001")],
+        )
+        .unwrap_err();
+        assert!(outside.to_string().contains("outside the approved scope"));
+
+        fs::create_dir_all(root.path().join("Documents/Reports")).unwrap();
+        fs::write(root.path().join("Documents/Reports/already.txt"), b"report").unwrap();
+        let inside = build_plan(
+            root.path(),
+            &ScanScope::new(vec![".".into()]).unwrap(),
+            &[file("f1", "Documents/Reports/already.txt")],
+            &folders,
+            vec![classification("f1", "d000001")],
+        )
+        .unwrap_err();
+        assert!(
+            inside
+                .to_string()
+                .contains("inside an approved destination")
+        );
     }
 }

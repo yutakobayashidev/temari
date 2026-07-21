@@ -1,6 +1,9 @@
 {
-  "version": 2,
+  "version": 3,
   "source": "/home/alice/Downloads",
+  "scope": {
+    "recursive_roots": ["Receipts", "Work"]
+  },
   "folders": [
     {
       "id": "d000001",

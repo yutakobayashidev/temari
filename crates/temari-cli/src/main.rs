@@ -11,8 +11,8 @@ use clap::{ArgAction, Parser, Subcommand};
 use serde::Serialize;
 use temari_core::{
     ApplySession, ApplyState, ClassificationBasis, ClassificationOptions, Config, FolderProposer,
-    FolderSet, LocalContentExtractor, OpenAiCompatibleModel, Plan, Proposal, UndoState, apply_plan,
-    build_plan, classify_files, preflight_apply, preflight_resume, preflight_undo,
+    FolderSet, LocalContentExtractor, OpenAiCompatibleModel, Plan, Proposal, ScanScope, UndoState,
+    apply_plan, build_plan, classify_files, preflight_apply, preflight_resume, preflight_undo,
     resume_apply_session, scan_directory, select_representative_files, undo_session,
 };
 use tempfile::NamedTempFile;
@@ -64,6 +64,10 @@ enum Command {
         /// Maximum number of folders the model may propose.
         #[arg(long, default_value_t = 12)]
         max_folders: usize,
+
+        /// Recursively include this source-relative directory; repeat as needed. Use '.' for all.
+        #[arg(long = "include-subtree")]
+        include_subtrees: Vec<String>,
     },
 
     /// Validate and explicitly approve a folder proposal.
@@ -144,6 +148,10 @@ enum Command {
         /// Maximum number of folders the model may propose.
         #[arg(long, default_value_t = 12)]
         max_folders: usize,
+
+        /// Recursively include this source-relative directory; repeat as needed. Use '.' for all.
+        #[arg(long = "include-subtree")]
+        include_subtrees: Vec<String>,
     },
 }
 
@@ -170,7 +178,8 @@ fn run() -> Result<()> {
             source,
             out,
             max_folders,
-        } => propose(&cli, source, out, *max_folders),
+            include_subtrees,
+        } => propose(&cli, source, out, *max_folders, include_subtrees),
         Command::Approve {
             proposal,
             out,
@@ -188,12 +197,20 @@ fn run() -> Result<()> {
             source,
             out,
             max_folders,
-        } => organize(&cli, source, out, *max_folders),
+            include_subtrees,
+        } => organize(&cli, source, out, *max_folders, include_subtrees),
     }
 }
 
-fn propose(cli: &Cli, source: &Path, out: &Path, max_folders: usize) -> Result<()> {
-    let (_, proposal, _) = generate_proposal(cli, source, max_folders)?;
+fn propose(
+    cli: &Cli,
+    source: &Path,
+    out: &Path,
+    max_folders: usize,
+    include_subtrees: &[String],
+) -> Result<()> {
+    let scope = ScanScope::new(include_subtrees.to_vec())?;
+    let (_, proposal, _) = generate_proposal(cli, source, max_folders, &scope)?;
     write_artifact(out, &proposal)?;
     print_output_result(cli, out)
 }
@@ -202,17 +219,18 @@ fn generate_proposal(
     cli: &Cli,
     source: &Path,
     max_folders: usize,
+    scope: &ScanScope,
 ) -> Result<(PathBuf, Proposal, usize)> {
     if max_folders == 0 {
         bail!("--max-folders must be greater than zero");
     }
     let config = load_config(cli)?;
     let source = canonical_source(source)?;
-    let files =
-        scan_directory(&source).with_context(|| format!("failed to scan {}", source.display()))?;
+    let files = scan_directory(&source, scope, &[])
+        .with_context(|| format!("failed to scan {}", source.display()))?;
     if files.is_empty() {
         bail!(
-            "no regular files found directly below {}; add files or choose another source",
+            "no regular files found in the selected scope below {}; add files or choose another source",
             source.display()
         );
     }
@@ -227,8 +245,9 @@ fn generate_proposal(
     let model = OpenAiCompatibleModel::new(&config.model)?;
     let folders = model.propose_folders(&sample, max_folders)?;
     let proposal = Proposal {
-        version: 1,
+        version: 2,
         source: portable_source_text(&source)?.to_owned(),
+        scope: scope.clone(),
         files_considered: sample.len(),
         folders,
     };
@@ -294,8 +313,13 @@ fn generate_plan(
     show_progress: bool,
 ) -> Result<Plan> {
     let config = load_config(cli)?;
-    let files =
-        scan_directory(source).with_context(|| format!("failed to scan {}", source.display()))?;
+    let excluded: Vec<_> = folder_set
+        .folders
+        .iter()
+        .map(|folder| folder.path.clone())
+        .collect();
+    let files = scan_directory(source, &folder_set.scope, &excluded)
+        .with_context(|| format!("failed to scan {}", source.display()))?;
     if show_progress {
         eprintln!("Classifying {} file name(s)...", files.len());
     }
@@ -323,6 +347,7 @@ fn generate_plan(
     }
     Ok(build_plan(
         source,
+        &folder_set.scope,
         &files,
         &folder_set.folders,
         summary.classifications,
@@ -460,7 +485,13 @@ fn resume(cli: &Cli, session_path: &Path, yes: bool) -> Result<()> {
     print_output_result(cli, session_path)
 }
 
-fn organize(cli: &Cli, source: &Path, run_directory: &Path, max_folders: usize) -> Result<()> {
+fn organize(
+    cli: &Cli,
+    source: &Path,
+    run_directory: &Path,
+    max_folders: usize,
+    include_subtrees: &[String],
+) -> Result<()> {
     if cli.no_input || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         bail!(
             "organize requires an interactive terminal; use propose, approve, plan, and apply for automation"
@@ -469,11 +500,19 @@ fn organize(cli: &Cli, source: &Path, run_directory: &Path, max_folders: usize) 
     if max_folders == 0 {
         bail!("--max-folders must be greater than zero");
     }
+    let scope = ScanScope::new(include_subtrees.to_vec())?;
     let source = canonical_source(source)?;
     create_run_directory(run_directory, &source)?;
     eprintln!("Source: {}", source.display());
-    eprintln!("Scope: regular files directly below the source");
-    eprintln!("Existing subdirectories and symlinks are excluded");
+    if scope.recursive_roots.is_empty() {
+        eprintln!("Scope: regular files directly below the source");
+    } else {
+        eprintln!(
+            "Scope: root files plus recursive subtree(s): {}",
+            scope.recursive_roots.join(", ")
+        );
+    }
+    eprintln!("Unselected subdirectories and symlinks are excluded");
 
     let proposal_path = run_directory.join("proposal.json");
     let review_path = run_directory.join("proposal-review.json");
@@ -482,7 +521,7 @@ fn organize(cli: &Cli, source: &Path, run_directory: &Path, max_folders: usize) 
     let apply_path = run_directory.join("apply-session.json");
 
     eprintln!("Stage 1/4: proposing a folder hierarchy...");
-    let (_, raw_proposal, total_files) = generate_proposal(cli, &source, max_folders)
+    let (_, raw_proposal, total_files) = generate_proposal(cli, &source, max_folders, &scope)
         .with_context(|| {
             format!(
                 "proposal failed; artifacts remain in {}",
@@ -603,6 +642,7 @@ fn review_proposal(raw: &Proposal, review_path: &Path, run_directory: &Path) -> 
 fn approve_review(raw: &Proposal, review: Proposal) -> Result<FolderSet> {
     if raw.version != review.version
         || raw.source != review.source
+        || raw.scope != review.scope
         || raw.files_considered != review.files_considered
     {
         bail!("editing may change folders and descriptions, but not proposal context");
@@ -660,7 +700,7 @@ fn render_plan(plan: &Plan, apply_path: &Path) -> Result<()> {
         };
         eprintln!(
             "  [{basis}] move {} -> {}",
-            terminal_text(&entry.file_name),
+            terminal_text(&entry.source_path),
             terminal_text(&entry.destination_path)
         );
     }
@@ -877,8 +917,9 @@ mod tests {
     #[test]
     fn proposal_review_may_change_folders_but_not_source_context() {
         let raw = Proposal {
-            version: 1,
+            version: 2,
             source: "/tmp/inbox".into(),
+            scope: ScanScope::default(),
             files_considered: 2,
             folders: vec![temari_core::FolderProposal {
                 path: "Documents".into(),

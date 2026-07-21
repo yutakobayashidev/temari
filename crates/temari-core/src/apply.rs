@@ -15,7 +15,7 @@ use crate::{
     artifact::normalize_relative_path,
     filesystem::{
         canonical_directory, checked_join, fingerprint, identity, io_error, path_exists,
-        verify_directory_chain,
+        verify_directory_chain, verify_existing_directory_chain,
     },
 };
 
@@ -156,12 +156,12 @@ impl ApplySession {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        if self.version != 1
+        if self.version != 2
             || !Path::new(&self.source).is_absolute()
             || self.source.chars().any(char::is_control)
         {
             return Err(Error::InvalidArtifact(
-                "apply session must be version 1 with an absolute source".into(),
+                "apply session must be version 2 with an absolute source".into(),
             ));
         }
         validate_digest(&self.plan_sha256)?;
@@ -189,7 +189,7 @@ impl ApplySession {
                     record.source_path
                 )));
             }
-            validate_direct_file_name(&record.source_path)?;
+            normalize_relative_path(&record.source_path)?;
             normalize_relative_path(&record.destination_path)?;
             if !destinations.insert(record.destination_path.as_str()) {
                 return Err(Error::InvalidArtifact(format!(
@@ -258,9 +258,9 @@ impl UndoSession {
             source,
         })?;
         let session: Self = serde_json::from_str(&text)?;
-        if session.version != 1 || !Path::new(&session.source).is_absolute() {
+        if session.version != 2 || !Path::new(&session.source).is_absolute() {
             return Err(Error::InvalidArtifact(
-                "undo session must be version 1 with an absolute source".into(),
+                "undo session must be version 2 with an absolute source".into(),
             ));
         }
         Ok(session)
@@ -270,7 +270,7 @@ impl UndoSession {
 pub fn apply_plan(plan: &Plan, journal_path: &Path) -> Result<ApplySession, Error> {
     preflight_apply(plan, journal_path)?;
     let mut session = ApplySession {
-        version: 1,
+        version: 2,
         id: format!("{}-{}", now_unix_ms()?, std::process::id()),
         plan_sha256: plan.sha256()?,
         source: plan.source.clone(),
@@ -291,7 +291,7 @@ pub fn apply_plan(plan: &Plan, journal_path: &Path) -> Result<ApplySession, Erro
             .iter()
             .map(|entry| MoveRecord {
                 file_id: entry.file_id.clone(),
-                source_path: entry.file_name.clone(),
+                source_path: entry.source_path.clone(),
                 destination_path: entry.destination_path.clone(),
                 fingerprint: entry.source_fingerprint.clone(),
                 outcome: MoveOutcome::Pending,
@@ -348,6 +348,7 @@ fn continue_apply(session: &mut ApplySession, journal_path: &Path) -> Result<(),
         let source_path = checked_join(root, &session.moves[move_index].source_path)?;
         let destination_path = checked_join(root, &session.moves[move_index].destination_path)?;
         let move_result = (|| {
+            verify_source_parent(root, &session.moves[move_index].source_path)?;
             verify_directory_chain(root, &destination_parent)?;
             if fingerprint(&source_path)? != session.moves[move_index].fingerprint {
                 return Err(Error::InvalidArtifact(format!(
@@ -367,7 +368,7 @@ fn continue_apply(session: &mut ApplySession, journal_path: &Path) -> Result<(),
         })();
         match move_result {
             Ok(()) => {
-                sync_directory(root)?;
+                sync_source_parent(root, &session.moves[move_index].source_path)?;
                 sync_directory(&checked_join(root, &destination_parent)?)?;
                 session.moves[move_index].outcome = MoveOutcome::Moved;
                 update_journal(journal_path, session)?;
@@ -392,7 +393,7 @@ pub fn undo_session(apply: &ApplySession, journal_path: &Path) -> Result<UndoSes
     preflight_undo(apply, journal_path)?;
     let root = PathBuf::from(&apply.source);
     let mut undo = UndoSession {
-        version: 1,
+        version: 2,
         apply_session_id: apply.id.clone(),
         source: apply.source.clone(),
         source_identity: apply.source_identity.clone(),
@@ -435,9 +436,9 @@ pub fn undo_session(apply: &ApplySession, journal_path: &Path) -> Result<UndoSes
         }
         let original = checked_join(&root, &apply_record.source_path)?;
         let destination = checked_join(&root, &apply_record.destination_path)?;
-        if let Err(error) =
+        if let Err(error) = verify_source_parent(&root, &apply_record.source_path).and_then(|()| {
             verify_directory_chain(&root, relative_parent(&apply_record.destination_path)?)
-        {
+        }) {
             undo.moves[undo_index].outcome = UndoMoveOutcome::Conflict {
                 message: error.to_string(),
             };
@@ -458,7 +459,7 @@ pub fn undo_session(apply: &ApplySession, journal_path: &Path) -> Result<UndoSes
                 update_journal(journal_path, &undo)?;
                 match fs::rename(&destination, &original) {
                     Ok(()) => {
-                        sync_directory(&root)?;
+                        sync_source_parent(&root, &apply_record.source_path)?;
                         sync_directory(&checked_join(
                             &root,
                             relative_parent(&apply_record.destination_path)?,
@@ -564,11 +565,12 @@ pub fn preflight_apply(plan: &Plan, journal_path: &Path) -> Result<(), Error> {
     plan.validate()?;
     let root = verify_source(&plan.source, &plan.source_identity)?;
     for entry in &plan.entries {
-        let source = checked_join(&root, &entry.file_name)?;
+        verify_source_parent(&root, &entry.source_path)?;
+        let source = checked_join(&root, &entry.source_path)?;
         if fingerprint(&source)? != entry.source_fingerprint {
             return Err(Error::InvalidArtifact(format!(
                 "source changed after planning: {:?}",
-                entry.file_name
+                entry.source_path
             )));
         }
         let parent = relative_parent(&entry.destination_path)?;
@@ -701,6 +703,13 @@ fn reconcile_running_session(session: &mut ApplySession, journal_path: &Path) ->
     for index in 0..session.moves.len() {
         let source = checked_join(root, &session.moves[index].source_path)?;
         let destination = checked_join(root, &session.moves[index].destination_path)?;
+        if let Err(error) = verify_source_parent(root, &session.moves[index].source_path) {
+            session.moves[index].outcome = MoveOutcome::Conflict {
+                message: error.to_string(),
+            };
+            finalize_resume_conflict(session, journal_path)?;
+            return Ok(());
+        }
         if let Err(error) = verify_directory_chain(
             root,
             relative_parent(&session.moves[index].destination_path)?,
@@ -1007,13 +1016,19 @@ fn relative_parent(path: &str) -> Result<&str, Error> {
         })
 }
 
-fn validate_direct_file_name(name: &str) -> Result<(), Error> {
-    if name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
-        return Err(Error::InvalidArtifact(format!(
-            "session source must be one file-name component: {name:?}"
-        )));
+fn verify_source_parent(root: &Path, source_path: &str) -> Result<(), Error> {
+    normalize_relative_path(source_path)?;
+    if let Some((parent, _)) = source_path.rsplit_once('/') {
+        verify_existing_directory_chain(root, parent)?;
     }
     Ok(())
+}
+
+fn sync_source_parent(root: &Path, source_path: &str) -> Result<(), Error> {
+    match source_path.rsplit_once('/') {
+        Some((parent, _)) => sync_directory(&checked_join(root, parent)?),
+        None => sync_directory(root),
+    }
 }
 
 fn validate_fingerprint(value: &FileFingerprint) -> Result<(), Error> {
@@ -1035,7 +1050,7 @@ fn validate_digest(value: &str) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     use tempfile::tempdir;
 
@@ -1048,8 +1063,9 @@ mod tests {
     fn plan(root: &Path) -> Plan {
         fs::write(root.join("report.txt"), b"report").unwrap();
         let folders = Proposal {
-            version: 1,
+            version: 2,
             source: root.display().to_string(),
+            scope: crate::ScanScope::default(),
             files_considered: 1,
             folders: vec![FolderProposal {
                 path: "Documents/Reports".into(),
@@ -1061,9 +1077,46 @@ mod tests {
         .folders;
         build_plan(
             root,
+            &crate::ScanScope::default(),
             &[FileCandidate {
                 id: "f000001".into(),
-                name: "report.txt".into(),
+                source_path: "report.txt".into(),
+                extension: "txt".into(),
+            }],
+            &folders,
+            vec![Classification {
+                file_id: "f000001".into(),
+                destination_id: "d000001".into(),
+                reasoning: None,
+                basis: ClassificationBasis::Name,
+            }],
+        )
+        .unwrap()
+    }
+
+    fn nested_plan(root: &Path) -> Plan {
+        fs::create_dir_all(root.join("incoming/deep")).unwrap();
+        fs::write(root.join("incoming/deep/report.txt"), b"report").unwrap();
+        let scope = crate::ScanScope::new(vec!["incoming".into()]).unwrap();
+        let folders = Proposal {
+            version: 2,
+            source: root.display().to_string(),
+            scope: scope.clone(),
+            files_considered: 1,
+            folders: vec![FolderProposal {
+                path: "Documents/Reports".into(),
+                description: "Reports".into(),
+            }],
+        }
+        .approve()
+        .unwrap()
+        .folders;
+        build_plan(
+            root,
+            &scope,
+            &[FileCandidate {
+                id: "f000001".into(),
+                source_path: "incoming/deep/report.txt".into(),
                 extension: "txt".into(),
             }],
             &folders,
@@ -1272,5 +1325,49 @@ mod tests {
         session.finished_unix_ms = None;
 
         assert!(preflight_undo(&session, &journals.path().join("undo.json")).is_err());
+    }
+
+    #[test]
+    fn applies_and_undoes_a_nested_source_without_removing_source_directories() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        let plan = nested_plan(root.path());
+        let apply_path = journals.path().join("apply.json");
+        let undo_path = journals.path().join("undo.json");
+
+        let apply = apply_plan(&plan, &apply_path).unwrap();
+        assert!(root.path().join("incoming/deep").is_dir());
+        assert!(root.path().join("Documents/Reports/report.txt").is_file());
+
+        let undo = undo_session(&apply, &undo_path).unwrap();
+        assert_eq!(undo.state, UndoState::Completed);
+        assert!(root.path().join("incoming/deep/report.txt").is_file());
+        assert!(root.path().join("incoming/deep").is_dir());
+    }
+
+    #[test]
+    fn preflight_rejects_a_nested_source_parent_replaced_by_a_symlink() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        let plan = nested_plan(root.path());
+        fs::rename(
+            root.path().join("incoming"),
+            root.path().join("real-incoming"),
+        )
+        .unwrap();
+        symlink(
+            root.path().join("real-incoming"),
+            root.path().join("incoming"),
+        )
+        .unwrap();
+
+        let error = apply_plan(&plan, &journals.path().join("apply.json")).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("source component must be a real directory")
+        );
+        assert!(!journals.path().join("apply.json").exists());
     }
 }

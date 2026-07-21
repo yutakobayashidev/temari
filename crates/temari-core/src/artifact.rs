@@ -9,6 +9,7 @@ use crate::Error;
 pub struct Proposal {
     pub version: u32,
     pub source: String,
+    pub scope: ScanScope,
     pub files_considered: usize,
     pub folders: Vec<FolderProposal>,
 }
@@ -25,7 +26,55 @@ pub struct FolderProposal {
 pub struct FolderSet {
     pub version: u32,
     pub source: String,
+    pub scope: ScanScope,
     pub folders: Vec<ApprovedFolder>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanScope {
+    pub recursive_roots: Vec<String>,
+}
+
+impl ScanScope {
+    pub fn new(mut recursive_roots: Vec<String>) -> Result<Self, Error> {
+        recursive_roots.sort();
+        let scope = Self { recursive_roots };
+        scope.validate()?;
+        Ok(scope)
+    }
+
+    pub fn validate(&self) -> Result<(), Error> {
+        let mut previous: Option<&str> = None;
+        for root in &self.recursive_roots {
+            if root != "." {
+                normalize_relative_path(root)?;
+            }
+            if let Some(previous) = previous {
+                if previous >= root.as_str() {
+                    return Err(Error::InvalidArtifact(
+                        "recursive scope roots must be sorted and unique".into(),
+                    ));
+                }
+                if previous == "." || root.starts_with(&format!("{previous}/")) {
+                    return Err(Error::InvalidArtifact(format!(
+                        "recursive scope roots must not overlap: {previous:?} and {root:?}"
+                    )));
+                }
+            }
+            previous = Some(root);
+        }
+        Ok(())
+    }
+
+    pub fn contains(&self, source_path: &str) -> bool {
+        if !source_path.contains('/') {
+            return true;
+        }
+        self.recursive_roots
+            .iter()
+            .any(|root| root == "." || source_path.starts_with(&format!("{root}/")))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -97,12 +146,13 @@ impl FallbackCategory {
 impl Proposal {
     pub fn load(path: &Path) -> Result<Self, Error> {
         let proposal: Self = read_json(path)?;
-        if proposal.version != 1 {
+        if proposal.version != 2 {
             return Err(Error::InvalidArtifact(format!(
-                "unsupported proposal version {}; expected 1",
+                "unsupported proposal version {}; expected 2",
                 proposal.version
             )));
         }
+        proposal.scope.validate()?;
         if !Path::new(&proposal.source).is_absolute()
             || proposal.source.chars().any(char::is_control)
         {
@@ -161,8 +211,9 @@ impl Proposal {
             });
         }
         let folder_set = FolderSet {
-            version: 2,
+            version: 3,
             source: self.source,
+            scope: self.scope,
             folders,
         };
         folder_set.validate()?;
@@ -178,12 +229,13 @@ impl FolderSet {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        if self.version != 2 {
+        if self.version != 3 {
             return Err(Error::InvalidArtifact(format!(
-                "unsupported folder-set version {}; expected 2",
+                "unsupported folder-set version {}; expected 3",
                 self.version
             )));
         }
+        self.scope.validate()?;
         if !Path::new(&self.source).is_absolute() || self.source.chars().any(char::is_control) {
             return Err(Error::InvalidArtifact(
                 "folder-set source must be an absolute path without control characters".into(),
@@ -296,8 +348,9 @@ mod tests {
 
     fn proposal(paths: &[&str]) -> Proposal {
         Proposal {
-            version: 1,
+            version: 2,
             source: "/tmp/inbox".into(),
+            scope: ScanScope::default(),
             files_considered: 3,
             folders: paths
                 .iter()
@@ -315,7 +368,7 @@ mod tests {
 
         assert_eq!(folder_set.folders[0].id, "d000001");
         assert_eq!(folder_set.folders[0].path, "Work/Reports");
-        assert_eq!(folder_set.version, 2);
+        assert_eq!(folder_set.version, 3);
         assert_eq!(folder_set.folders.len(), 11);
     }
 

@@ -9,8 +9,9 @@ use tempfile::tempdir;
 fn write_plan(source: &Path, path: &Path) -> Plan {
     fs::write(source.join("report.txt"), b"report").unwrap();
     let folders = Proposal {
-        version: 1,
+        version: 2,
         source: source.display().to_string(),
+        scope: temari_core::ScanScope::default(),
         files_considered: 1,
         folders: vec![FolderProposal {
             path: "Documents".into(),
@@ -22,9 +23,10 @@ fn write_plan(source: &Path, path: &Path) -> Plan {
     .folders;
     let plan = build_plan(
         source,
+        &temari_core::ScanScope::default(),
         &[FileCandidate {
             id: "f000001".into(),
-            name: "report.txt".into(),
+            source_path: "report.txt".into(),
             extension: "txt".into(),
         }],
         &folders,

@@ -7,13 +7,13 @@ The implementation will evolve, but the experimental CLI contract will be redesi
 ## Command tree
 
 ```text
-temari [global options] propose <SOURCE> --out <PROPOSAL>
+temari [global options] propose <SOURCE> --out <PROPOSAL> [--include-subtree <PATH>]...
 temari [global options] approve <PROPOSAL> --out <FOLDER_SET>
 temari [global options] plan <SOURCE> --folders <FOLDER_SET> --out <PLAN>
 temari [global options] apply <PLAN> --out <APPLY_SESSION> [--yes]
 temari [global options] undo <APPLY_SESSION> --out <UNDO_SESSION> [--yes]
 temari [global options] resume <APPLY_SESSION> [--yes]
-temari [global options] organize <SOURCE> --out <RUN_DIR>
+temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...
 ```
 
 `organize` is an interactive convenience command. The five primitive commands remain the stable interface for agents and scripts.
@@ -23,8 +23,10 @@ temari [global options] organize <SOURCE> --out <RUN_DIR>
 ### `propose`
 
 - Read-only.
-- Scans regular files directly below the selected source and sends a representative sample of at most 100 file names, extensions, and opaque file IDs.
-- Produces a versioned `Proposal` containing the canonical source path, sample count, relative hierarchy suggestions, and descriptions.
+- Always scans regular files directly below the source. Each repeated `--include-subtree` adds one source-relative directory recursively; `.` selects the complete tree.
+- Never follows symlink files or directories. Rejects overlapping recursive roots and non-portable paths.
+- Sends a representative sample of at most 100 relative paths, extensions, and opaque file IDs.
+- Produces a version 2 `Proposal` containing the canonical source path, immutable `ScanScope`, sample count, relative hierarchy suggestions, and descriptions.
 - Does not create folders or assign executable destination paths.
 
 ### `approve`
@@ -33,7 +35,7 @@ temari [global options] organize <SOURCE> --out <RUN_DIR>
 - Previews the proposed hierarchy and asks for confirmation when stdin and stderr are terminals. Edit the proposal JSON before approval when hierarchy changes are needed.
 - Validates normalized relative paths and assigns opaque destination IDs.
 - Adds deterministic `Others/*` destinations for PDF, spreadsheet, image, video, audio, archive, code, presentation, and miscellaneous fallbacks. Automatically added fallbacks are visible during approval but local-only during classification; an identically named user proposal is reused and remains model-visible.
-- Produces a version 2 `FolderSet` that identifies model-visible and fallback destinations.
+- Produces a version 3 `FolderSet` that preserves the approved scope and identifies model-visible and fallback destinations.
 - In non-interactive mode, fails unless `--accept-all` is supplied.
 
 ### `plan`
@@ -43,7 +45,8 @@ temari [global options] organize <SOURCE> --out <RUN_DIR>
 - A name result may request content. With `privacy.content = "on_demand"`, the core extracts bounded UTF-8 or PDF text locally and classifies those files in batches of 20. With `metadata_only`, no content is read or sent.
 - Uses deterministic approved fallback IDs when content is disabled, unsupported, oversized, empty, or cannot be extracted. Model and endpoint failures remain errors rather than silently falling back.
 - Rejects a `FolderSet` created for a different canonical source path.
-- Produces a version 2 `Plan` containing approved folders, local SHA-256 and filesystem identities, required directories, collision-resolved destinations, classification basis, and optional reasoning.
+- Uses the scope stored in the `FolderSet`; callers cannot replace it at planning time. Approved destination subtrees are excluded from scanning.
+- Produces a version 3 `Plan` containing scope, relative source paths, approved folders, local SHA-256 and filesystem identities, required directories, collision-resolved destinations, classification basis, and optional reasoning.
 - Hashes are computed locally and are never sent to the model.
 - Extracted text and model connectivity are never written to the Plan.
 
@@ -53,6 +56,7 @@ temari [global options] organize <SOURCE> --out <RUN_DIR>
 - Shows a summary and asks for confirmation on a TTY.
 - Requires `--yes` when no TTY is available.
 - Revalidates root containment, symlinks, fingerprints, destination types, permissions, and collisions immediately before each operation.
+- Revalidates every existing source-parent component before nested moves. Empty source directories are never removed.
 - Requires a new persistent `--out` path outside the organized source; `--out -` and existing paths are rejected.
 - Creates missing directories lazily, never overwrites, and atomically checkpoints `pending`, in-progress, and completed outcomes.
 - Finalizes an immutable `ApplySession`; partial failure remains honestly recorded and returns a failure exit.
@@ -118,6 +122,7 @@ $ temari apply downloads.plan.json --out downloads.apply.json
 $ temari undo downloads.apply.json --out downloads.undo.json
 $ temari resume interrupted.apply.json
 $ temari organize ~/Downloads --out downloads-run
+$ temari organize ~/Downloads --include-subtree Receipts --include-subtree Work --out downloads-run
 ```
 
 For an agent-driven approval after the proposal has already been reviewed:
