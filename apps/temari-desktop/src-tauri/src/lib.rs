@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use temari_core::{
@@ -79,6 +80,36 @@ struct ApproveRequest {
 struct PlanPreview {
     plan: Plan,
     sha256: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigLocation {
+    path: Option<String>,
+    default_path: String,
+}
+
+#[tauri::command]
+fn default_config_location() -> Result<ConfigLocation, String> {
+    let directories = ProjectDirs::from("dev", "yutakobayashidev", "temari")
+        .ok_or_else(|| "could not determine the user configuration directory".to_owned())?;
+    let default_path = directories.config_dir().join("config.toml");
+    let path = if default_path.is_file() {
+        Some(path_to_string(&default_path.canonicalize().map_err(
+            |error| {
+                format!(
+                    "could not read model configuration {:?}: {error}",
+                    default_path.display().to_string()
+                )
+            },
+        )?)?)
+    } else {
+        None
+    };
+    Ok(ConfigLocation {
+        path,
+        default_path: path_to_string(&default_path)?,
+    })
 }
 
 #[tauri::command]
@@ -174,7 +205,8 @@ async fn preview_plan(state: State<'_, AppState>) -> Result<PlanPreview, String>
 }
 
 fn generate_proposal(request: ProposeRequest) -> Result<ProposalState, String> {
-    let config = Config::load(Path::new(&request.config_path)).map_err(error_text)?;
+    let config_path = canonical_config(&request.config_path)?;
+    let config = Config::load(&config_path).map_err(error_text)?;
     let source = canonical_source(&request.source)?;
     let scope = ScanScope::new(request.recursive_roots).map_err(error_text)?;
     let files = scan_directory(&source, &scope, &[]).map_err(error_text)?;
@@ -268,6 +300,23 @@ fn canonical_source(source: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn canonical_config(config_path: &str) -> Result<PathBuf, String> {
+    let requested = Path::new(config_path.trim());
+    if !requested.is_absolute() {
+        return Err("choose the model configuration file in the app".into());
+    }
+    let canonical = requested
+        .canonicalize()
+        .map_err(|error| format!("could not read model configuration {config_path:?}: {error}"))?;
+    if !canonical.is_file() {
+        return Err(format!(
+            "model configuration is not a regular file: {}",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
 fn path_to_string(path: &Path) -> Result<String, String> {
     path.to_str()
         .map(str::to_owned)
@@ -284,6 +333,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
+            default_config_location,
             scan_source,
             propose_structure,
             approve_structure,
@@ -338,6 +388,25 @@ mod tests {
         File::create(&file).unwrap();
 
         assert!(canonical_source(file.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn config_path_must_be_an_absolute_regular_file() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join("temari.toml");
+        std::fs::write(&config, "version = 4").unwrap();
+
+        assert_eq!(canonical_config(config.to_str().unwrap()).unwrap(), config);
+        assert!(canonical_config(".temari.toml").is_err());
+        assert!(canonical_config(directory.path().to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn default_config_location_uses_the_platform_config_directory() {
+        let location = default_config_location().unwrap();
+
+        assert!(Path::new(&location.default_path).is_absolute());
+        assert!(location.default_path.ends_with("temari/config.toml"));
     }
 
     struct NameClassifier {
@@ -395,6 +464,7 @@ mod tests {
                 base_url: "http://127.0.0.1:4000/v1".into(),
                 name: "test-model".into(),
                 allowed_hosts: Vec::new(),
+                api_key: None,
                 api_key_env: None,
             },
             privacy: PrivacyConfig {

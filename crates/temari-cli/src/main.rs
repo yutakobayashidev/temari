@@ -1073,6 +1073,7 @@ mod tests {
                 base_url: "https://model.example.test/private/v1?token=hidden".into(),
                 name: "local".into(),
                 allowed_hosts: vec!["model.example.test".into()],
+                api_key: None,
                 api_key_env: Some("PRIVATE_KEY".into()),
             },
             privacy: temari_core::PrivacyConfig {

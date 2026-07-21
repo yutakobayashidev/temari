@@ -1,5 +1,5 @@
 import "./styles.css";
-import { approveStructure, chooseSource, previewPlan, proposeStructure, scanSource } from "./api";
+import { approveStructure, chooseConfig, chooseSource, defaultConfigLocation, previewPlan, proposeStructure, scanSource } from "./api";
 import type { ClassificationBasis, FolderProposal, FolderSet, PlanPreview, Proposal, ScanPreview } from "./types";
 
 type Stage = "source" | "scan" | "shape" | "approve" | "plan";
@@ -14,6 +14,7 @@ type AppState = {
   busy: boolean;
   error: string | null;
   configPath: string;
+  defaultConfigPath: string;
 };
 
 const state: AppState = {
@@ -25,7 +26,8 @@ const state: AppState = {
   planPreview: null,
   busy: false,
   error: null,
-  configPath: ".temari.toml",
+  configPath: "",
+  defaultConfigPath: "",
 };
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -90,11 +92,12 @@ app.innerHTML = `
           <span><small>Source</small><strong id="source-path"></strong></span>
           <button id="change-source" class="text-button" type="button">Change</button>
         </div>
-        <label class="config-strip" id="config-strip" hidden>
-          <span>Model config</span>
-          <input id="config-path" value=".temari.toml" spellcheck="false" aria-describedby="config-help" />
-          <small id="config-help">Used only when requesting a structure</small>
-        </label>
+        <div class="config-strip" id="config-strip" hidden>
+          <label for="config-path">Model config</label>
+          <input id="config-path" readonly placeholder="No configuration selected" aria-describedby="config-help" />
+          <button id="choose-config" class="text-button" type="button">Choose</button>
+          <small id="config-help">Select the TOML file used for model access.</small>
+        </div>
       </section>
 
       <aside class="review" aria-labelledby="review-title">
@@ -137,6 +140,7 @@ const $ = <T extends Element>(selector: string): T => {
 const mainAction = $("#main-action") as HTMLButtonElement;
 const chooseSourceButton = $("#choose-source") as HTMLButtonElement;
 const changeSourceButton = $("#change-source") as HTMLButtonElement;
+const chooseConfigButton = $("#choose-config") as HTMLButtonElement;
 const addFolderButton = $("#add-folder") as HTMLButtonElement;
 const configPathInput = $("#config-path") as HTMLInputElement;
 
@@ -145,6 +149,7 @@ function setBusy(busy: boolean): void {
   mainAction.disabled = busy;
   chooseSourceButton.disabled = busy;
   changeSourceButton.disabled = busy;
+  chooseConfigButton.disabled = busy;
   mainAction.classList.toggle("is-busy", busy);
 }
 
@@ -176,6 +181,14 @@ function render(): void {
   if (state.source) $("#source-path").textContent = state.source;
 
   ($("#config-strip") as HTMLElement).hidden = !hasSource;
+  configPathInput.value = state.configPath;
+  configPathInput.title = state.configPath;
+  chooseConfigButton.textContent = state.configPath ? "Change" : "Choose";
+  $("#config-help").textContent = state.configPath
+    ? `Loaded for this session: ${state.configPath}`
+    : state.defaultConfigPath
+      ? `No config found at ${state.defaultConfigPath}`
+      : "Checking the standard config location…";
   const count = state.proposal?.files_considered ?? state.scan?.fileCount;
   const countBox = $("#file-count") as HTMLElement;
   countBox.hidden = count === undefined;
@@ -309,8 +322,10 @@ function renderReviewText(): void {
     title.textContent = "Tune the proposal";
     copy.textContent = "Rename, regroup, or remove destinations. Approval validates paths and assigns local destination IDs.";
   } else if (state.scan) {
-    title.textContent = "Inventory ready";
-    copy.textContent = "Only file names and extensions were inspected. Request a proposal when this scope looks right.";
+    title.textContent = state.configPath ? "Inventory ready" : "Choose model access";
+    copy.textContent = state.configPath
+      ? "Only file names and extensions were inspected. Request a proposal when this scope looks right."
+      : "Choose the TOML configuration used to request a folder structure.";
   } else if (state.source) {
     title.textContent = "Ready to scan";
     copy.textContent = "The scan is read-only and stays at the top level for this preview.";
@@ -329,7 +344,10 @@ function renderAction(): void {
     plan: "Plan ready",
   };
   mainAction.textContent = labels[state.stage];
-  mainAction.disabled = state.busy || !state.source || state.stage === "plan";
+  mainAction.disabled = state.busy
+    || !state.source
+    || state.stage === "plan"
+    || (state.stage === "scan" && !state.configPath);
   const applyAction = $("#apply-action") as HTMLButtonElement;
   const moveCount = state.planPreview?.plan.entries.length;
   applyAction.querySelector("span")!.textContent = moveCount === undefined ? "Apply moves" : `Apply ${moveCount} moves`;
@@ -371,6 +389,33 @@ async function selectSource(): Promise<void> {
   }
 }
 
+async function selectConfig(): Promise<void> {
+  if (state.busy) return;
+  setBusy(true);
+  state.error = null;
+  try {
+    const configPath = await chooseConfig();
+    if (configPath) state.configPath = configPath;
+  } catch (error) {
+    state.error = formatError(error);
+  } finally {
+    setBusy(false);
+    render();
+  }
+}
+
+async function initializeConfig(): Promise<void> {
+  try {
+    const location = await defaultConfigLocation();
+    state.defaultConfigPath = location.defaultPath;
+    if (!state.configPath && location.path) state.configPath = location.path;
+  } catch (error) {
+    state.error = formatError(error);
+  } finally {
+    render();
+  }
+}
+
 async function advance(): Promise<void> {
   if (!state.source || state.busy) return;
   setBusy(true);
@@ -380,8 +425,7 @@ async function advance(): Promise<void> {
       state.scan = await scanSource(state.source);
       state.stage = "scan";
     } else if (state.stage === "scan") {
-      state.configPath = configPathInput.value.trim();
-      if (!state.configPath) throw new Error("Enter the path to your model configuration file.");
+      if (!state.configPath) throw new Error("Choose the model configuration file in the app.");
       state.proposal = await proposeStructure(state.source, state.configPath);
       state.stage = "shape";
     } else if (state.stage === "shape" && state.proposal) {
@@ -417,6 +461,7 @@ function formatError(error: unknown): string {
 
 chooseSourceButton.addEventListener("click", selectSource);
 changeSourceButton.addEventListener("click", selectSource);
+chooseConfigButton.addEventListener("click", selectConfig);
 mainAction.addEventListener("click", advance);
 
 addFolderButton.addEventListener("click", () => {
@@ -454,3 +499,4 @@ $("#folder-nodes").addEventListener("click", (event) => {
 });
 
 render();
+void initializeConfig();

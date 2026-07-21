@@ -82,12 +82,38 @@ function isTauri(): boolean {
   return "__TAURI_INTERNALS__" in window;
 }
 
+export type ConfigLocation = {
+  path: string | null;
+  defaultPath: string;
+};
+
+export async function defaultConfigLocation(): Promise<ConfigLocation> {
+  if (!isTauri()) {
+    return {
+      path: "/Users/you/Library/Application Support/dev.yutakobayashidev.temari/config.toml",
+      defaultPath: "/Users/you/Library/Application Support/dev.yutakobayashidev.temari/config.toml",
+    };
+  }
+  return invoke<ConfigLocation>("default_config_location");
+}
+
 export async function chooseSource(): Promise<string | null> {
   if (!isTauri()) return demoProposal.source;
   const selected = await open({
     directory: true,
     multiple: false,
     title: "Choose a folder to organize",
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
+export async function chooseConfig(): Promise<string | null> {
+  if (!isTauri()) return "/Users/you/.config/temari/config.toml";
+  const selected = await open({
+    directory: false,
+    multiple: false,
+    title: "Choose model configuration",
+    filters: [{ name: "TOML configuration", extensions: ["toml"] }],
   });
   return typeof selected === "string" ? selected : null;
 }

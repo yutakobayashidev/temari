@@ -23,6 +23,9 @@ pub struct ModelConfig {
     pub name: String,
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub api_key: Option<String>,
+    #[serde(default)]
     pub api_key_env: Option<String>,
 }
 
@@ -87,7 +90,7 @@ impl Config {
             return Err(Error::InvalidConfig("model.name must not be empty".into()));
         }
 
-        self.model.validate_endpoint()?;
+        self.model.validate()?;
         if self.privacy.max_content_chars == 0 {
             return Err(Error::InvalidConfig(
                 "privacy.max_content_chars must be greater than zero".into(),
@@ -186,6 +189,30 @@ impl ModelConfig {
 
         Ok(())
     }
+
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        self.validate_endpoint()?;
+        if self.api_key.is_some() && self.api_key_env.is_some() {
+            return Err(Error::InvalidConfig(
+                "model.api_key and model.api_key_env are mutually exclusive".into(),
+            ));
+        }
+        if self.api_key.as_ref().is_some_and(|value| value.is_empty()) {
+            return Err(Error::InvalidConfig(
+                "model.api_key must not be empty".into(),
+            ));
+        }
+        if self
+            .api_key_env
+            .as_ref()
+            .is_some_and(|value| value.is_empty())
+        {
+            return Err(Error::InvalidConfig(
+                "model.api_key_env must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -199,6 +226,7 @@ mod tests {
                 base_url: "http://127.0.0.1:11434/v1".into(),
                 name: "local".into(),
                 allowed_hosts: vec!["127.0.0.1".into()],
+                api_key: None,
                 api_key_env: None,
             },
             privacy: PrivacyConfig {
@@ -221,6 +249,26 @@ mod tests {
     #[test]
     fn accepts_explicitly_allowed_model_host() {
         config().validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_multiple_api_key_sources() {
+        let mut value = config();
+        value.model.api_key = Some("inline".into());
+        value.model.api_key_env = Some("MODEL_KEY".into());
+
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn serialization_omits_an_inline_api_key() {
+        let mut value = config();
+        value.model.api_key = Some("inline-secret".into());
+
+        let serialized = toml::to_string(&value).unwrap();
+
+        assert!(!serialized.contains("inline-secret"));
+        assert!(!serialized.contains("api_key ="));
     }
 
     #[test]

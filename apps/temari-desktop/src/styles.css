@@ -124,10 +124,10 @@ button:focus-visible, input:focus-visible, a:focus-visible { outline: 3px solid 
 .source-icon { display: grid; place-items: center; width: 30px; height: 30px; color: var(--indigo); border: 1px solid #ccd5d1; border-radius: 50%; }
 .text-button { padding: 3px 0; border: 0; color: var(--indigo); background: none; font-size: 11px; font-weight: 650; cursor: pointer; }
 .text-button:hover { text-decoration: underline; }
-.config-strip { display: grid; grid-template-columns: auto minmax(100px, 240px) auto; gap: 9px; align-items: center; margin-top: 7px; color: var(--muted); font-size: 9px; }
-.config-strip > span { font: 650 8px "SFMono-Regular", monospace; letter-spacing: .07em; text-transform: uppercase; }
+.config-strip { display: grid; grid-template-columns: auto minmax(100px, 1fr) auto; gap: 5px 9px; align-items: center; margin-top: 7px; color: var(--muted); font-size: 9px; }
+.config-strip > label { font: 650 8px "SFMono-Regular", monospace; letter-spacing: .07em; text-transform: uppercase; }
 .config-strip input { min-width: 0; padding: 6px 8px; border: 1px solid #d0d9d5; border-radius: 5px; color: var(--ink); background: rgba(248,250,248,.72); font: 10px "SFMono-Regular", monospace; }
-.config-strip small { font-size: 8px; }
+.config-strip small { grid-column: 2 / 4; font-size: 8px; }
 
 .review { min-width: 0; display: flex; flex-direction: column; padding: 38px 25px 24px; border-left: 1px solid var(--line); background: rgba(248,250,248,.82); backdrop-filter: blur(12px); }
 .review-header { padding-bottom: 22px; border-bottom: 1px solid var(--line); }

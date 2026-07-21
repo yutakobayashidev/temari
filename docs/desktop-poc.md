@@ -38,7 +38,7 @@ $ corepack pnpm --dir apps/temari-desktop tauri dev
 
 The repository dev shell supplies Rust, pnpm, the Linux Tauri libraries, and the GTK 3 file-chooser schema. On macOS it omits Linux-only libraries and uses the system WebKit framework.
 
-The config field accepts an absolute path when the process working directory is uncertain. The file follows the same format as `examples/temari.example.toml`.
+The desktop automatically loads `config.toml` from the directory returned by `ProjectDirs::config_dir` (`$XDG_CONFIG_HOME/temari` on Linux and Application Support on macOS). Use the native file picker to override it for the current session. The backend accepts only absolute regular-file paths and never searches relative to the process working directory or selected source. Keep the config outside the folder being organized. The file follows the same format as `examples/temari.example.toml`.
 
 For frontend-only work, start the Vite preview:
 

@@ -86,23 +86,22 @@ pub struct OpenAiCompatibleModel {
 
 impl OpenAiCompatibleModel {
     pub fn new(config: &ModelConfig) -> Result<Self, Error> {
-        config.validate_endpoint()?;
+        config.validate()?;
         let mut base = config.base_url.trim_end_matches('/').to_owned();
         base.push('/');
         let endpoint = Url::parse(&base)
             .and_then(|url| url.join("chat/completions"))
             .map_err(|error| Error::InvalidConfig(format!("invalid model.base_url: {error}")))?;
-        let api_key = config
-            .api_key_env
-            .as_ref()
-            .map(|name| {
-                env::var(name).map_err(|_| {
-                    Error::InvalidConfig(format!(
-                        "environment variable {name:?} is required by model.api_key_env"
-                    ))
-                })
-            })
-            .transpose()?;
+        let api_key = match (&config.api_key, &config.api_key_env) {
+            (Some(value), None) => Some(value.clone()),
+            (None, Some(name)) => Some(env::var(name).map_err(|_| {
+                Error::InvalidConfig(format!(
+                    "environment variable {name:?} is required by model.api_key_env"
+                ))
+            })?),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("validated above"),
+        };
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(60))
@@ -417,6 +416,7 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             name: "test-model".into(),
             allowed_hosts: vec!["127.0.0.1".into()],
+            api_key: Some("inline-secret".into()),
             api_key_env: None,
         })
         .unwrap();
@@ -447,6 +447,11 @@ mod tests {
         assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
         assert!(request.contains("f000001"));
         assert!(request.contains("report.pdf"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer inline-secret")
+        );
     }
 
     #[test]
@@ -455,6 +460,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             name: "test-model".into(),
             allowed_hosts: vec!["localhost".into()],
+            api_key: None,
             api_key_env: None,
         });
 
@@ -490,6 +496,7 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             name: "test-model".into(),
             allowed_hosts: vec!["127.0.0.1".into()],
+            api_key: None,
             api_key_env: None,
         })
         .unwrap();
@@ -532,6 +539,7 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             name: "test-model".into(),
             allowed_hosts: vec!["127.0.0.1".into()],
+            api_key: None,
             api_key_env: None,
         })
         .unwrap();

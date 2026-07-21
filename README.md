@@ -17,7 +17,7 @@ Proposal, approval, and planning are read-only. Filesystem changes require a sep
 - Undo tolerates a consistent filesystem device-number change across reboot, while still requiring the same source inode and matching file hashes and inodes.
 - Undo restores only recorded moves whose identity and content still match, and removes only session-created directories that remain empty.
 - Every model endpoint hostname must appear in an explicit allowlist.
-- API keys are read from a configured environment variable and are never stored in the configuration file.
+- API keys may be stored in an owner-only private config or read from a configured environment variable. They are never serialized into workflow artifacts.
 - No external service, analytics SDK, or crash-reporting SDK is included.
 
 ## Requirements
@@ -75,7 +75,7 @@ $ corepack pnpm --dir apps/temari-desktop install
 $ corepack pnpm --dir apps/temari-desktop tauri dev
 ```
 
-The model configuration path is editable in the window and defaults to `.temari.toml`. Plan preview repeats the scan against the backend-held approved destinations. Under `privacy.content = "ask"`, ambiguous files use local fallbacks because this POC has no content-consent screen; explicit `on_demand` retains bounded extraction. Running `pnpm dev` without Tauri opens an explicitly simulated browser preview for UI development; it does not access the filesystem or model. See [the desktop POC notes](docs/desktop-poc.md) for its command boundary and verification steps.
+Desktop automatically loads `config.toml` from the platform application-config directory (`$XDG_CONFIG_HOME/temari` on Linux and Application Support on macOS). The native file picker can override it for the current session. Desktop accepts only absolute regular-file paths and never searches the source folder or process working directory. Plan preview repeats the scan against the backend-held approved destinations. Under `privacy.content = "ask"`, ambiguous files use local fallbacks because this POC has no content-consent screen; explicit `on_demand` retains bounded extraction. Running `pnpm dev` without Tauri opens an explicitly simulated browser preview for UI development; it does not access the filesystem or model. See [the desktop POC notes](docs/desktop-poc.md) for its command boundary and verification steps.
 
 ## Foreground monitoring
 
@@ -160,7 +160,7 @@ The workflow follows five explicit trust boundaries:
 4. `apply`: after confirmation, local code creates only required approved directories and performs validated moves while atomically updating an audit journal.
 5. `undo`: local code conservatively reverses recorded moves and removes only unchanged, empty directories created by that apply session.
 
-All five primitive stages, explicit crash resume, the interactive `organize` orchestrator, and foreground monitoring are implemented. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for artifact persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits, [ADR 0008](docs/adr/0008-use-sqlite-for-monitoring-state.md) for monitoring state, and [ADR 0009](docs/adr/0009-request-per-run-content-consent.md) for consent.
+All five primitive stages, explicit crash resume, the interactive `organize` orchestrator, and foreground monitoring are implemented. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for artifact persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits, [ADR 0008](docs/adr/0008-use-sqlite-for-monitoring-state.md) for monitoring state, [ADR 0009](docs/adr/0009-request-per-run-content-consent.md) for consent, and [ADR 0010](docs/adr/0010-load-desktop-config-from-platform-directory.md) for desktop configuration and private credentials.
 
 Example schemas are available for a model-created [proposal](examples/proposal.example.json) and a locally approved [folder set](examples/folders.example.json). Their source paths are illustrative and must match the canonical source used by `plan`.
 

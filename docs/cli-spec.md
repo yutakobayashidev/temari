@@ -148,7 +148,7 @@ temari [global options] history list|show ...
 - OCR is disabled when `[privacy.extraction.ocr]` is absent. Its executable and optional data directory must be absolute paths; language identifiers are validated tokens.
 - Approved destinations live in a `FolderSet`, not in application configuration.
 - The current implementation reads `.temari.toml` or the path supplied with `--config`.
-- API keys are loaded only from the environment-variable name configured by `model.api_key_env`; secret values never appear in flags or artifacts.
+- API keys may be read from `model.api_key` in an owner-only private config or from the environment-variable name in `model.api_key_env`; the fields are mutually exclusive and secret values never appear in flags or workflow artifacts.
 
 ## Common flows
 
