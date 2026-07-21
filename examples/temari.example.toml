@@ -1,0 +1,7 @@
+version = 1
+
+[model]
+base_url = "http://127.0.0.1:11434/v1"
+name = "qwen2.5:7b"
+allowed_hosts = ["127.0.0.1", "localhost", "::1"]
+# api_key_env = "TEMARI_MODEL_API_KEY"

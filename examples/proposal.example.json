@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "source": "/home/alice/Downloads",
+  "files_considered": 42,
+  "folders": [
+    {
+      "path": "Documents",
+      "description": "Text documents, notes, reports, and office files"
+    },
+    {
+      "path": "Images/Screenshots",
+      "description": "Screenshots and screen recordings"
+    }
+  ]
+}

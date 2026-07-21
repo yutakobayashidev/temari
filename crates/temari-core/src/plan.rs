@@ -1,0 +1,498 @@
+use std::{
+    cmp::Ordering,
+    collections::{BTreeSet, HashMap, HashSet},
+    fs, io,
+    path::Path,
+};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::{
+    ApprovedFolder, Classification, Error, FileCandidate, FileFingerprint, FsIdentity,
+    artifact::normalize_relative_path,
+    filesystem::{
+        canonical_directory, checked_join, fingerprint, path_exists, verify_directory_chain,
+    },
+};
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Plan {
+    pub version: u32,
+    pub source: String,
+    pub source_identity: FsIdentity,
+    pub collision_policy: CollisionPolicy,
+    pub folders: Vec<ApprovedFolder>,
+    pub directories: Vec<String>,
+    pub entries: Vec<PlanEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollisionPolicy {
+    Rename,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanEntry {
+    pub file_id: String,
+    pub file_name: String,
+    pub source_fingerprint: FileFingerprint,
+    pub destination_id: String,
+    pub requested_destination: String,
+    pub destination_path: String,
+    pub reasoning: Option<String>,
+}
+
+impl Plan {
+    pub fn load(path: &Path) -> Result<Self, Error> {
+        let text = fs::read_to_string(path).map_err(|source| Error::ReadFile {
+            path: path.display().to_string(),
+            source,
+        })?;
+        let plan: Self = serde_json::from_str(&text)?;
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.version != 1 {
+            return Err(Error::InvalidArtifact(format!(
+                "unsupported plan version {}; expected 1",
+                self.version
+            )));
+        }
+        let source = Path::new(&self.source);
+        if !source.is_absolute() || self.source.chars().any(char::is_control) {
+            return Err(Error::InvalidArtifact(
+                "plan source must be an absolute canonical path without control characters".into(),
+            ));
+        }
+
+        let mut previous_directory: Option<&str> = None;
+        let mut directory_set = HashSet::new();
+        for directory in &self.directories {
+            normalize_relative_path(directory)?;
+            if !directory_set.insert(directory.as_str()) {
+                return Err(Error::InvalidArtifact(format!(
+                    "duplicate planned directory {directory:?}"
+                )));
+            }
+            if let Some(previous) = previous_directory
+                && directory_order(previous, directory) == Ordering::Greater
+            {
+                return Err(Error::InvalidArtifact(
+                    "planned directories must be in parent-first lexical order".into(),
+                ));
+            }
+            previous_directory = Some(directory);
+        }
+
+        let mut file_ids = HashSet::new();
+        let mut file_names = HashSet::new();
+        let mut destinations = HashSet::new();
+        let folder_set = crate::FolderSet {
+            version: 1,
+            source: self.source.clone(),
+            folders: self.folders.clone(),
+        };
+        folder_set.validate()?;
+        let folders_by_id: HashMap<_, _> = self
+            .folders
+            .iter()
+            .map(|folder| (folder.id.as_str(), folder))
+            .collect();
+        for entry in &self.entries {
+            if entry.file_id.trim().is_empty() || !file_ids.insert(entry.file_id.as_str()) {
+                return Err(Error::InvalidArtifact(format!(
+                    "plan file IDs must be non-empty and unique: {:?}",
+                    entry.file_id
+                )));
+            }
+            validate_file_name(&entry.file_name)?;
+            if !file_names.insert(entry.file_name.as_str()) {
+                return Err(Error::InvalidArtifact(format!(
+                    "duplicate planned source file {:?}",
+                    entry.file_name
+                )));
+            }
+            let folder = folders_by_id
+                .get(entry.destination_id.as_str())
+                .ok_or_else(|| {
+                    Error::InvalidArtifact(format!(
+                        "unknown approved destination ID {:?}",
+                        entry.destination_id
+                    ))
+                })?;
+            normalize_relative_path(&entry.requested_destination)?;
+            normalize_relative_path(&entry.destination_path)?;
+            let expected_requested = format!("{}/{}", folder.path, entry.file_name);
+            if entry.requested_destination != expected_requested
+                || destination_parent(&entry.destination_path)? != folder.path
+            {
+                return Err(Error::InvalidArtifact(format!(
+                    "plan entry {:?} escapes its approved destination",
+                    entry.file_id
+                )));
+            }
+            if !destinations.insert(entry.destination_path.as_str()) {
+                return Err(Error::InvalidArtifact(format!(
+                    "duplicate planned destination {:?}",
+                    entry.destination_path
+                )));
+            }
+            validate_fingerprint(&entry.source_fingerprint)?;
+        }
+        if self
+            .entries
+            .windows(2)
+            .any(|pair| pair[0].file_id > pair[1].file_id)
+        {
+            return Err(Error::InvalidArtifact(
+                "plan entries must be sorted by file ID".into(),
+            ));
+        }
+        for directory in &self.directories {
+            if !self.entries.iter().any(|entry| {
+                destination_parent(&entry.destination_path).is_ok_and(|parent| {
+                    parent == directory || parent.starts_with(&format!("{directory}/"))
+                })
+            }) {
+                return Err(Error::InvalidArtifact(format!(
+                    "planned directory is not required by any move: {directory:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn sha256(&self) -> Result<String, Error> {
+        self.validate()?;
+        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(self)?)))
+    }
+}
+
+pub fn build_plan(
+    source: &Path,
+    files: &[FileCandidate],
+    folders: &[ApprovedFolder],
+    classifications: Vec<Classification>,
+) -> Result<Plan, Error> {
+    if classifications.len() != files.len() {
+        return Err(Error::InvalidModelResponse(format!(
+            "expected {} classifications, received {}",
+            files.len(),
+            classifications.len()
+        )));
+    }
+    let (canonical_source, source_identity) = canonical_directory(source)?;
+    let files_by_id: HashMap<_, _> = files.iter().map(|file| (&file.id, file)).collect();
+    let folders_by_id: HashMap<_, _> = folders.iter().map(|folder| (&folder.id, folder)).collect();
+    let mut classified = Vec::with_capacity(classifications.len());
+    let mut seen = HashSet::new();
+    for classification in classifications {
+        if !seen.insert(classification.file_id.clone()) {
+            return Err(Error::InvalidModelResponse(format!(
+                "duplicate file ID {:?}",
+                classification.file_id
+            )));
+        }
+        let file = files_by_id.get(&classification.file_id).ok_or_else(|| {
+            Error::InvalidModelResponse(format!("unknown file ID {:?}", classification.file_id))
+        })?;
+        let folder = folders_by_id
+            .get(&classification.destination_id)
+            .ok_or_else(|| {
+                Error::InvalidModelResponse(format!(
+                    "unknown destination ID {:?}",
+                    classification.destination_id
+                ))
+            })?;
+        classified.push((classification, *file, *folder));
+    }
+    classified.sort_by(|left, right| left.0.file_id.cmp(&right.0.file_id));
+
+    let mut reserved_destinations = HashSet::new();
+    let mut missing_directories = BTreeSet::new();
+    let mut entries = Vec::with_capacity(classified.len());
+    for (classification, file, folder) in classified {
+        validate_file_name(&file.name)?;
+        verify_directory_chain(&canonical_source, &folder.path)?;
+        let source_path = canonical_source.join(&file.name);
+        let source_fingerprint = fingerprint(&source_path)?;
+        let requested_destination = format!("{}/{}", folder.path, file.name);
+        let destination_path = resolve_collision(
+            &canonical_source,
+            &folder.path,
+            &file.name,
+            &reserved_destinations,
+        )?;
+        reserved_destinations.insert(destination_path.clone());
+        collect_missing_directories(
+            &canonical_source,
+            destination_parent(&destination_path)?,
+            &mut missing_directories,
+        )?;
+        entries.push(PlanEntry {
+            file_id: classification.file_id,
+            file_name: file.name.clone(),
+            source_fingerprint,
+            destination_id: classification.destination_id,
+            requested_destination,
+            destination_path,
+            reasoning: classification.reasoning,
+        });
+    }
+
+    let mut directories: Vec<_> = missing_directories.into_iter().collect();
+    directories.sort_by(|left, right| directory_order(left, right));
+    let source_text = canonical_source.to_str().ok_or_else(|| {
+        Error::InvalidArtifact("source path must be valid UTF-8 for portable artifacts".into())
+    })?;
+    if source_text.chars().any(char::is_control) {
+        return Err(Error::InvalidArtifact(
+            "source path must not contain control characters".into(),
+        ));
+    }
+    let plan = Plan {
+        version: 1,
+        source: source_text.to_owned(),
+        source_identity,
+        collision_policy: CollisionPolicy::Rename,
+        folders: folders.to_vec(),
+        directories,
+        entries,
+    };
+    plan.validate()?;
+    Ok(plan)
+}
+
+fn resolve_collision(
+    source: &Path,
+    folder: &str,
+    file_name: &str,
+    reserved: &HashSet<String>,
+) -> Result<String, Error> {
+    for suffix in 0_u64.. {
+        let candidate_name = if suffix == 0 {
+            file_name.to_owned()
+        } else {
+            suffixed_name(file_name, suffix)?
+        };
+        let relative = format!("{folder}/{candidate_name}");
+        let absolute = checked_join(source, &relative)?;
+        if !reserved.contains(&relative) && !path_exists(&absolute)? {
+            return Ok(relative);
+        }
+    }
+    unreachable!("the numeric collision suffix space is finite only after u64 exhaustion")
+}
+
+fn suffixed_name(file_name: &str, suffix: u64) -> Result<String, Error> {
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            Error::InvalidArtifact(format!("file name is not valid UTF-8: {file_name:?}"))
+        })?;
+    Ok(match path.extension().and_then(|value| value.to_str()) {
+        Some(extension) => format!("{stem} {suffix}.{extension}"),
+        None => format!("{stem} {suffix}"),
+    })
+}
+
+fn collect_missing_directories(
+    source: &Path,
+    relative: &str,
+    missing: &mut BTreeSet<String>,
+) -> Result<(), Error> {
+    let mut current_relative = String::new();
+    for component in relative.split('/') {
+        if !current_relative.is_empty() {
+            current_relative.push('/');
+        }
+        current_relative.push_str(component);
+        let absolute = checked_join(source, &current_relative)?;
+        match fs::symlink_metadata(&absolute) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                    return Err(Error::InvalidArtifact(format!(
+                        "destination component must be a real directory: {:?}",
+                        absolute.display().to_string()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.insert(current_relative.clone());
+            }
+            Err(source_error) => {
+                return Err(Error::FileSystem {
+                    action: "inspect",
+                    path: absolute.display().to_string(),
+                    source: source_error,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn destination_parent(destination: &str) -> Result<&str, Error> {
+    destination
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .ok_or_else(|| {
+            Error::InvalidArtifact(format!(
+                "planned destination must include an approved directory: {destination:?}"
+            ))
+        })
+}
+
+fn validate_file_name(name: &str) -> Result<(), Error> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.chars().any(char::is_control)
+    {
+        return Err(Error::InvalidArtifact(format!(
+            "source file name must be one portable path component: {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_fingerprint(fingerprint: &FileFingerprint) -> Result<(), Error> {
+    if fingerprint.sha256.len() != 64
+        || !fingerprint
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::InvalidArtifact(
+            "file fingerprint must contain a lowercase SHA-256 digest".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn directory_order(left: &str, right: &str) -> Ordering {
+    left.split('/')
+        .count()
+        .cmp(&right.split('/').count())
+        .then_with(|| left.cmp(right))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn file(id: &str, name: &str) -> FileCandidate {
+        FileCandidate {
+            id: id.into(),
+            name: name.into(),
+            extension: Path::new(name)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .into(),
+        }
+    }
+
+    fn folder() -> ApprovedFolder {
+        ApprovedFolder {
+            id: "docs".into(),
+            path: "Documents/Reports".into(),
+            description: "Documents".into(),
+        }
+    }
+
+    fn classification(file_id: &str, destination_id: &str) -> Classification {
+        Classification {
+            file_id: file_id.into(),
+            destination_id: destination_id.into(),
+            reasoning: None,
+        }
+    }
+
+    #[test]
+    fn builds_plan_with_fingerprint_and_parent_first_directories() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("report.txt"), b"report").unwrap();
+
+        let plan = build_plan(
+            root.path(),
+            &[file("f1", "report.txt")],
+            &[folder()],
+            vec![classification("f1", "docs")],
+        )
+        .unwrap();
+
+        assert_eq!(plan.directories, ["Documents", "Documents/Reports"]);
+        assert_eq!(
+            plan.entries[0].destination_path,
+            "Documents/Reports/report.txt"
+        );
+        assert_eq!(plan.entries[0].source_fingerprint.size, 6);
+    }
+
+    #[test]
+    fn resolves_existing_and_reserved_collisions_deterministically() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("report.txt"), b"one").unwrap();
+        fs::write(root.path().join("report-copy.txt"), b"two").unwrap();
+        fs::create_dir_all(root.path().join("Documents/Reports")).unwrap();
+        File::create(root.path().join("Documents/Reports/report.txt")).unwrap();
+        let files = [file("f1", "report.txt"), file("f2", "report-copy.txt")];
+        let classifications = vec![classification("f2", "docs"), classification("f1", "docs")];
+
+        let plan = build_plan(root.path(), &files, &[folder()], classifications).unwrap();
+
+        assert_eq!(
+            plan.entries[0].destination_path,
+            "Documents/Reports/report 1.txt"
+        );
+        assert_eq!(
+            plan.entries[1].destination_path,
+            "Documents/Reports/report-copy.txt"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_destination_id() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("report.txt"), b"report").unwrap();
+        let error = build_plan(
+            root.path(),
+            &[file("f1", "report.txt")],
+            &[folder()],
+            vec![classification("f1", "invented")],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown destination"));
+    }
+
+    #[test]
+    fn rejects_missing_classification() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("report.txt"), b"report").unwrap();
+        let error = build_plan(
+            root.path(),
+            &[file("f1", "report.txt")],
+            &[folder()],
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("expected 1"));
+    }
+}

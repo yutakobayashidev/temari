@@ -1,0 +1,19 @@
+[package]
+name = "temari-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "temari"
+path = "src/main.rs"
+
+[dependencies]
+temari-core = { path = "../temari-core" }
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shlex.workspace = true
+tempfile.workspace = true
