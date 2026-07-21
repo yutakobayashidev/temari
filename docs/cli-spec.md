@@ -20,6 +20,10 @@ temari [global options] monitor run --out <RUN_ROOT> [--monitor <ID>] [--once] [
 temari [global options] monitor apply <RUN_ID> [--yes]
 temari [global options] rule add|list|enable|disable|remove ...
 temari [global options] history list|show ...
+temari [global options] managed init <SOURCE> --out <SETUP_PLAN>
+temari [global options] managed apply <SETUP_PLAN> --folders <FOLDER_SET> --out <RUN_DIR> [--yes]
+temari [global options] managed list|status|run|apply-run|resume-run|history|undo ...
+temari [global options] managed undo-setup|resume-setup ...
 ```
 
 `organize` is an interactive convenience command. The five primitive commands remain the stable interface for agents and scripts.
@@ -121,6 +125,17 @@ temari [global options] history list|show ...
 
 - `list [--monitor <ID>] [--limit <N>]` reads the cross-run SQLite index.
 - `show <RUN_ID>` displays run status, artifact paths, aggregate routing counts, and staged file metadata. It never contains extracted text, raw model responses, or credentials.
+
+### `managed`
+
+- `init` is read-only. It inventories the complete source root and writes a `ManagedSetupPlan` that creates `Kept`, `Inbox`, and `Library`, moves existing real directories to Kept, and moves existing regular files to Inbox. It rejects reserved-name collisions, special entries, non-portable names, stale source identity, and cross-filesystem directory entries.
+- `apply` confirms that exact setup Plan, writes a durable setup journal before mutation, then registers the completed workspace with a Library-prefixed FolderSet. Retention and stability windows are fixed in the workspace definition.
+- `run` is finite. It first writes a local Plan for new root files to Inbox, observes Inbox fingerprints in SQLite, and writes a classification Plan only for files past both deadlines. Without `--apply --yes`, Plans remain reviewable and no file moves.
+- `apply-run` applies a previously recorded stage or classification Plan by run ID and exact digest.
+- `resume-run` conservatively reconciles and resumes a running Apply journal, then synchronizes both the managed run index and Inbox state. Terminal runs are immutable.
+- `history` lists recent indexed moves. `undo` resolves a completed run to its ApplySession and restores either the complete session or repeated `--file <FILE_ID>` selections. Selected-file Undo never removes shared directories.
+- `undo-setup` and `resume-setup` operate only from their versioned setup journals. Setup Undo refuses a changed kept directory, occupied original path, or changed area identity.
+- SQLite stores mutable retention and history indexes only. Setup Plans, normal Plans, Apply sessions, and Undo sessions remain authoritative JSON artifacts outside the managed source.
 
 ## Global options and output
 

@@ -180,12 +180,22 @@ impl ApplySession {
                 )));
             }
         }
-        let mut files = HashSet::new();
+        let mut file_ids = HashSet::new();
+        let mut sources = HashSet::new();
         let mut destinations = HashSet::new();
         for record in &self.moves {
-            if record.file_id.trim().is_empty() || !files.insert(record.source_path.as_str()) {
+            if record.file_id.trim().is_empty()
+                || record.file_id.chars().any(char::is_control)
+                || !file_ids.insert(record.file_id.as_str())
+            {
                 return Err(Error::InvalidArtifact(format!(
-                    "duplicate or invalid session source {:?}",
+                    "duplicate or invalid session file ID {:?}",
+                    record.file_id
+                )));
+            }
+            if !sources.insert(record.source_path.as_str()) {
+                return Err(Error::InvalidArtifact(format!(
+                    "duplicate session source {:?}",
                     record.source_path
                 )));
             }
@@ -258,12 +268,111 @@ impl UndoSession {
             source,
         })?;
         let session: Self = serde_json::from_str(&text)?;
-        if session.version != 2 || !Path::new(&session.source).is_absolute() {
+        session.validate()?;
+        Ok(session)
+    }
+
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.version != 2
+            || !Path::new(&self.source).is_absolute()
+            || self.source.chars().any(char::is_control)
+        {
             return Err(Error::InvalidArtifact(
                 "undo session must be version 2 with an absolute source".into(),
             ));
         }
-        Ok(session)
+        if self.apply_session_id.trim().is_empty()
+            || self.apply_session_id.chars().any(char::is_control)
+        {
+            return Err(Error::InvalidArtifact(
+                "undo session apply ID must not be empty or contain control characters".into(),
+            ));
+        }
+        let mut file_ids = HashSet::new();
+        let mut sources = HashSet::new();
+        let mut destinations = HashSet::new();
+        for record in &self.moves {
+            if record.file_id.trim().is_empty()
+                || record.file_id.chars().any(char::is_control)
+                || !file_ids.insert(record.file_id.as_str())
+            {
+                return Err(Error::InvalidArtifact(
+                    "undo session contains a duplicate or invalid file ID".into(),
+                ));
+            }
+            normalize_relative_path(&record.source_path)?;
+            normalize_relative_path(&record.destination_path)?;
+            if !sources.insert(record.source_path.as_str())
+                || !destinations.insert(record.destination_path.as_str())
+            {
+                return Err(Error::InvalidArtifact(
+                    "undo session contains duplicate move paths".into(),
+                ));
+            }
+        }
+        let mut directories = HashSet::new();
+        for record in &self.directories {
+            normalize_relative_path(&record.path)?;
+            if !directories.insert(record.path.as_str()) {
+                return Err(Error::InvalidArtifact(
+                    "undo session contains duplicate directory paths".into(),
+                ));
+            }
+        }
+        match self.state {
+            UndoState::Running if self.finished_unix_ms.is_some() => {
+                return Err(Error::InvalidArtifact(
+                    "running undo session must not have a finish time".into(),
+                ));
+            }
+            UndoState::Completed | UndoState::PartialFailure if self.finished_unix_ms.is_none() => {
+                return Err(Error::InvalidArtifact(
+                    "finalized undo session must have a finish time".into(),
+                ));
+            }
+            _ => {}
+        }
+        if self.state != UndoState::Running
+            && (self.moves.iter().any(|record| {
+                matches!(
+                    record.outcome,
+                    UndoMoveOutcome::Pending | UndoMoveOutcome::Restoring
+                )
+            }) || self.directories.iter().any(|record| {
+                matches!(
+                    record.outcome,
+                    UndoDirectoryOutcome::Pending | UndoDirectoryOutcome::Removing
+                )
+            }))
+        {
+            return Err(Error::InvalidArtifact(
+                "finalized undo session contains an in-progress operation".into(),
+            ));
+        }
+        let has_problem = self.moves.iter().any(|record| {
+            matches!(
+                record.outcome,
+                UndoMoveOutcome::Conflict { .. } | UndoMoveOutcome::Failed { .. }
+            )
+        }) || self.directories.iter().any(|record| {
+            matches!(
+                record.outcome,
+                UndoDirectoryOutcome::NotEmpty
+                    | UndoDirectoryOutcome::Conflict { .. }
+                    | UndoDirectoryOutcome::Failed { .. }
+            )
+        });
+        if self.state == UndoState::Completed && has_problem {
+            return Err(Error::InvalidArtifact(
+                "completed undo session contains a failed operation".into(),
+            ));
+        }
+        if self.state == UndoState::PartialFailure && !has_problem {
+            return Err(Error::InvalidArtifact(
+                "partial undo session contains no failed operation".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -412,6 +521,50 @@ fn continue_apply(session: &mut ApplySession, journal_path: &Path) -> Result<(),
 pub fn undo_session(apply: &ApplySession, journal_path: &Path) -> Result<UndoSession, Error> {
     let lock = SourceLock::acquire(Path::new(&apply.source))?;
     undo_session_with_lock(apply, journal_path, &lock)
+}
+
+/// Restores selected applied files from a terminal apply session without
+/// removing any directories created by that session.
+pub fn undo_session_files(
+    apply: &ApplySession,
+    file_ids: &[String],
+    journal_path: &Path,
+) -> Result<UndoSession, Error> {
+    apply.validate()?;
+    if file_ids.is_empty() {
+        return Err(Error::InvalidArtifact(
+            "individual undo requires at least one file ID".into(),
+        ));
+    }
+    let requested: HashSet<_> = file_ids.iter().map(String::as_str).collect();
+    if requested.len() != file_ids.len() {
+        return Err(Error::InvalidArtifact(
+            "individual undo file IDs must be unique".into(),
+        ));
+    }
+    let moves = apply
+        .moves
+        .iter()
+        .filter(|record| requested.contains(record.file_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if moves.len() != requested.len() {
+        return Err(Error::InvalidArtifact(
+            "individual undo references an unknown file ID".into(),
+        ));
+    }
+    if moves
+        .iter()
+        .any(|record| !matches!(record.outcome, MoveOutcome::Moved | MoveOutcome::Moving))
+    {
+        return Err(Error::InvalidArtifact(
+            "individual undo can only select files that were applied".into(),
+        ));
+    }
+    let mut selected = apply.clone();
+    selected.moves = moves;
+    selected.directories.clear();
+    undo_session(&selected, journal_path)
 }
 
 pub fn undo_session_with_lock(
@@ -1284,6 +1437,82 @@ mod tests {
         assert!(root.path().join("report.txt").exists());
         assert!(!root.path().join("Documents").exists());
         assert_eq!(fs::read(&apply_path).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn individual_undo_restores_the_file_but_keeps_shared_directories() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        let plan = plan(root.path());
+        let apply = apply_plan(&plan, &journals.path().join("apply.json")).unwrap();
+
+        let undo = undo_session_files(
+            &apply,
+            &["f000001".into()],
+            &journals.path().join("undo.json"),
+        )
+        .unwrap();
+
+        assert_eq!(undo.state, UndoState::Completed);
+        assert!(root.path().join("report.txt").exists());
+        assert!(root.path().join("Documents/Reports").is_dir());
+        assert!(undo.directories.is_empty());
+    }
+
+    #[test]
+    fn individual_undo_rejects_a_file_that_was_not_applied() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        let mut apply =
+            apply_plan(&plan(root.path()), &journals.path().join("apply.json")).unwrap();
+        apply.state = ApplyState::PartialFailure;
+        apply.moves[0].outcome = MoveOutcome::Failed {
+            message: "not applied".into(),
+        };
+
+        let result = undo_session_files(
+            &apply,
+            &["f000001".into()],
+            &journals.path().join("undo.json"),
+        );
+
+        assert!(result.is_err());
+        assert!(!journals.path().join("undo.json").exists());
+    }
+
+    #[test]
+    fn apply_artifact_rejects_duplicate_file_ids() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        let mut apply =
+            apply_plan(&plan(root.path()), &journals.path().join("apply.json")).unwrap();
+        apply.state = ApplyState::Running;
+        apply.finished_unix_ms = None;
+        let mut duplicate = apply.moves[0].clone();
+        duplicate.source_path = "other.txt".into();
+        duplicate.destination_path = "Documents/Reports/other.txt".into();
+        duplicate.outcome = MoveOutcome::Pending;
+        apply.moves.push(duplicate);
+
+        assert!(apply.validate().is_err());
+    }
+
+    #[test]
+    fn undo_artifact_rejects_inconsistent_terminal_states() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        let apply = apply_plan(&plan(root.path()), &journals.path().join("apply.json")).unwrap();
+        let mut undo = undo_session(&apply, &journals.path().join("undo.json")).unwrap();
+        let artifact = journals.path().join("forged-undo.json");
+
+        undo.moves[0].outcome = UndoMoveOutcome::Pending;
+        fs::write(&artifact, serde_json::to_vec(&undo).unwrap()).unwrap();
+        assert!(UndoSession::load(&artifact).is_err());
+
+        undo.moves[0].outcome = UndoMoveOutcome::Restored;
+        undo.state = UndoState::PartialFailure;
+        fs::write(&artifact, serde_json::to_vec(&undo).unwrap()).unwrap();
+        assert!(UndoSession::load(&artifact).is_err());
     }
 
     #[test]

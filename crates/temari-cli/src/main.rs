@@ -19,8 +19,10 @@ use temari_core::{
 };
 use tempfile::NamedTempFile;
 
+mod managed;
 mod monitoring;
 
+use managed::ManagedCommand;
 use monitoring::{HistoryCommand, MonitorCommand, MonitoringContext, RuleCommand};
 
 const PROPOSAL_SAMPLE_LIMIT: usize = 100;
@@ -175,6 +177,10 @@ enum Command {
     /// Inspect durable monitoring run history.
     #[command(subcommand)]
     History(HistoryCommand),
+
+    /// Manage a Kept, Inbox, and Library workspace.
+    #[command(subcommand)]
+    Managed(ManagedCommand),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,6 +263,7 @@ fn run() -> Result<()> {
             )?,
             command,
         ),
+        Command::Managed(command) => managed::run_managed(&cli, command),
     }
 }
 

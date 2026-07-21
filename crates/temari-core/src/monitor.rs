@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::Write,
     os::unix::fs::PermissionsExt,
@@ -11,6 +11,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
+use crate::artifact::normalize_relative_path;
 use crate::{
     ApplySession, ApplyState, ClassificationOptions, Classifier, Config, ContentDecision,
     ContentExtractor, ContentPolicy, Error, FileFingerprint, FolderSet, LocalRule, MonitorRecord,
@@ -95,9 +96,6 @@ pub fn plan_monitor_cycle<C: Classifier, E: ContentExtractor>(
     options: MonitoringOptions,
 ) -> Result<MonitoringPlan, Error> {
     validate_monitor_binding(monitor, folder_set)?;
-    let rule_set = RuleSet::compile(rules, &folder_set.folders)?;
-    let folder_set_sha256 = folder_set.sha256()?;
-    let rule_set_sha256 = rule_set.digest().to_owned();
     let source = Path::new(&monitor.source);
     let excluded: Vec<_> = folder_set
         .folders
@@ -105,11 +103,38 @@ pub fn plan_monitor_cycle<C: Classifier, E: ContentExtractor>(
         .map(|folder| folder.path.clone())
         .collect();
     let scanned = scan_directory(source, &folder_set.scope, &excluded)?;
+    plan_monitor_candidates(
+        store, monitor, folder_set, rules, &scanned, classifier, extractor, options,
+    )
+}
+
+/// Builds a monitoring Plan from an already bounded set of source candidates.
+///
+/// Managed workspaces use this entry point after their local retention index has
+/// selected stable Inbox files. The supplied candidates are still validated by
+/// `build_plan`; this function does not grant additional path authority.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_monitor_candidates<C: Classifier, E: ContentExtractor>(
+    store: &StateStore,
+    monitor: &MonitorRecord,
+    folder_set: &FolderSet,
+    rules: &[LocalRule],
+    scanned: &[crate::FileCandidate],
+    classifier: &C,
+    extractor: &E,
+    options: MonitoringOptions,
+) -> Result<MonitoringPlan, Error> {
+    validate_monitor_binding(monitor, folder_set)?;
+    validate_monitor_candidates(folder_set, scanned)?;
+    let rule_set = RuleSet::compile(rules, &folder_set.folders)?;
+    let folder_set_sha256 = folder_set.sha256()?;
+    let rule_set_sha256 = rule_set.digest().to_owned();
+    let source = Path::new(&monitor.source);
     let mut eligible = Vec::new();
     let mut fingerprints = HashMap::new();
     let mut signatures = HashMap::new();
     let mut skipped_processed = 0;
-    for file in &scanned {
+    for file in scanned {
         let fingerprint = fingerprint_candidate(source, file)?;
         let signature = processing_signature(&fingerprint, &folder_set_sha256, &rule_set_sha256)?;
         if store.is_processed(&monitor.id, &fingerprint, &signature)? {
@@ -208,6 +233,59 @@ pub fn plan_monitor_cycle<C: Classifier, E: ContentExtractor>(
             fallback_matches: summary.by_fallback,
         },
     })
+}
+
+fn validate_monitor_candidates(
+    folder_set: &FolderSet,
+    candidates: &[crate::FileCandidate],
+) -> Result<(), Error> {
+    let mut ids = HashSet::new();
+    let mut paths = HashSet::new();
+    for candidate in candidates {
+        if candidate.id.trim().is_empty()
+            || candidate.id.chars().any(char::is_control)
+            || !ids.insert(candidate.id.as_str())
+        {
+            return Err(Error::InvalidArtifact(
+                "monitor candidates contain a duplicate or invalid file ID".into(),
+            ));
+        }
+        normalize_relative_path(&candidate.source_path)?;
+        if !paths.insert(candidate.source_path.as_str()) {
+            return Err(Error::InvalidArtifact(
+                "monitor candidates contain a duplicate source path".into(),
+            ));
+        }
+        if !folder_set.scope.contains(&candidate.source_path) {
+            return Err(Error::InvalidArtifact(format!(
+                "monitor candidate is outside the approved scope: {:?}",
+                candidate.source_path
+            )));
+        }
+        if folder_set.folders.iter().any(|folder| {
+            candidate.source_path == folder.path
+                || candidate
+                    .source_path
+                    .starts_with(&format!("{}/", folder.path))
+        }) {
+            return Err(Error::InvalidArtifact(format!(
+                "monitor candidate is inside an approved destination: {:?}",
+                candidate.source_path
+            )));
+        }
+        let extension = Path::new(&candidate.source_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if candidate.extension != extension {
+            return Err(Error::InvalidArtifact(format!(
+                "monitor candidate extension does not match its path: {:?}",
+                candidate.source_path
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn persist_monitoring_plan(
@@ -607,6 +685,68 @@ mod tests {
         assert_eq!(receipt.destination_id, "d000001");
         assert_eq!(monitoring.stats.rule_matches, 1);
         assert_eq!(monitoring.stats.name_matches, 1);
+    }
+
+    #[test]
+    fn empty_managed_candidate_set_does_not_call_model_or_extractor() {
+        let source = tempdir().unwrap();
+        let artifacts = tempdir().unwrap();
+        let folder_set = approved_folders(source.path());
+        let mut store = StateStore::open_in_memory().unwrap();
+        let monitor = register_monitor(&mut store, &folder_set, artifacts.path());
+        let classifier = RecordingClassifier::direct("d000001");
+        let extractor = RecordingExtractor::default();
+
+        let monitoring = plan_monitor_candidates(
+            &store,
+            &monitor,
+            &folder_set,
+            &[],
+            &[],
+            &classifier,
+            &extractor,
+            options(ContentPolicy::OnDemand),
+        )
+        .unwrap();
+
+        assert!(monitoring.plan.entries.is_empty());
+        assert_eq!(monitoring.stats.total_files, 0);
+        assert!(classifier.name_paths.borrow().is_empty());
+        assert_eq!(classifier.content_calls.get(), 0);
+        assert_eq!(extractor.calls.get(), 0);
+    }
+
+    #[test]
+    fn candidate_entrypoint_rejects_destination_files_before_model_routing() {
+        let source = tempdir().unwrap();
+        let artifacts = tempdir().unwrap();
+        fs::create_dir(source.path().join("Reports")).unwrap();
+        fs::write(source.path().join("Reports/private.txt"), b"private").unwrap();
+        let folder_set = approved_folders(source.path());
+        let mut store = StateStore::open_in_memory().unwrap();
+        let monitor = register_monitor(&mut store, &folder_set, artifacts.path());
+        let classifier = RecordingClassifier::direct("d000001");
+        let extractor = RecordingExtractor::default();
+        let candidates = [FileCandidate {
+            id: "f000001".into(),
+            source_path: "Reports/private.txt".into(),
+            extension: "txt".into(),
+        }];
+
+        let result = plan_monitor_candidates(
+            &store,
+            &monitor,
+            &folder_set,
+            &[],
+            &candidates,
+            &classifier,
+            &extractor,
+            options(ContentPolicy::OnDemand),
+        );
+
+        assert!(result.is_err());
+        assert!(classifier.name_paths.borrow().is_empty());
+        assert_eq!(extractor.calls.get(), 0);
     }
 
     #[test]

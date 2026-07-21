@@ -4,6 +4,8 @@
 
 Proposal, approval, and planning are read-only. Filesystem changes require a separate confirmed `apply` command and produce a durable JSON journal that can be inspected or passed to `undo`. The default `ask` privacy policy requests per-run consent only when names are ambiguous; only bounded extracted text is eligible to be sent. The application does not send telemetry.
 
+For a long-lived folder, the managed workflow creates three physical areas: `Kept` protects existing directories, `Inbox` holds new files through a configurable retention and stability window, and `Library` contains AI-classified files under the reviewed folder hierarchy. Initial setup and every later move remain separately planned, journaled, and undoable.
+
 ## Trust boundaries
 
 - During classification, the model selects only user-approved, model-visible opaque destination IDs. Model-proposed folder names remain untrusted data until local approval validates them and assigns those IDs.
@@ -103,6 +105,25 @@ Monitoring stores definitions, schedules, rules, processed signatures, and run i
 
 Rules match file basenames case-insensitively in descending priority and stable ID order. They select reviewed opaque destination IDs locally before any model call. Rule changes alter the processing signature. In unattended monitoring, `privacy.content = "ask"` behaves as no consent and uses approved local fallbacks; choose `on_demand` explicitly to permit bounded extracted text.
 
+## Managed workspaces
+
+Managed setup is deliberately split into read-only planning and confirmed apply. Existing directories move to `Kept`, existing loose files move to `Inbox`, and the reviewed folder set is namespaced below `Library` without changing its opaque destination IDs.
+
+```console
+$ temari managed init ~/Downloads --out downloads.setup-plan.json
+$ temari managed apply downloads.setup-plan.json \
+    --folders /absolute/path/downloads.folders.json \
+    --out ~/.local/state/temari/downloads-setup --yes
+$ temari managed list
+$ temari managed status <WORKSPACE_ID>
+$ temari managed run <WORKSPACE_ID> \
+    --out ~/.local/state/temari/managed-runs
+```
+
+The first `managed run` is read-only unless `--apply --yes` is supplied. A run first stages new root files into `Inbox`, then considers only direct Inbox files whose retention and stability deadlines have passed. Classification writes a normal Plan before Apply. Recent run records resolve back to authoritative JSON journals for full-session or selected-file Undo.
+
+Arrival time is the first local observation stored in SQLite, not file modification time. Editing or replacing a pending file resets its stability deadline. `Kept` is never recursively scanned, and `Library` is always excluded as an approved destination subtree.
+
 The approval command previews every destination and asks for confirmation when stdin and stderr are terminals. For a proposal that has already been reviewed by an agent or script, make acceptance explicit:
 
 ```console
@@ -141,6 +162,7 @@ Commands:
   monitor add|list|enable|disable|remove|run|apply ...
   rule add|list|enable|disable|remove ...
   history list|show ...
+  managed init|apply|list|status|run|apply-run|resume-run|history|undo|undo-setup|resume-setup ...
 ```
 
 - Artifact paths go to stdout. Read-only commands accept `--out -` to emit artifact JSON. Apply and undo require persistent journal paths outside the organized source.
@@ -160,7 +182,7 @@ The workflow follows five explicit trust boundaries:
 4. `apply`: after confirmation, local code creates only required approved directories and performs validated moves while atomically updating an audit journal.
 5. `undo`: local code conservatively reverses recorded moves and removes only unchanged, empty directories created by that apply session.
 
-All five primitive stages, explicit crash resume, the interactive `organize` orchestrator, and foreground monitoring are implemented. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for artifact persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits, [ADR 0008](docs/adr/0008-use-sqlite-for-monitoring-state.md) for monitoring state, [ADR 0009](docs/adr/0009-request-per-run-content-consent.md) for consent, [ADR 0010](docs/adr/0010-load-desktop-config-from-platform-directory.md) for desktop configuration and private credentials, and [ADR 0011](docs/adr/0011-apply-backend-held-desktop-plans.md) for confirmed desktop Apply and Undo.
+All five primitive stages, explicit crash resume, the interactive `organize` orchestrator, foreground monitoring, and managed three-area core workflow are implemented. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for artifact persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits, [ADR 0008](docs/adr/0008-use-sqlite-for-monitoring-state.md) for monitoring state, [ADR 0009](docs/adr/0009-request-per-run-content-consent.md) for consent, [ADR 0010](docs/adr/0010-load-desktop-config-from-platform-directory.md) for desktop configuration and private credentials, [ADR 0011](docs/adr/0011-apply-backend-held-desktop-plans.md) for confirmed desktop Apply and Undo, and [ADR 0012](docs/adr/0012-adopt-managed-three-area-workspaces.md) for protected, staged, and classified areas.
 
 Example schemas are available for a model-created [proposal](examples/proposal.example.json) and a locally approved [folder set](examples/folders.example.json). Their source paths are illustrative and must match the canonical source used by `plan`.
 

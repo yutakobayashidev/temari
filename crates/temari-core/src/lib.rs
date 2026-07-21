@@ -5,6 +5,8 @@ mod config;
 mod extraction;
 mod filesystem;
 mod lock;
+mod managed;
+mod managed_cycle;
 mod model;
 mod monitor;
 mod plan;
@@ -16,7 +18,8 @@ pub use apply::{
     ApplySession, ApplyState, DirectoryOutcome, DirectoryRecord, MoveOutcome, MoveRecord,
     UndoDirectoryOutcome, UndoDirectoryRecord, UndoMoveOutcome, UndoMoveRecord, UndoSession,
     UndoState, apply_plan, apply_plan_with_lock, preflight_apply, preflight_resume, preflight_undo,
-    resume_apply_session, resume_apply_session_with_lock, undo_session, undo_session_with_lock,
+    resume_apply_session, resume_apply_session_with_lock, undo_session, undo_session_files,
+    undo_session_with_lock,
 };
 pub use artifact::{
     ApprovedFolder, FallbackCategory, FolderProposal, FolderSet, Proposal, ScanScope,
@@ -31,20 +34,35 @@ pub use filesystem::{
     FileFingerprint, FsIdentity, canonical_source_identity, fingerprint_candidate,
 };
 pub use lock::SourceLock;
+pub use managed::{
+    DirectoryFingerprint, MANAGED_AREAS, ManagedAreaOutcome, ManagedAreaRecord,
+    ManagedEntryFingerprint, ManagedMoveOutcome, ManagedMoveRecord, ManagedSetupMove,
+    ManagedSetupPlan, ManagedSetupSession, ManagedSetupState, ManagedSetupUndoSession,
+    ManagedSetupUndoState, ManagedUndoAreaOutcome, ManagedUndoAreaRecord, ManagedUndoMoveOutcome,
+    ManagedUndoMoveRecord, apply_managed_setup, apply_managed_setup_with_lock,
+    build_managed_setup_plan, fingerprint_directory, preflight_managed_resume,
+    preflight_managed_setup, preflight_managed_undo, resume_managed_setup,
+    resume_managed_setup_with_lock, undo_managed_setup, undo_managed_setup_with_lock,
+};
+pub use managed_cycle::{
+    INBOX_DIRECTORY, KEPT_DIRECTORY, LIBRARY_DIRECTORY, STAGE_TO_INBOX_RULE_ID,
+    build_stage_to_inbox_plan, filter_inbox_candidates, inbox_file_candidates, library_folder_set,
+    root_file_candidates,
+};
 pub use model::{
     Classification, ClassificationBasis, Classifier, ContentCandidate, FolderProposer,
     NameClassification, NameDecision, OpenAiCompatibleModel,
 };
 pub use monitor::{
     MonitoringOptions, MonitoringPlan, MonitoringStats, apply_monitoring_plan,
-    persist_monitoring_plan, plan_monitor_cycle, processing_signature,
+    persist_monitoring_plan, plan_monitor_candidates, plan_monitor_cycle, processing_signature,
 };
 pub use plan::{Plan, PlanEntry, build_plan};
 pub use rules::{LocalRule, RuleMatch, RuleSet};
 pub use scan::{FileCandidate, scan_directory, select_representative_files};
 pub use state::{
-    MonitorRecord, MonitoringRun, ProcessedFileRecord, ReconcileSummary, RunState,
-    StagedFileRecord, StateStore,
+    InboxItem, InboxState, ManagedRun, ManagedRunKind, ManagedWorkspace, MonitorRecord,
+    MonitoringRun, ProcessedFileRecord, ReconcileSummary, RunState, StagedFileRecord, StateStore,
 };
 
 use thiserror::Error;
