@@ -2,7 +2,7 @@
 
 ## Product boundaries
 
-- This is a private, independent implementation. Do not copy third-party code, branding, UI assets, internal identifiers, prompt wording, database schemas, or log strings.
+- This is an independent implementation. Do not copy third-party code, branding, UI assets, internal identifiers, prompt wording, database schemas, or log strings.
 - Linux and macOS are required platforms. Keep reusable behavior in `temari-core`; keep presentation in adapters such as `temari-cli`.
 - Localhost is allowed by default. Every non-local model hostname must be explicitly allowlisted in configuration.
 - The model may select opaque destination IDs only. Never execute a model-generated filesystem path.

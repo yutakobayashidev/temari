@@ -3,6 +3,7 @@
 ## Status
 
 - Accepted
+- Its private-publication assumption is superseded by [ADR 0019](0019-prepare-publication-with-license-tbd.md); the technical decisions remain accepted.
 
 ## Decision Drivers
 
@@ -49,4 +50,4 @@
 - Tests must cover unknown file IDs, unknown destination IDs, duplicate classifications, unsafe destination paths, and disallowed endpoint hosts.
 - Code review must reject any flow that sends content without an explicit content policy or executes a model-produced path.
 - A change to provider protocol, filesystem mutation policy, or supported platforms requires a new ADR.
-- As the sole private operator, the repository owner approves exceptions and records them in an ADR with tests demonstrating the revised trust boundary.
+- The repository owner approves exceptions and records them in an ADR with tests demonstrating the revised trust boundary.

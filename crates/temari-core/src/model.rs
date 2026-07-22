@@ -105,6 +105,7 @@ impl OpenAiCompatibleModel {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         Ok(Self {
@@ -465,6 +466,55 @@ mod tests {
         });
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn adapter_never_follows_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _request = read_http_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{address}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            drop(stream);
+
+            listener.set_nonblocking(true).unwrap();
+            thread::sleep(Duration::from_millis(100));
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        });
+        let model = OpenAiCompatibleModel::new(&ModelConfig {
+            base_url: format!("http://{address}/v1"),
+            name: "test-model".into(),
+            allowed_hosts: vec!["127.0.0.1".into()],
+            api_key: Some("inline-secret".into()),
+            api_key_env: None,
+        })
+        .unwrap();
+
+        let result = model.classify_names(
+            &[FileCandidate {
+                id: "f000001".into(),
+                source_path: "report.pdf".into(),
+                extension: "pdf".into(),
+            }],
+            &[ApprovedFolder {
+                id: "docs".into(),
+                path: "Documents".into(),
+                description: "Reports and documents".into(),
+                model_visible: true,
+                fallback: None,
+            }],
+        );
+
+        assert!(result.is_err());
+        server.join().unwrap();
     }
 
     #[test]

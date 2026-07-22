@@ -1,5 +1,15 @@
 /target/
 /.temari.toml
+/.direnv/
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.key
+*.p12
+*.pem
 /.agent/skills/
 /.agents/skills/
 /.claude/skills/

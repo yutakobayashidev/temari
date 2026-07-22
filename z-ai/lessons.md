@@ -30,3 +30,4 @@
 
 - When the user authorizes a concrete implementation, do not repeatedly stop at plans or partial status reports. Continue through code, verification, documentation, and commit unless a genuine external blocker requires user input.
 - Browser demo state must preserve the selected workspace identity across preview and Apply, and should model the resulting recovery metadata; otherwise UI E2E can pass against a different workspace or cannot exercise Undo.
+- When a public-release request does not specify licensing terms, keep the license explicitly TBD and blocking; do not infer a proprietary or open-source grant from repository visibility.

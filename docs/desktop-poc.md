@@ -2,7 +2,7 @@
 
 ## Scope
 
-The Tauri 2 application under `apps/temari-desktop` is a private proof of concept for Linux and macOS. It exposes the managed three-area workflow while keeping filesystem safety and orchestration in the shared `ManagedService` in `temari-core`.
+The Tauri 2 application under `apps/temari-desktop` is an experimental proof of concept for Linux and macOS. It exposes the managed three-area workflow while keeping filesystem safety and orchestration in the shared `ManagedService` in `temari-core`.
 
 The native flow is:
 

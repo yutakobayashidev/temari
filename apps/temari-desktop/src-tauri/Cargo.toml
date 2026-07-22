@@ -2,8 +2,8 @@
 name = "temari-desktop"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-license = "LicenseRef-Proprietary"
+rust-version = "1.88"
+publish = false
 
 [lib]
 name = "temari_desktop_lib"

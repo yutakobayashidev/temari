@@ -1,6 +1,9 @@
 # Temari
 
-`Temari` is a private, personal-use tool that plans and applies file organization with a local model or a model hosted on an explicitly trusted internal network.
+`Temari` is a privacy-focused, personal-use tool that plans and applies file organization with a local model or a model hosted on an explicitly trusted internal network.
+
+> [!WARNING]
+> Temari is pre-release software that moves files. Start with a backed-up test directory, inspect every generated Plan, and verify Undo before trusting it with important data. The desktop application is still a proof of concept.
 
 Proposal, approval, and planning are read-only. Filesystem changes require a separate confirmed `apply` command and produce a durable JSON journal that can be inspected or passed to `undo`. The default `ask` privacy policy requests per-run consent only when names are ambiguous; only bounded extracted text is eligible to be sent. The application does not send telemetry.
 
@@ -24,9 +27,20 @@ For a long-lived folder, the managed workflow creates three physical areas: `Man
 
 ## Requirements
 
-- Rust 1.85 or later
+- Rust 1.88 or later
 - An OpenAI Chat Completions-compatible API, such as Ollama, llama.cpp, or vLLM
 - Linux or macOS
+
+## Install from source
+
+Clone the repository and build the CLI with the pinned Rust toolchain:
+
+```console
+$ cargo build --release -p temari-cli
+$ install target/release/temari ~/.local/bin/temari
+```
+
+Copy `examples/temari.example.toml` to the platform configuration directory or pass its absolute path with `--config`. Review `model.base_url`, `model.name`, and `model.allowed_hosts` before the first run. File names and extensions are sent to that configured model; bounded extracted text is sent only according to `privacy.content`. Raw files are never uploaded by Temari.
 
 ## Quick start
 
@@ -186,7 +200,7 @@ The workflow follows five explicit trust boundaries:
 
 The managed workflow is the primary product surface. `organize` remains a one-time convenience, and the six primitive commands remain available for agents and recovery. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for artifact persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits, [ADR 0008](docs/adr/0008-use-sqlite-for-monitoring-state.md) for internal monitoring state, [ADR 0009](docs/adr/0009-request-per-run-content-consent.md) for consent, [ADR 0010](docs/adr/0010-load-desktop-config-from-platform-directory.md) for desktop configuration and private credentials, [ADR 0011](docs/adr/0011-apply-backend-held-desktop-plans.md) for confirmed desktop Apply and Undo, [ADR 0012](docs/adr/0012-adopt-managed-three-area-workspaces.md) for protected, staged, and classified areas, [ADR 0013](docs/adr/0013-make-managed-the-primary-cli.md) for the public CLI boundary, [ADR 0014](docs/adr/0014-schedule-finite-managed-runs.md) for explicit OS scheduling, [ADR 0015](docs/adr/0015-reprocess-managed-files-through-recents.md) for protected and classified file reprocessing, and [ADR 0016](docs/adr/0016-share-managed-services-across-cli-and-desktop.md) for shared CLI and desktop orchestration.
 
-The detailed parity backlog is maintained in [the product roadmap](docs/roadmap.md). It separates current workflow completion from optional cleanup capabilities and records evidence confidence for behavior inferred from binary analysis.
+The detailed backlog is maintained in [the product roadmap](docs/roadmap.md). It separates current workflow completion from optional cleanup capabilities and records areas that need more product research.
 
 Example schemas are available for a model-created [proposal](examples/proposal.example.json) and a locally approved [folder set](examples/folders.example.json). Their source paths are illustrative and must match the canonical source used by `plan`.
 
@@ -203,6 +217,13 @@ Entering `nix develop` also installs the pinned Emil Kowalski design and animati
 
 See [the CLI specification](docs/cli-spec.md), [ADR 0001](docs/adr/0001-adopt-rust-core-and-read-only-cli.md), and [ADR 0003](docs/adr/0003-redesign-cli-around-versioned-workflow-artifacts.md).
 
+## Project policy
+
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or proposing a change.
+- Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+- Review [the public repository checklist](docs/public-release-checklist.md) before changing repository visibility or distributing binaries.
+- The project license is TBD. Do not make the repository public or redistribute the source until the license and contribution terms are selected.
+
 ## Implementation boundary
 
-This repository is an independent implementation. Product behavior and safety requirements are documented and tested within this repository. It does not contain third-party source code, branding, UI assets, internal identifiers, prompt text, database schemas, or log strings. This repository is intended for private use and is not planned for publication.
+This repository is an independent implementation. Product behavior and safety requirements are documented and tested within this repository. It does not contain third-party source code, branding, UI assets, internal identifiers, prompt text, database schemas, or log strings.

@@ -1,6 +1,6 @@
-# Product Parity Roadmap
+# Product Roadmap
 
-This roadmap records the remaining parity work identified through binary analysis and the current implementation review. It is deliberately separate from the core safety contract: unfinished items must not weaken read-only planning, opaque destination IDs, explicit consent, durable journals, or conservative recovery.
+This roadmap records the remaining product work identified through implementation review and user-flow analysis. It is deliberately separate from the core safety contract: unfinished items must not weaken read-only planning, opaque destination IDs, explicit consent, durable journals, or conservative recovery.
 
 ## Current position
 
@@ -14,7 +14,7 @@ This roadmap records the remaining parity work identified through binary analysi
 
 - [x] **Separate default roots from app-managed areas** (Core, CLI, Tauri)
   - Treat `Desktop`, `Downloads`, and optionally `Documents` as default onboarding suggestions, never as implicit registrations.
-  - Preserve the physical three-area workflow, but use product terminology aligned with the analyzed behavior: Manual Library, Recents, and AI Library.
+  - Preserve the physical three-area workflow and its product terminology: Manual Library, Recents, and AI Library.
   - Reject registering a managed area or a nested root beneath an existing workspace; recognize existing app-managed areas by the setup journal, filesystem identity, and reserved-area metadata.
   - Keep journals, SQLite indexes, and immutable workflow artifacts in the application state directory; only the three user-visible workflow areas and approved destination folders belong under the selected root.
   - Reject obsolete artifacts and state schemas instead of maintaining compatibility or migration paths. Treat obsolete area names as ordinary user directories rather than hidden reserved names.
@@ -98,11 +98,11 @@ This roadmap records the remaining parity work identified through binary analysi
   - Combine file moves, directory adoption, configuration revisions, Undo, Redo, and pending recovery in one timeline.
   - Support filtering by workspace, operation type, and state without making SQLite authoritative for immutable artifacts.
 
-## Evidence and confidence
+## Product research confidence
 
-- High confidence: three-area workflow, move journals, move-back markers, folder prompt priority metadata, nested tree editing, phase-oriented organization progress, duplicate selection, recoverable Trash, cleanup reports, and separate physical reorganization helpers.
-- Medium confidence: the exact current call path for directory move-back logs, whether physical reorganization includes Recents in the current UI, and end-to-end folder prompt transaction semantics.
-- Unconfirmed: a dedicated folder-merge operation. Do not add merge semantics until a concrete binary or UX path is identified.
+- Validated in the current product direction: three-area workflow, move journals, move-back markers, folder prompt priority metadata, nested tree editing, phase-oriented organization progress, duplicate selection, recoverable Trash, cleanup reports, and separate physical reorganization helpers.
+- Needs further product research: the exact desired presentation for directory move-back logs, whether physical reorganization should include Recents, and end-to-end folder prompt transaction semantics.
+- Unconfirmed: a dedicated folder-merge operation. Do not add merge semantics until a concrete user need and UX path are identified.
 
 ## Non-goals
 
