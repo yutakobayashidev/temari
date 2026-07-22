@@ -255,6 +255,11 @@ impl ManagedService {
             let _ = store.remove_monitor(&monitor_id, now);
             return Err(recovery_error(error));
         }
+        if let Err(error) = observe_recents(&mut store, &workspace, now) {
+            let _ = store.delete_managed_workspace(&workspace_id);
+            let _ = store.remove_monitor(&monitor_id, now);
+            return Err(recovery_error(error));
+        }
         Ok(ManagedActivationResult {
             workspace,
             setup_run,
@@ -2964,6 +2969,69 @@ mod tests {
                 .join("Manual Library/MustRemainAfterCorruption")
                 .exists()
         );
+    }
+
+    #[test]
+    fn activation_indexes_setup_recents_for_the_first_managed_run() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("baseline.txt"), b"baseline").unwrap();
+        let state = root.path().join("state.sqlite3");
+        let config_path = root.path().join("config.toml");
+        fs::write(&config_path, toml::to_string(&config()).unwrap()).unwrap();
+        let folders = Proposal {
+            version: 2,
+            source: source.display().to_string(),
+            scope: ScanScope::default(),
+            files_considered: 1,
+            folders: vec![FolderProposal {
+                path: "Documents".into(),
+                description: "Documents".into(),
+            }],
+        }
+        .approve()
+        .unwrap();
+        let destination_id = folders.folders[0].id.clone();
+        let setup = build_managed_setup_plan(&source).unwrap();
+        let service = ManagedService::new(&state);
+        let activation = service
+            .activate_workspace(&setup, &folders, &config_path, 1, 1)
+            .unwrap();
+
+        let mut store = StateStore::open(&state).unwrap();
+        let items = store.recents_items(&activation.workspace.id).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].relative_path, "Recents/baseline.txt");
+        assert_eq!(items[0].state, RecentsState::Pending);
+        store
+            .insert_rule(
+                &LocalRule {
+                    id: "text-rule".into(),
+                    monitor_id: activation.workspace.monitor_id.clone(),
+                    name_glob: "*.txt".into(),
+                    destination_id,
+                    priority: 100,
+                    enabled: true,
+                },
+                unix_ms().unwrap(),
+            )
+            .unwrap();
+        drop(store);
+
+        thread::sleep(Duration::from_millis(1_100));
+        let cycle = service
+            .run_workspace(&activation.workspace.id, true)
+            .unwrap();
+        let classified = cycle
+            .runs
+            .iter()
+            .find(|run| run.kind == ManagedRunKind::Classify)
+            .unwrap();
+        assert_eq!(classified.state, RunState::Completed);
+        assert_eq!(classified.move_count, 1);
+        assert!(source.join("AI Library/Documents/baseline.txt").is_file());
+        assert!(!source.join("Recents/baseline.txt").exists());
     }
 
     #[test]
