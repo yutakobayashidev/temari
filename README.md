@@ -199,6 +199,8 @@ $ cargo clippy --workspace --all-targets -- -D warnings
 $ cargo test --workspace
 ```
 
+Entering `nix develop` also installs the pinned Emil Kowalski design and animation skills into the supported local agent skill directories through `agent-skills-nix`.
+
 See [the CLI specification](docs/cli-spec.md), [ADR 0001](docs/adr/0001-adopt-rust-core-and-read-only-cli.md), and [ADR 0003](docs/adr/0003-redesign-cli-around-versioned-workflow-artifacts.md).
 
 ## Implementation boundary

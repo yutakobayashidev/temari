@@ -1,9 +1,16 @@
 {
   description = "Temari development environment";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    agent-skills-nix.url = "github:Kyure-A/agent-skills-nix";
+    emil-skills = {
+      url = "github:emilkowalski/skills";
+      flake = false;
+    };
+  };
 
-  outputs = { self, nixpkgs, ... }:
+  outputs = inputs@{ self, nixpkgs, ... }:
     let
       systems = [
         "aarch64-darwin"
@@ -67,9 +74,40 @@
               rustfmt
             ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux linuxPackages;
 
-            shellHook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-              export XDG_DATA_DIRS="${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:''${XDG_DATA_DIRS:-}"
-            '';
+            shellHook =
+              let
+                agentLib = inputs.agent-skills-nix.lib.agent-skills;
+                sources = {
+                  emil = {
+                    path = inputs.emil-skills;
+                    subdir = "skills";
+                  };
+                };
+                catalog = agentLib.discoverCatalog sources;
+                allowlist = agentLib.allowlistFor {
+                  inherit catalog sources;
+                  enableAll = true;
+                };
+                selection = agentLib.selectSkills {
+                  inherit catalog allowlist sources;
+                  skills = { };
+                };
+                bundle = agentLib.mkBundle { inherit pkgs selection; };
+                localTargets = builtins.mapAttrs (
+                  _: target:
+                  target
+                  // {
+                    enable = true;
+                  }
+                ) agentLib.defaultLocalTargets;
+              in
+              agentLib.mkShellHook {
+                inherit pkgs bundle;
+                targets = localTargets;
+              }
+              + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+                export XDG_DATA_DIRS="${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:''${XDG_DATA_DIRS:-}"
+              '';
           };
         }
       );
