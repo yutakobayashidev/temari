@@ -17,17 +17,20 @@ use crate::managed::{
 
 use crate::{
     ApplySession, ApplyState, Config, Error, FolderSet, InboxReconcileSummary, InboxState,
-    LocalContentExtractor, ManagedEntryFingerprint, ManagedLibraryEdit, ManagedLibraryEditPlan,
-    ManagedLibraryEditSession, ManagedLibraryEditState, ManagedLibraryEditUndoSession,
-    ManagedMoveOutcome, ManagedReprocessArea, ManagedReprocessSelection, ManagedRun,
-    ManagedRunKind, ManagedSetupPlan, ManagedSetupSession, ManagedSetupState,
-    ManagedSetupUndoSession, ManagedSetupUndoState, ManagedWorkspace, MonitorRecord,
-    MonitoringOptions, OpenAiCompatibleModel, Plan, RunState, SourceLock, StateStore,
-    apply_managed_setup, apply_monitoring_plan, apply_plan, build_reprocess_to_inbox_plan,
-    build_stage_to_inbox_plan, canonical_source_identity, filter_inbox_candidates,
-    fingerprint_candidate, inbox_file_candidates, library_folder_set, persist_monitoring_plan,
-    plan_monitor_candidates, reprocess_file_candidates, resume_apply_session, resume_managed_setup,
-    root_file_candidates, undo_managed_directory_adoption,
+    LocalContentExtractor, ManagedAreaMigrationPlan, ManagedAreaMigrationSession,
+    ManagedAreaMigrationState, ManagedAreaMigrationUndoSession, ManagedEntryFingerprint,
+    ManagedLibraryEdit, ManagedLibraryEditPlan, ManagedLibraryEditSession, ManagedLibraryEditState,
+    ManagedLibraryEditUndoSession, ManagedMoveOutcome, ManagedReprocessArea,
+    ManagedReprocessSelection, ManagedRun, ManagedRunKind, ManagedSetupPlan, ManagedSetupSession,
+    ManagedSetupState, ManagedSetupUndoSession, ManagedSetupUndoState, ManagedWorkspace,
+    MonitorRecord, MonitoringOptions, OpenAiCompatibleModel, Plan, RunState, SourceLock,
+    StateStore, apply_managed_area_migration, apply_managed_setup, apply_monitoring_plan,
+    apply_plan, build_reprocess_to_inbox_plan, build_stage_to_inbox_plan,
+    canonical_source_identity, filter_inbox_candidates, fingerprint_candidate,
+    inbox_file_candidates, library_folder_set, persist_monitoring_plan, plan_monitor_candidates,
+    reprocess_file_candidates, resume_apply_session, resume_managed_area_migration,
+    resume_managed_area_migration_undo, resume_managed_setup, root_file_candidates,
+    undo_managed_area_migration, undo_managed_directory_adoption,
 };
 
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -71,6 +74,20 @@ pub struct ManagedLibraryEditUndoResult {
     pub workspace: ManagedWorkspace,
     pub run: ManagedRun,
     pub session: ManagedLibraryEditUndoSession,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ManagedAreaMigrationResult {
+    pub workspace: ManagedWorkspace,
+    pub run: ManagedRun,
+    pub session: ManagedAreaMigrationSession,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ManagedAreaMigrationUndoResult {
+    pub workspace: ManagedWorkspace,
+    pub run: ManagedRun,
+    pub session: ManagedAreaMigrationUndoSession,
 }
 
 impl ManagedService {
@@ -402,6 +419,249 @@ impl ManagedService {
             )));
         }
         Ok(undo)
+    }
+
+    pub fn preview_area_migration(
+        &self,
+        workspace_id: &str,
+    ) -> Result<ManagedAreaMigrationPlan, Error> {
+        let store = self.store()?;
+        let workspace = require_workspace(&store, workspace_id)?;
+        let folders = validate_library_edit_workspace(&store, &workspace)?;
+        ManagedAreaMigrationPlan::build(
+            &workspace.id,
+            Path::new(&workspace.source),
+            Path::new(&workspace.folder_set_path),
+            &folders,
+        )
+    }
+
+    pub fn apply_area_migration(
+        &self,
+        plan: &ManagedAreaMigrationPlan,
+    ) -> Result<ManagedAreaMigrationResult, Error> {
+        plan.validate()?;
+        let mut store = self.store()?;
+        let workspace = require_workspace(&store, &plan.workspace_id)?;
+        validate_area_migration_binding(&store, &workspace, plan)?;
+        let run_directory = self.create_run_directory(&workspace.id, "area-migration")?;
+        let plan_path = run_directory.join("area-migration-plan.json");
+        let folders_path = run_directory.join("folders.json");
+        let session_path = run_directory.join("area-migration-session.json");
+        write_json(&plan_path, plan)?;
+        write_json(&folders_path, &plan.after_folders)?;
+        let started = unix_ms()?;
+        let mut run = ManagedRun {
+            id: new_id("managed-area-migration")?,
+            workspace_id: workspace.id.clone(),
+            kind: ManagedRunKind::Configure,
+            state: RunState::Applying,
+            plan_path: Some(path_text(&plan_path)?),
+            apply_path: Some(path_text(&session_path)?),
+            undo_path: None,
+            started_unix_ms: started,
+            finished_unix_ms: None,
+            move_count: 3,
+            error: None,
+        };
+        store.insert_managed_run(&run)?;
+        let session = match apply_managed_area_migration(plan, &session_path) {
+            Ok(session) => session,
+            Err(error) => {
+                run.state = if ManagedAreaMigrationSession::load(&session_path)
+                    .is_ok_and(|session| session.state == ManagedAreaMigrationState::Running)
+                {
+                    RunState::NeedsResume
+                } else {
+                    RunState::Failed
+                };
+                run.finished_unix_ms = Some(unix_ms()?);
+                run.error = Some(error.to_string());
+                store.update_managed_run(&run)?;
+                return Err(error);
+            }
+        };
+        if session.state != ManagedAreaMigrationState::Completed {
+            run.state = RunState::NeedsResume;
+            run.finished_unix_ms = Some(unix_ms()?);
+            run.error = Some("managed area migration needs recovery".into());
+            store.update_managed_run(&run)?;
+            return Err(Error::InvalidState(
+                "managed area migration needs recovery".into(),
+            ));
+        }
+        let workspace = finalize_area_migration_binding(
+            &mut store,
+            &workspace,
+            &run,
+            plan,
+            &folders_path,
+            false,
+        )?;
+        run.state = RunState::Completed;
+        run.finished_unix_ms = Some(unix_ms()?);
+        store.update_managed_run(&run)?;
+        Ok(ManagedAreaMigrationResult {
+            workspace,
+            run,
+            session,
+        })
+    }
+
+    pub fn resume_area_migration(&self, run_id: &str) -> Result<ManagedAreaMigrationResult, Error> {
+        let mut store = self.store()?;
+        let mut run = require_run(&store, run_id)?;
+        if run.kind != ManagedRunKind::Configure
+            || !matches!(run.state, RunState::Applying | RunState::NeedsResume)
+            || run.undo_path.is_some()
+        {
+            return Err(Error::InvalidState(
+                "area migration resume requires a resumable Apply run".into(),
+            ));
+        }
+        let plan = load_area_migration_plan(&run)?;
+        let session_path = require_run_path(&run.apply_path, "area migration Session")?;
+        let session = match ManagedAreaMigrationSession::load(session_path) {
+            Ok(session) if session.state == ManagedAreaMigrationState::Completed => session,
+            Ok(session) if session.state == ManagedAreaMigrationState::Running => {
+                resume_managed_area_migration(session_path)?
+            }
+            Ok(_) => {
+                return Err(Error::InvalidState(
+                    "terminal failed area migration cannot be resumed".into(),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if session.state != ManagedAreaMigrationState::Completed {
+            return Err(Error::InvalidState(
+                "managed area migration still needs recovery".into(),
+            ));
+        }
+        let workspace = require_workspace(&store, &run.workspace_id)?;
+        let folders_path = require_run_path(&run.plan_path, "area migration Plan")?
+            .parent()
+            .ok_or_else(|| Error::InvalidState("area migration Plan has no parent".into()))?
+            .join("folders.json");
+        let workspace = finalize_area_migration_binding(
+            &mut store,
+            &workspace,
+            &run,
+            &plan,
+            &folders_path,
+            false,
+        )?;
+        run.state = RunState::Completed;
+        run.finished_unix_ms = Some(unix_ms()?);
+        run.error = None;
+        store.update_managed_run(&run)?;
+        Ok(ManagedAreaMigrationResult {
+            workspace,
+            run,
+            session,
+        })
+    }
+
+    pub fn undo_area_migration(
+        &self,
+        run_id: &str,
+        journal_path: &Path,
+    ) -> Result<ManagedAreaMigrationUndoResult, Error> {
+        let mut store = self.store()?;
+        let mut run = require_run(&store, run_id)?;
+        if run.kind != ManagedRunKind::Configure
+            || run.state != RunState::Completed
+            || run.undo_path.is_some()
+        {
+            return Err(Error::InvalidState(
+                "area migration Undo requires a completed migration run".into(),
+            ));
+        }
+        let plan = load_area_migration_plan(&run)?;
+        let apply = ManagedAreaMigrationSession::load(require_run_path(
+            &run.apply_path,
+            "area migration Session",
+        )?)?;
+        let workspace = require_workspace(&store, &run.workspace_id)?;
+        validate_area_migration_current_binding(&store, &workspace, &run, &plan)?;
+        run.undo_path = Some(path_text(journal_path)?);
+        run.state = RunState::NeedsResume;
+        run.finished_unix_ms = Some(unix_ms()?);
+        run.error = Some("area migration Undo is pending".into());
+        store.update_managed_run(&run)?;
+        let session = undo_managed_area_migration(&apply, journal_path)?;
+        if session.state != ManagedAreaMigrationState::Completed {
+            return Err(Error::InvalidState(
+                "managed area migration Undo needs recovery".into(),
+            ));
+        }
+        let workspace = finalize_area_migration_binding(
+            &mut store,
+            &workspace,
+            &run,
+            &plan,
+            Path::new(&plan.before_folder_set_path),
+            true,
+        )?;
+        run.state = RunState::Completed;
+        run.finished_unix_ms = Some(unix_ms()?);
+        run.error = None;
+        store.update_managed_run(&run)?;
+        Ok(ManagedAreaMigrationUndoResult {
+            workspace,
+            run,
+            session,
+        })
+    }
+
+    pub fn resume_area_migration_undo(
+        &self,
+        run_id: &str,
+    ) -> Result<ManagedAreaMigrationUndoResult, Error> {
+        let mut store = self.store()?;
+        let mut run = require_run(&store, run_id)?;
+        if run.kind != ManagedRunKind::Configure || run.state != RunState::NeedsResume {
+            return Err(Error::InvalidState(
+                "area migration Undo resume requires a resumable run".into(),
+            ));
+        }
+        let plan = load_area_migration_plan(&run)?;
+        let undo_path = require_run_path(&run.undo_path, "area migration Undo journal")?;
+        let session = match ManagedAreaMigrationUndoSession::load(undo_path) {
+            Ok(session) if session.state == ManagedAreaMigrationState::Completed => session,
+            Ok(session) if session.state == ManagedAreaMigrationState::Running => {
+                resume_managed_area_migration_undo(undo_path)?
+            }
+            Ok(_) => {
+                return Err(Error::InvalidState(
+                    "terminal failed area migration Undo cannot be resumed".into(),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if session.state != ManagedAreaMigrationState::Completed {
+            return Err(Error::InvalidState(
+                "managed area migration Undo still needs recovery".into(),
+            ));
+        }
+        let workspace = require_workspace(&store, &run.workspace_id)?;
+        let workspace = finalize_area_migration_binding(
+            &mut store,
+            &workspace,
+            &run,
+            &plan,
+            Path::new(&plan.before_folder_set_path),
+            true,
+        )?;
+        run.state = RunState::Completed;
+        run.finished_unix_ms = Some(unix_ms()?);
+        run.error = None;
+        store.update_managed_run(&run)?;
+        Ok(ManagedAreaMigrationUndoResult {
+            workspace,
+            run,
+            session,
+        })
     }
 
     pub fn preview_library_edit(
@@ -977,6 +1237,131 @@ fn validate_library_edit_workspace(
         ));
     }
     Ok(folders)
+}
+
+fn validate_area_migration_binding(
+    store: &StateStore,
+    workspace: &ManagedWorkspace,
+    plan: &ManagedAreaMigrationPlan,
+) -> Result<(), Error> {
+    let folders = validate_library_edit_workspace(store, workspace)?;
+    if plan.workspace_id != workspace.id
+        || plan.source != workspace.source
+        || plan.source_identity != workspace.source_identity
+        || plan.before_folder_set_path != workspace.folder_set_path
+        || plan.before_folder_set_sha256 != workspace.folder_set_sha256
+        || plan.before_folders != folders
+    {
+        return Err(Error::InvalidState(
+            "managed area migration preview is stale".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_area_migration_current_binding(
+    store: &StateStore,
+    workspace: &ManagedWorkspace,
+    run: &ManagedRun,
+    plan: &ManagedAreaMigrationPlan,
+) -> Result<(), Error> {
+    if workspace.enabled {
+        return Err(Error::InvalidState(
+            "managed workspace must be disabled before area migration recovery".into(),
+        ));
+    }
+    let folders_path = require_run_path(&run.plan_path, "area migration Plan")?
+        .parent()
+        .ok_or_else(|| Error::InvalidState("area migration Plan has no parent".into()))?
+        .join("folders.json");
+    let folders = FolderSet::load(&folders_path)?;
+    let digest = folders.sha256()?;
+    if folders != plan.after_folders
+        || workspace.folder_set_path != path_text(&folders_path)?
+        || workspace.folder_set_sha256 != digest
+    {
+        return Err(Error::InvalidState(
+            "managed area migration binding changed after Apply".into(),
+        ));
+    }
+    let monitor = store
+        .monitor(&workspace.monitor_id)?
+        .filter(|monitor| monitor.deleted_unix_ms.is_none())
+        .ok_or_else(|| Error::InvalidState("managed monitor is missing".into()))?;
+    if monitor.folder_set_path != workspace.folder_set_path
+        || monitor.folder_set_sha256 != workspace.folder_set_sha256
+        || monitor.enabled
+    {
+        return Err(Error::InvalidState(
+            "managed monitor no longer matches its migrated workspace".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn finalize_area_migration_binding(
+    store: &mut StateStore,
+    workspace: &ManagedWorkspace,
+    run: &ManagedRun,
+    plan: &ManagedAreaMigrationPlan,
+    replacement_path: &Path,
+    undo: bool,
+) -> Result<ManagedWorkspace, Error> {
+    if workspace.enabled {
+        return Err(Error::InvalidState(
+            "managed workspace must remain disabled during area migration".into(),
+        ));
+    }
+    let replacement = FolderSet::load(replacement_path)?;
+    let replacement_digest = replacement.sha256()?;
+    let expected_after_path = require_run_path(&run.plan_path, "area migration Plan")?
+        .parent()
+        .ok_or_else(|| Error::InvalidState("area migration Plan has no parent".into()))?
+        .join("folders.json");
+    let (expected_path, expected_digest, expected_folders) = if undo {
+        (
+            path_text(&expected_after_path)?,
+            plan.after_folders.sha256()?,
+            &plan.before_folders,
+        )
+    } else {
+        (
+            plan.before_folder_set_path.clone(),
+            plan.before_folder_set_sha256.clone(),
+            &plan.after_folders,
+        )
+    };
+    if &replacement != expected_folders {
+        return Err(Error::InvalidState(
+            "managed area migration replacement FolderSet changed".into(),
+        ));
+    }
+    let replacement_path = path_text(replacement_path)?;
+    if workspace.folder_set_path == replacement_path
+        && workspace.folder_set_sha256 == replacement_digest
+    {
+        return Ok(workspace.clone());
+    }
+    store.replace_managed_folder_set_binding(
+        &workspace.id,
+        &run.id,
+        &expected_path,
+        &expected_digest,
+        &replacement_path,
+        &replacement_digest,
+        None,
+        unix_ms()?,
+    )
+}
+
+fn load_area_migration_plan(run: &ManagedRun) -> Result<ManagedAreaMigrationPlan, Error> {
+    ManagedAreaMigrationPlan::load(require_run_path(&run.plan_path, "area migration Plan")?)
+}
+
+fn require_run_path<'a>(path: &'a Option<String>, name: &str) -> Result<&'a Path, Error> {
+    path.as_deref()
+        .map(Path::new)
+        .ok_or_else(|| Error::InvalidState(format!("managed run has no {name}")))
 }
 
 fn validate_library_edit_plan_binding(
@@ -1625,19 +2010,6 @@ fn ensure_no_monitor_overlap(store: &StateStore, source: &Path) -> Result<(), Er
 }
 
 fn reject_managed_area_root(source: &Path) -> Result<(), Error> {
-    let Some(name) = source.file_name().and_then(|value| value.to_str()) else {
-        return Ok(());
-    };
-    let is_area_name = matches!(
-        name,
-        "Kept" | "Inbox" | "Library" | "Manual Library" | "Recents" | "AI Library"
-    );
-    if !is_area_name {
-        return Ok(());
-    }
-    let Some(parent) = source.parent() else {
-        return Ok(());
-    };
     let sibling_names = [
         "Kept",
         "Inbox",
@@ -1646,15 +2018,26 @@ fn reject_managed_area_root(source: &Path) -> Result<(), Error> {
         "Recents",
         "AI Library",
     ];
-    let sibling_area_count = sibling_names
-        .iter()
-        .filter(|candidate| parent.join(candidate).is_dir())
-        .count();
-    if sibling_area_count >= 2 {
-        return Err(Error::InvalidState(format!(
-            "managed area {:?} cannot be registered as a workspace root",
-            source.display()
-        )));
+    for ancestor in source.ancestors() {
+        let Some(name) = ancestor.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !sibling_names.contains(&name) {
+            continue;
+        }
+        let Some(parent) = ancestor.parent() else {
+            continue;
+        };
+        let sibling_area_count = sibling_names
+            .iter()
+            .filter(|candidate| parent.join(candidate).is_dir())
+            .count();
+        if sibling_area_count >= 2 {
+            return Err(Error::InvalidState(format!(
+                "managed area descendant {:?} cannot be registered as a workspace root",
+                source.display()
+            )));
+        }
     }
     Ok(())
 }
@@ -1852,6 +2235,8 @@ mod tests {
             fs::create_dir(root.path().join(name)).unwrap();
         }
         assert!(reject_managed_area_root(&root.path().join("Inbox")).is_err());
+        fs::create_dir_all(root.path().join("Inbox/nested/deeper")).unwrap();
+        assert!(reject_managed_area_root(&root.path().join("Inbox/nested/deeper")).is_err());
         assert!(reject_managed_area_root(&root.path().join("ordinary")).is_ok());
     }
 
@@ -1880,6 +2265,73 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn area_migration_switches_the_binding_atomically_and_can_be_undone() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("report.txt"), b"report").unwrap();
+        fs::create_dir(source.join("Project")).unwrap();
+        fs::write(source.join("Project/note.txt"), b"note").unwrap();
+        let state = root.path().join("state.sqlite3");
+        let config_path = root.path().join("config.toml");
+        fs::write(&config_path, toml::to_string(&config()).unwrap()).unwrap();
+        let folders = Proposal {
+            version: 2,
+            source: source.display().to_string(),
+            scope: ScanScope::default(),
+            files_considered: 1,
+            folders: vec![FolderProposal {
+                path: "Documents".into(),
+                description: "Documents".into(),
+            }],
+        }
+        .approve()
+        .unwrap();
+        let service = ManagedService::new(&state);
+        let activation = service
+            .activate_workspace(
+                &build_managed_setup_plan(&source).unwrap(),
+                &folders,
+                &config_path,
+                1,
+                1,
+            )
+            .unwrap();
+        let mut store = StateStore::open(&state).unwrap();
+        let disabled = store
+            .set_managed_workspace_enabled(&activation.workspace.id, false, unix_ms().unwrap())
+            .unwrap();
+        drop(store);
+
+        let plan = service.preview_area_migration(&disabled.id).unwrap();
+        let original_path = plan.before_folder_set_path.clone();
+        let original_digest = plan.before_folder_set_sha256.clone();
+        let applied = service.apply_area_migration(&plan).unwrap();
+        assert_eq!(applied.run.state, RunState::Completed);
+        assert!(source.join("Manual Library/Project/note.txt").is_file());
+        assert!(source.join("Recents/report.txt").is_file());
+        assert!(source.join("AI Library").is_dir());
+        assert_ne!(applied.workspace.folder_set_path, original_path);
+        assert_eq!(
+            FolderSet::load(Path::new(&applied.workspace.folder_set_path)).unwrap(),
+            plan.after_folders
+        );
+
+        let undone = service
+            .undo_area_migration(
+                &applied.run.id,
+                &root.path().join("area-migration-undo.json"),
+            )
+            .unwrap();
+        assert_eq!(undone.run.state, RunState::Completed);
+        assert!(source.join("Kept/Project/note.txt").is_file());
+        assert!(source.join("Inbox/report.txt").is_file());
+        assert!(source.join("Library").is_dir());
+        assert_eq!(undone.workspace.folder_set_path, original_path);
+        assert_eq!(undone.workspace.folder_set_sha256, original_digest);
     }
 
     #[test]

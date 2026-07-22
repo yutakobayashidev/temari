@@ -6,6 +6,7 @@ mod extraction;
 mod filesystem;
 mod lock;
 mod managed;
+mod managed_area_migration;
 mod managed_cycle;
 mod managed_library;
 mod managed_service;
@@ -47,6 +48,13 @@ pub use managed::{
     preflight_managed_undo, resume_managed_setup, resume_managed_setup_with_lock,
     undo_managed_directory_adoption, undo_managed_setup, undo_managed_setup_with_lock,
 };
+pub use managed_area_migration::{
+    CURRENT_MANAGED_AREAS, LEGACY_MANAGED_AREAS, ManagedAreaMigrationMove,
+    ManagedAreaMigrationOutcome, ManagedAreaMigrationPlan, ManagedAreaMigrationRecord,
+    ManagedAreaMigrationSession, ManagedAreaMigrationState, ManagedAreaMigrationUndoSession,
+    apply_managed_area_migration, apply_managed_area_migration_with_lock,
+    resume_managed_area_migration, resume_managed_area_migration_undo, undo_managed_area_migration,
+};
 pub use managed_cycle::{
     INBOX_DIRECTORY, KEPT_DIRECTORY, LIBRARY_DIRECTORY, ManagedReprocessArea,
     ManagedReprocessSelection, STAGE_TO_INBOX_RULE_ID, build_reprocess_to_inbox_plan,
@@ -58,8 +66,9 @@ pub use managed_library::{
     ManagedLibraryEditUndoSession,
 };
 pub use managed_service::{
-    ManagedActivationResult, ManagedCycleResult, ManagedDirectoryAdoption,
-    ManagedLibraryEditResult, ManagedLibraryEditUndoResult, ManagedService,
+    ManagedActivationResult, ManagedAreaMigrationResult, ManagedAreaMigrationUndoResult,
+    ManagedCycleResult, ManagedDirectoryAdoption, ManagedLibraryEditResult,
+    ManagedLibraryEditUndoResult, ManagedService,
 };
 pub use model::{
     Classification, ClassificationBasis, Classifier, ContentCandidate, FolderProposer,
