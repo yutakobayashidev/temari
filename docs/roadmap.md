@@ -6,6 +6,12 @@ This roadmap records the remaining parity work identified through binary analysi
 
 ### P0 — make the current managed workflow complete
 
+- [ ] **Separate user roots from internal workflow state** (Core, CLI, Tauri)
+  - Treat `Desktop`, `Downloads`, and optionally `Documents` as default suggestions only, never as implicit registrations.
+  - Reject registering a managed area or a nested root beneath an existing workspace unless the user explicitly converts it through a reviewed migration.
+  - Stop creating fixed `Kept`, `Inbox`, and `Library` directories in the user's selected root by default. Represent Manual, Recents, and Library as logical areas; create only approved destination folders and keep journals/indexes in the application state directory.
+  - Define an explicit migration and recovery path for the current three-directory workspaces before changing the default.
+  - Acceptance: selecting `~/Downloads` does not make `~/Downloads/Kept`, `~/Downloads/Inbox`, or `~/Downloads/Library` eligible as separate roots, and status remains healthy after a setup Undo.
 - [ ] **Multi-operation Library edit plans** (`temari-core`, CLI, Tauri)
   - Allow one reviewed plan to contain an ordered set of add, rename, description, and delete operations.
   - Validate the complete before/after FolderSet delta and preserve stable IDs across every operation.
