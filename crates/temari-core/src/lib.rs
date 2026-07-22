@@ -8,6 +8,7 @@ mod lock;
 mod managed;
 mod managed_cycle;
 mod managed_library;
+mod managed_reorganization;
 mod managed_service;
 mod managed_status;
 mod model;
@@ -21,8 +22,9 @@ pub use apply::{
     ApplySession, ApplyState, DirectoryOutcome, DirectoryRecord, MoveOutcome, MoveRecord,
     UndoDirectoryOutcome, UndoDirectoryRecord, UndoMoveOutcome, UndoMoveRecord, UndoSession,
     UndoState, apply_plan, apply_plan_with_lock, preflight_apply, preflight_resume, preflight_undo,
-    resume_apply_session, resume_apply_session_with_lock, undo_session, undo_session_files,
-    undo_session_files_with_lock, undo_session_with_lock,
+    resume_apply_session, resume_apply_session_with_lock, resume_undo_session,
+    resume_undo_session_with_lock, undo_session, undo_session_files, undo_session_files_with_lock,
+    undo_session_with_lock,
 };
 pub use artifact::{
     ApprovedFolder, FallbackCategory, FolderProposal, FolderSet, Proposal, ScanScope,
@@ -60,10 +62,15 @@ pub use managed_library::{
     ManagedLibraryEditRedoSession, ManagedLibraryEditSession, ManagedLibraryEditState,
     ManagedLibraryEditUndoSession,
 };
+pub use managed_reorganization::{
+    ManagedLibraryReorganizationAttention, ManagedLibraryReorganizationAttentionReason,
+    ManagedLibraryReorganizationEntry, ManagedLibraryReorganizationPlan,
+    ManagedLibraryReorganizationTarget,
+};
 pub use managed_service::{
     ManagedActivationResult, ManagedCycleResult, ManagedDirectoryAdoption,
     ManagedLibraryEditRedoResult, ManagedLibraryEditResult, ManagedLibraryEditUndoResult,
-    ManagedService,
+    ManagedLibraryReorganizationResult, ManagedLibraryReorganizationUndoResult, ManagedService,
 };
 pub use managed_status::{
     ManagedActivity, ManagedActivityRunSnapshot, ManagedActivitySnapshot, ManagedQueueSnapshot,

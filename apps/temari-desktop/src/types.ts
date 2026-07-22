@@ -35,7 +35,7 @@ export type WaitingFile = {
 
 export type ManagedRun = {
   id: string;
-  kind: "setup" | "adopt" | "stage" | "classify" | "configure";
+  kind: "setup" | "adopt" | "stage" | "classify" | "configure" | "reorganize";
   state: "planning" | "planned" | "applying" | "completed" | "noop" | "needs_resume" | "failed";
   moveCount: number;
   startedUnixMs: number;
@@ -70,6 +70,14 @@ export type ManagedWorkspaceStatus = {
     redone: boolean;
     finishedUnixMs: number | null;
   };
+  latestReorganization: null | {
+    runId: string;
+    configureRunId: string;
+    state: ManagedRun["state"];
+    undone: boolean;
+    moveCount: number;
+    finishedUnixMs: number | null;
+  };
 };
 
 export type LibraryFolder = { id: string; path: string; description: string };
@@ -91,9 +99,24 @@ export type LibraryEditPreview = {
   afterFolders: LibraryFolder[];
 };
 
+export type LibraryReorganizationPreview = {
+  token: string;
+  directories: string[];
+  moves: Array<{
+    sourcePath: string;
+    requestedDestination: string;
+    destinationPath: string;
+    target: "approved" | "recents";
+  }>;
+  attention: Array<{
+    sourcePath: string;
+    reason: "untracked" | "changed" | "unknown_destination" | "outside_recorded_destination";
+  }>;
+};
+
 export type ManagedMove = {
   sessionId: string;
-  kind: "adopt" | "stage" | "classify" | "configure";
+  kind: "adopt" | "stage" | "classify" | "configure" | "reorganize";
   moveId: string;
   sourcePath: string;
   destinationPath: string;

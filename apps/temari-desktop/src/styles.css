@@ -216,7 +216,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 
 .small-dialog { display: grid; place-items: center; }
 .small-dialog > form, .small-dialog > section { position: relative; width: min(470px, calc(100vw - 32px)); padding: 29px; border-radius: 10px; background: var(--paper); box-shadow: 0 25px 80px rgba(12,22,35,.35); }
-.confirmation dl { display: grid; gap: 1px; overflow: hidden; margin: 19px 0; border: 1px solid var(--line); border-radius: 6px; background: var(--line); }
+.confirmation dl { display: grid; gap: 1px; max-height: 46vh; overflow: auto; margin: 19px 0; border: 1px solid var(--line); border-radius: 6px; background: var(--line); }
 .confirmation dl div { display: grid; grid-template-columns: 110px minmax(0,1fr); gap: 10px; padding: 10px; background: white; }
 .confirmation dt { color: var(--muted); font: 700 8px "SFMono-Regular", Consolas, monospace; text-transform: uppercase; letter-spacing: .06em; }
 .confirmation dd { margin: 0; font: 9px/1.4 "SFMono-Regular", Consolas, monospace; overflow-wrap: anywhere; }
@@ -235,6 +235,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .library-editor-rows .danger-text { grid-column: 2; color: #8b4c46; }
 .library-add { display: grid; grid-template-columns: .8fr 1.2fr auto; gap: 8px; align-items: end; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
 .library-add .eyebrow { grid-column: 1 / -1; margin: 0; }
+.library-action { margin-top: 10px; }
 
 .waiting-files { display: grid; gap: 1px; margin-top: 10px; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--line); }
 .waiting-files div { display: grid; grid-template-columns: minmax(120px,.8fr) minmax(0,1.2fr); gap: 12px; padding: 9px 11px; background: rgba(255,255,255,.78); }

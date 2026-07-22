@@ -14,16 +14,16 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use temari_core::{
-    ApplySession, Config, FolderProposal, FolderProposer, FolderSet, RecentsState,
+    ApplySession, Config, FolderProposal, FolderProposer, FolderSet, MANAGED_AREAS,
     ManagedActivitySnapshot, ManagedCycleResult, ManagedLibraryEdit, ManagedLibraryEditDraft,
     ManagedLibraryEditPlan, ManagedLibraryEditRedoSession, ManagedLibraryEditState,
-    ManagedQueueSnapshot, ManagedReprocessArea,
+    ManagedLibraryReorganizationAttentionReason, ManagedLibraryReorganizationPlan,
+    ManagedLibraryReorganizationTarget, ManagedQueueSnapshot, ManagedReprocessArea,
     ManagedReprocessSelection, ManagedRun, ManagedRunKind, ManagedService, ManagedSetupPlan,
     ManagedSetupSession, ManagedSetupUndoSession, ManagedSetupUndoState, ManagedUndoMoveOutcome,
-    ManagedWorkspace, OpenAiCompatibleModel, Proposal, RunState, ScanScope, SourceLock, StateStore,
-    UndoMoveOutcome, UndoSession, MANAGED_AREAS, build_managed_setup_plan,
-    build_workspace_snapshot,
-    recents_file_candidates, scan_directory, select_representative_files,
+    ManagedWorkspace, OpenAiCompatibleModel, Proposal, RecentsState, RunState, ScanScope,
+    SourceLock, StateStore, UndoMoveOutcome, UndoSession, build_managed_setup_plan,
+    build_workspace_snapshot, recents_file_candidates, scan_directory, select_representative_files,
     undo_session_files_with_lock, undo_session_with_lock,
     validate_managed_workspace_root_candidate,
 };
@@ -58,12 +58,19 @@ struct LibraryEditDraft {
     plan: ManagedLibraryEditPlan,
 }
 
+#[derive(Clone)]
+struct LibraryReorganizationDraft {
+    token: String,
+    plan: ManagedLibraryReorganizationPlan,
+}
+
 #[derive(Default)]
 struct ManagedDrafts {
     revision: u64,
     proposal: Option<ProposalDraft>,
     preview: Option<PreviewDraft>,
     library_edit: Option<LibraryEditDraft>,
+    library_reorganization: Option<LibraryReorganizationDraft>,
 }
 
 impl ManagedDrafts {
@@ -72,6 +79,7 @@ impl ManagedDrafts {
         self.proposal = None;
         self.preview = None;
         self.library_edit = None;
+        self.library_reorganization = None;
         self.revision
     }
 
@@ -102,6 +110,7 @@ impl ManagedDrafts {
         self.proposal = None;
         self.preview = None;
         self.library_edit = None;
+        self.library_reorganization = None;
         self.revision
     }
 
@@ -118,6 +127,33 @@ impl ManagedDrafts {
             .library_edit
             .take()
             .expect("AI Library edit token was checked"))
+    }
+
+    fn begin_library_reorganization(&mut self) -> u64 {
+        self.revision = self.revision.wrapping_add(1);
+        self.proposal = None;
+        self.preview = None;
+        self.library_edit = None;
+        self.library_reorganization = None;
+        self.revision
+    }
+
+    fn consume_library_reorganization(
+        &mut self,
+        token: &str,
+    ) -> Result<LibraryReorganizationDraft, String> {
+        if self
+            .library_reorganization
+            .as_ref()
+            .is_none_or(|draft| draft.token != token)
+        {
+            return Err("the reviewed AI Library file reorganization is no longer active".into());
+        }
+        self.revision = self.revision.wrapping_add(1);
+        Ok(self
+            .library_reorganization
+            .take()
+            .expect("AI Library reorganization token was checked"))
     }
 }
 
@@ -225,6 +261,26 @@ pub(crate) struct ManagedLibraryEditUndoRequest {
     pub run_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct ManagedLibraryReorganizationPreviewRequest {
+    pub workspace_id: String,
+    pub configure_run_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct ManagedLibraryReorganizationApplyRequest {
+    pub preview_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct ManagedLibraryReorganizationRunRequest {
+    pub workspace_id: String,
+    pub run_id: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ManagedWorkspaceView {
@@ -311,6 +367,17 @@ pub(crate) struct LibraryConfigurationView {
     pub finished_unix_ms: Option<i64>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LibraryReorganizationView {
+    pub run_id: String,
+    pub configure_run_id: String,
+    pub state: RunState,
+    pub undone: bool,
+    pub move_count: u64,
+    pub finished_unix_ms: Option<i64>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ManagedWorkspaceStatus {
@@ -323,6 +390,7 @@ pub(crate) struct ManagedWorkspaceStatus {
     pub runs: ManagedRunsView,
     pub library_folders: Vec<LibraryFolderView>,
     pub latest_configuration: Option<LibraryConfigurationView>,
+    pub latest_reorganization: Option<LibraryReorganizationView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -332,6 +400,31 @@ pub(crate) struct LibraryEditPreviewView {
     pub operations: Vec<ManagedLibraryEdit>,
     pub before_folders: Vec<LibraryFolderView>,
     pub after_folders: Vec<LibraryFolderView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LibraryReorganizationMoveView {
+    pub source_path: String,
+    pub requested_destination: String,
+    pub destination_path: String,
+    pub target: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LibraryReorganizationAttentionView {
+    pub source_path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LibraryReorganizationPreviewView {
+    pub token: String,
+    pub directories: Vec<String>,
+    pub moves: Vec<LibraryReorganizationMoveView>,
+    pub attention: Vec<LibraryReorganizationAttentionView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -772,6 +865,106 @@ pub(crate) async fn managed_resume_library_edit(
 }
 
 #[tauri::command]
+pub(crate) async fn managed_preview_library_reorganization(
+    request: ManagedLibraryReorganizationPreviewRequest,
+    state: State<'_, ManagedAppState>,
+) -> Result<LibraryReorganizationPreviewView, String> {
+    let revision = {
+        let mut drafts = state
+            .drafts
+            .lock()
+            .map_err(|_| "managed setup state is unavailable".to_owned())?;
+        drafts.begin_library_reorganization()
+    };
+    let token = setup_token("library-reorganization", revision);
+    let plan = tauri::async_runtime::spawn_blocking(move || {
+        managed_service()?
+            .preview_library_reorganization(&request.workspace_id, &request.configure_run_id)
+            .map_err(error_text)
+    })
+    .await
+    .map_err(|error| format!("AI Library file reorganization preview task failed: {error}"))??;
+    let view = library_reorganization_preview_view(&token, &plan);
+    let mut drafts = state
+        .drafts
+        .lock()
+        .map_err(|_| "managed setup state is unavailable".to_owned())?;
+    if drafts.revision != revision {
+        return Err("a newer AI Library file reorganization preview replaced this result".into());
+    }
+    drafts.library_reorganization = Some(LibraryReorganizationDraft { token, plan });
+    Ok(view)
+}
+
+#[tauri::command]
+pub(crate) async fn managed_apply_library_reorganization(
+    request: ManagedLibraryReorganizationApplyRequest,
+    state: State<'_, ManagedAppState>,
+) -> Result<ManagedWorkspaceStatus, String> {
+    let draft = {
+        let mut drafts = state
+            .drafts
+            .lock()
+            .map_err(|_| "managed setup state is unavailable".to_owned())?;
+        drafts.consume_library_reorganization(&request.preview_token)?
+    };
+    let workspace_id = draft.plan.workspace_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        managed_service()?
+            .apply_library_reorganization(&draft.plan)
+            .map_err(error_text)
+    })
+    .await
+    .map_err(|error| format!("AI Library file reorganization Apply task failed: {error}"))??;
+    with_store(|store| workspace_status(store, &workspace_id))
+}
+
+#[tauri::command]
+pub(crate) async fn managed_resume_library_reorganization(
+    request: ManagedLibraryReorganizationRunRequest,
+) -> Result<ManagedWorkspaceStatus, String> {
+    let state_path = default_state_path()?;
+    let workspace_id = request.workspace_id;
+    let status_workspace_id = workspace_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let run = require_reorganization_run(&state_path, &workspace_id, &request.run_id)?;
+        let service = ManagedService::new(&state_path);
+        if run.undo_path.is_some() {
+            service
+                .resume_library_reorganization_undo(&request.run_id)
+                .map(|_| ())
+                .map_err(error_text)
+        } else {
+            service
+                .resume_library_reorganization(&request.run_id)
+                .map(|_| ())
+                .map_err(error_text)
+        }
+    })
+    .await
+    .map_err(|error| format!("AI Library file reorganization Resume task failed: {error}"))??;
+    with_store(|store| workspace_status(store, &status_workspace_id))
+}
+
+#[tauri::command]
+pub(crate) async fn managed_undo_library_reorganization(
+    request: ManagedLibraryReorganizationRunRequest,
+) -> Result<ManagedWorkspaceStatus, String> {
+    let state_path = default_state_path()?;
+    let workspace_id = request.workspace_id;
+    let status_workspace_id = workspace_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        require_reorganization_run(&state_path, &workspace_id, &request.run_id)?;
+        ManagedService::new(&state_path)
+            .undo_library_reorganization(&request.run_id)
+            .map_err(error_text)
+    })
+    .await
+    .map_err(|error| format!("AI Library file reorganization Undo task failed: {error}"))??;
+    with_store(|store| workspace_status(store, &status_workspace_id))
+}
+
+#[tauri::command]
 pub(crate) async fn managed_run(request: ManagedRunRequest) -> Result<ManagedCycleView, String> {
     if !request.apply {
         return Err("desktop managed runs require explicit Apply confirmation".into());
@@ -901,6 +1094,65 @@ fn require_workspace_id(workspace_id: &str) -> Result<(), String> {
     with_store(|store| require_workspace(store, workspace_id).map(|_| ()))
 }
 
+fn require_reorganization_run(
+    state_path: &Path,
+    workspace_id: &str,
+    run_id: &str,
+) -> Result<ManagedRun, String> {
+    let store = StateStore::open(state_path).map_err(error_text)?;
+    require_workspace(&store, workspace_id)?;
+    let run = store
+        .managed_run(run_id)
+        .map_err(error_text)?
+        .ok_or_else(|| format!("unknown Library reorganization run {run_id:?}"))?;
+    if run.workspace_id != workspace_id || run.kind != ManagedRunKind::Reorganize {
+        return Err("Library reorganization run does not belong to the requested workspace".into());
+    }
+    Ok(run)
+}
+
+fn library_reorganization_preview_view(
+    token: &str,
+    plan: &ManagedLibraryReorganizationPlan,
+) -> LibraryReorganizationPreviewView {
+    LibraryReorganizationPreviewView {
+        token: token.into(),
+        directories: plan.directories.clone(),
+        moves: plan
+            .entries
+            .iter()
+            .map(|entry| LibraryReorganizationMoveView {
+                source_path: entry.source_path.clone(),
+                requested_destination: entry.requested_destination.clone(),
+                destination_path: entry.destination_path.clone(),
+                target: match &entry.target {
+                    ManagedLibraryReorganizationTarget::Approved { .. } => "approved",
+                    ManagedLibraryReorganizationTarget::Recents { .. } => "recents",
+                }
+                .into(),
+            })
+            .collect(),
+        attention: plan
+            .attention
+            .iter()
+            .map(|item| LibraryReorganizationAttentionView {
+                source_path: item.source_path.clone(),
+                reason: match &item.reason {
+                    ManagedLibraryReorganizationAttentionReason::Untracked => "untracked",
+                    ManagedLibraryReorganizationAttentionReason::Changed => "changed",
+                    ManagedLibraryReorganizationAttentionReason::UnknownDestination { .. } => {
+                        "unknown_destination"
+                    }
+                    ManagedLibraryReorganizationAttentionReason::OutsideRecordedDestination {
+                        ..
+                    } => "outside_recorded_destination",
+                }
+                .into(),
+            })
+            .collect(),
+    }
+}
+
 fn workspace_status(
     store: &StateStore,
     workspace_id: &str,
@@ -983,6 +1235,35 @@ fn workspace_status(
                 finished_unix_ms: run.finished_unix_ms,
             }
         });
+    let latest_reorganization = if let Some(run) = runs
+        .iter()
+        .find(|run| run.kind == ManagedRunKind::Reorganize)
+    {
+        match run.plan_path.as_deref() {
+            Some(path) => match ManagedLibraryReorganizationPlan::load(Path::new(path)) {
+                Ok(plan) => Some(LibraryReorganizationView {
+                    run_id: run.id.clone(),
+                    configure_run_id: plan.configure_run_id,
+                    state: run.state,
+                    undone: run.undo_path.is_some() && run.state == RunState::Completed,
+                    move_count: run.move_count,
+                    finished_unix_ms: run.finished_unix_ms,
+                }),
+                Err(error) => {
+                    issues.push(format!(
+                        "AI Library file reorganization Plan could not be loaded: {error}"
+                    ));
+                    None
+                }
+            },
+            None => {
+                issues.push("AI Library file reorganization run has no Plan".into());
+                None
+            }
+        }
+    } else {
+        None
+    };
     let health = if !issues.is_empty() {
         "attention"
     } else if !workspace.enabled {
@@ -1008,6 +1289,7 @@ fn workspace_status(
         },
         library_folders,
         latest_configuration,
+        latest_reorganization,
     })
 }
 
@@ -1351,6 +1633,50 @@ fn undo_managed_at(
                 restored_files,
                 conflicts,
                 journal_path: path_text(&journal_path)?,
+            });
+        }
+        if run.kind == ManagedRunKind::Reorganize {
+            if move_id.is_some() {
+                return Err(
+                    "AI Library file reorganization can be undone only as a complete session"
+                        .into(),
+                );
+            }
+            drop(store);
+            let result = ManagedService::new(path)
+                .undo_library_reorganization(&run.id)
+                .map_err(error_text)?;
+            let restored_files = result
+                .session
+                .moves
+                .iter()
+                .filter(|movement| {
+                    matches!(
+                        movement.outcome,
+                        UndoMoveOutcome::Restored | UndoMoveOutcome::AlreadyRestored
+                    )
+                })
+                .count();
+            let conflicts = result
+                .session
+                .moves
+                .iter()
+                .filter(|movement| {
+                    matches!(
+                        movement.outcome,
+                        UndoMoveOutcome::Conflict { .. } | UndoMoveOutcome::Failed { .. }
+                    )
+                })
+                .count();
+            return Ok(ManagedUndoResult {
+                run_id: run.id,
+                state: undo_state_label(&result.session.state),
+                restored_files,
+                conflicts,
+                journal_path: result
+                    .run
+                    .undo_path
+                    .ok_or_else(|| "reorganization Undo journal was not recorded".to_owned())?,
             });
         }
         if run.state != RunState::Completed || run.kind == ManagedRunKind::Setup {
@@ -1746,6 +2072,12 @@ timeout_seconds = 2
             "journalPath": "/tmp/injected.json"
         });
         assert!(serde_json::from_value::<ManagedUndoMoveRequest>(request).is_err());
+        let request = serde_json::json!({
+            "workspaceId": "workspace-1",
+            "runId": "run-1",
+            "journalPath": "/tmp/injected.json"
+        });
+        assert!(serde_json::from_value::<ManagedLibraryReorganizationRunRequest>(request).is_err());
     }
 
     #[test]
@@ -1952,6 +2284,29 @@ timeout_seconds = 2
         assert_eq!(
             status.latest_configuration.as_ref().unwrap().run_id,
             applied.run.id
+        );
+        let reorganization = service
+            .preview_library_reorganization(&activation.workspace.id, &applied.run.id)
+            .unwrap();
+        let view = library_reorganization_preview_view("reviewed-files", &reorganization);
+        assert_eq!(view.token, "reviewed-files");
+        assert!(view.moves.is_empty());
+        let mut drafts = ManagedDrafts::default();
+        drafts.begin_library_reorganization();
+        drafts.library_reorganization = Some(LibraryReorganizationDraft {
+            token: "reviewed-files".into(),
+            plan: reorganization,
+        });
+        assert!(drafts.consume_library_reorganization("stale").is_err());
+        assert!(
+            drafts
+                .consume_library_reorganization("reviewed-files")
+                .is_ok()
+        );
+        assert!(
+            drafts
+                .consume_library_reorganization("reviewed-files")
+                .is_err()
         );
         service.undo_library_edit(&applied.run.id).unwrap();
         let status = get_workspace_at(&state_path, &activation.workspace.id).unwrap();

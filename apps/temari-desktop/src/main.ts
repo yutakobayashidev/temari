@@ -1,5 +1,6 @@
 import "./styles.css";
 import {
+  applyLibraryReorganization,
   applyLibraryEdit,
   applyManagedWorkspace,
   chooseConfig,
@@ -15,6 +16,7 @@ import {
   listManagedWorkspaces,
   previewManagedWorkspace,
   previewLibraryEdit,
+  previewLibraryReorganization,
   proposeManagedWorkspace,
   reprocessManagedFiles,
   redoLibraryEdit,
@@ -24,11 +26,14 @@ import {
   undoManagedRun,
   undoLibraryEdit,
   resumeLibraryEdit,
+  resumeLibraryReorganization,
+  undoLibraryReorganization,
 } from "./api";
 import type {
   DefaultSourceLocation,
   LibraryEditOperation,
   LibraryEditPreview,
+  LibraryReorganizationPreview,
   ManagedMove,
   ManagedWorkspace,
   ManagedWorkspaceStatus,
@@ -156,6 +161,13 @@ function libraryDiffDetails(preview: LibraryEditPreview): Array<[string, string]
   return details;
 }
 
+function reorganizationAttentionLabel(reason: LibraryReorganizationPreview["attention"][number]["reason"]): string {
+  if (reason === "untracked") return "Not tracked by an earlier classification";
+  if (reason === "changed") return "Contents changed after classification";
+  if (reason === "unknown_destination") return "Recorded destination is unavailable";
+  return "File is outside its recorded destination";
+}
+
 async function loadSchedule(workspaceId: string): Promise<ScheduleStatus | null> {
   try {
     return await getManagedSchedule(workspaceId);
@@ -182,10 +194,10 @@ function historyRows(): string {
         <span aria-hidden="true">→</span>
         <strong>${escapeHtml(move.destinationPath)}</strong>
       </div>
-      <span class="move-kind">${move.kind === "classify" ? "Classified" : move.kind === "adopt" ? "Manual" : move.kind === "configure" ? "Configured" : "Staged"}</span>
+      <span class="move-kind">${move.kind === "classify" ? "Classified" : move.kind === "adopt" ? "Manual" : move.kind === "configure" ? "Configured" : move.kind === "reorganize" ? "Reorganized" : "Staged"}</span>
       ${move.undone
         ? `<span class="undo-state">Undone</span>`
-        : move.kind === "adopt"
+        : move.kind === "adopt" || move.kind === "reorganize"
           ? `<span class="undo-state">Undo by run</span>`
           : `<button class="quiet-button" data-undo-file="${escapeAttribute(move.moveId)}" data-run-id="${escapeAttribute(move.sessionId)}" type="button">Undo</button>`}
     </article>`).join("");
@@ -231,6 +243,11 @@ function dashboard(): string {
     : "Nothing is waiting for review";
   const scheduleOn = state.schedule?.installed && state.schedule.enabled;
   const latestRuns = [...new Set(state.history.filter((move) => !move.undone).map((move) => move.sessionId))].slice(0, 3);
+  const configuration = state.status.latestConfiguration;
+  const reorganization = state.status.latestReorganization;
+  const reorganizationMatchesConfiguration = configuration && reorganization?.configureRunId === configuration.runId;
+  const activeReorganization = reorganizationMatchesConfiguration && reorganization
+    && !reorganization.undone && !["failed", "noop"].includes(reorganization.state);
 
   return `<main class="dashboard">
     <header class="workspace-header">
@@ -280,10 +297,13 @@ function dashboard(): string {
         <button class="text-button" id="open-library-editor" type="button" ${workspace.enabled ? "disabled" : ""}>Edit structure</button>
       </div>
       <div class="library-ledger-rows">${state.status.libraryFolders.map((folder) => `<div><strong>${escapeHtml(folder.path)}</strong><span>${escapeHtml(folder.description)}</span></div>`).join("")}</div>
-      <p class="field-note">${workspace.enabled ? "Pause this workspace before editing its structure." : "Structure edits do not move existing files. Use Reprocess when files should be organized again."}</p>
-      ${state.status.latestConfiguration?.state === "completed" && !state.status.latestConfiguration.undone && !state.status.latestConfiguration.redone ? `<button class="text-button" id="undo-library-edit" type="button">Undo last structure edit</button>` : ""}
-      ${state.status.latestConfiguration?.state === "completed" && state.status.latestConfiguration.undone ? `<button class="text-button" id="redo-library-edit" type="button">Redo structure edit</button>` : ""}
+      <p class="field-note">${workspace.enabled ? "Pause this workspace before editing its structure." : "Structure edits do not move existing files. Review existing file moves separately after Apply."}</p>
+      ${state.status.latestConfiguration?.state === "completed" && !state.status.latestConfiguration.undone && !state.status.latestConfiguration.redone && !activeReorganization ? `<button class="text-button" id="undo-library-edit" type="button">Undo last structure edit</button>` : ""}
+      ${state.status.latestConfiguration?.state === "completed" && state.status.latestConfiguration.undone && !activeReorganization ? `<button class="text-button" id="redo-library-edit" type="button">Redo structure edit</button>` : ""}
       ${state.status.latestConfiguration && ["applying", "needs_resume"].includes(state.status.latestConfiguration.state) ? `<button class="text-button" id="resume-library-edit" type="button">Resume structure edit</button>` : ""}
+      ${configuration?.state === "completed" && !configuration.undone && (!reorganizationMatchesConfiguration || reorganization?.undone) ? `<button class="secondary-button library-action" id="preview-library-reorganization" type="button" ${workspace.enabled ? "disabled" : ""}>Review existing file moves</button>` : ""}
+      ${reorganizationMatchesConfiguration && reorganization && ["applying", "needs_resume"].includes(reorganization.state) ? `<button class="secondary-button library-action" id="resume-library-reorganization" type="button">Resume file reorganization</button>` : ""}
+      ${reorganizationMatchesConfiguration && reorganization?.state === "completed" && !reorganization.undone ? `<button class="text-button" id="undo-library-reorganization" type="button">Undo file reorganization</button>` : ""}
     </section>
 
     <div class="dashboard-grid">
@@ -541,6 +561,50 @@ async function reviewLibraryEdits(operations: LibraryEditOperation[]): Promise<v
   }
 }
 
+async function reviewLibraryReorganization(): Promise<void> {
+  const status = state.status;
+  const configuration = status?.latestConfiguration;
+  if (!status || !configuration || state.busy) return;
+  setBusy(true);
+  try {
+    const preview = await previewLibraryReorganization(status.workspace.id, configuration.runId);
+    const details: Array<[string, string]> = [
+      ...preview.moves.map((move): [string, string] => ["Move", `${move.sourcePath} → ${move.destinationPath}`]),
+      ...preview.moves
+        .filter((move) => move.requestedDestination !== move.destinationPath)
+        .map((move): [string, string] => ["Collision-safe name", `${move.requestedDestination} → ${move.destinationPath}`]),
+      ...preview.attention.map((item): [string, string] => ["Leave in place", `${item.sourcePath} — ${reorganizationAttentionLabel(item.reason)}`]),
+    ];
+    if (preview.moves.length === 0) {
+      askForConfirmation({
+        title: "No tracked files need moving",
+        copy: preview.attention.length
+          ? "Files needing attention remain untouched and are listed below."
+          : "The existing AI Library already matches the approved structure.",
+        details: details.length ? details : [["Result", "No moves or attention items"]],
+        confirmLabel: "Close",
+        action: async () => {},
+      });
+      return;
+    }
+    askForConfirmation({
+      title: `Apply ${preview.moves.length} reviewed file move${preview.moves.length === 1 ? "" : "s"}?`,
+      copy: `${preview.attention.length} attention item${preview.attention.length === 1 ? "" : "s"} will remain untouched. Only the exact moves below will be applied.`,
+      details,
+      confirmLabel: "Apply exact file moves",
+      action: async () => {
+        await applyLibraryReorganization(preview.token);
+        await refreshSelected(`${preview.moves.length} AI Library file move${preview.moves.length === 1 ? "" : "s"} applied.`);
+      },
+    });
+  } catch (error) {
+    state.notice = { tone: "error", message: formatError(error) };
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
 function bindEvents(): void {
   document.querySelectorAll<HTMLElement>("[data-open-setup]").forEach((button) => button.addEventListener("click", () => {
     state.setupOpen = true;
@@ -612,6 +676,33 @@ function bindEvents(): void {
       await refreshSelected("AI Library structure recovery completed.");
     } catch (error) { state.notice = { tone: "error", message: formatError(error) }; }
     finally { state.busy = false; render(); }
+  });
+  document.querySelector("#preview-library-reorganization")?.addEventListener("click", () => void reviewLibraryReorganization());
+  document.querySelector("#resume-library-reorganization")?.addEventListener("click", async () => {
+    const current = state.status?.latestReorganization;
+    const workspaceId = state.status?.workspace.id;
+    if (!current || !workspaceId) return;
+    setBusy(true);
+    try {
+      await resumeLibraryReorganization(workspaceId, current.runId);
+      await refreshSelected("AI Library file reorganization recovery completed.");
+    } catch (error) { state.notice = { tone: "error", message: formatError(error) }; }
+    finally { state.busy = false; render(); }
+  });
+  document.querySelector("#undo-library-reorganization")?.addEventListener("click", () => {
+    const current = state.status?.latestReorganization;
+    const workspaceId = state.status?.workspace.id;
+    if (!current || !workspaceId) return;
+    askForConfirmation({
+      title: `Undo ${current.moveCount} AI Library file move${current.moveCount === 1 ? "" : "s"}?`,
+      copy: "Each recorded move is restored conservatively. Files changed after reorganization remain untouched and are reported as conflicts.",
+      details: [["Run", current.runId], ["Recorded moves", String(current.moveCount)]],
+      confirmLabel: "Undo file reorganization",
+      action: async () => {
+        await undoLibraryReorganization(workspaceId, current.runId);
+        await refreshSelected("AI Library file reorganization undone.");
+      },
+    });
   });
 
   document.querySelector("#pick-setup-source")?.addEventListener("click", async () => {

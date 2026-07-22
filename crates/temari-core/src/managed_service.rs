@@ -16,20 +16,23 @@ use crate::managed::{
 };
 use crate::managed_status::build_workspace_snapshot;
 
+use crate::apply::apply_validated_move_manifest;
 use crate::{
     ApplySession, ApplyState, Config, Error, FolderSet, LocalContentExtractor, MANAGED_AREAS,
     ManagedEntryFingerprint, ManagedLibraryEdit, ManagedLibraryEditDraft, ManagedLibraryEditPlan,
     ManagedLibraryEditRedoSession, ManagedLibraryEditSession, ManagedLibraryEditState,
-    ManagedLibraryEditUndoSession, ManagedMoveOutcome, ManagedReprocessArea,
-    ManagedReprocessSelection, ManagedRun, ManagedRunKind, ManagedSetupPlan, ManagedSetupSession,
-    ManagedSetupState, ManagedSetupUndoSession, ManagedSetupUndoState, ManagedWorkspace,
-    MonitorRecord, MonitoringOptions, OpenAiCompatibleModel, Plan, RecentsReconcileSummary,
-    RecentsState, RunState, SourceLock, StateStore, ai_library_folder_set, apply_managed_setup,
-    apply_monitoring_plan, apply_plan, build_reprocess_to_recents_plan,
-    build_stage_to_recents_plan, canonical_source_identity, filter_recents_candidates,
-    fingerprint_candidate, persist_monitoring_plan, plan_monitor_candidates,
-    recents_file_candidates, reprocess_file_candidates, resume_apply_session, resume_managed_setup,
-    root_file_candidates, undo_managed_directory_adoption,
+    ManagedLibraryEditUndoSession, ManagedLibraryReorganizationPlan, ManagedMoveOutcome,
+    ManagedReprocessArea, ManagedReprocessSelection, ManagedRun, ManagedRunKind, ManagedSetupPlan,
+    ManagedSetupSession, ManagedSetupState, ManagedSetupUndoSession, ManagedSetupUndoState,
+    ManagedWorkspace, MonitorRecord, MonitoringOptions, OpenAiCompatibleModel, Plan,
+    RecentsReconcileSummary, RecentsState, RunState, SourceLock, StateStore, UndoMoveOutcome,
+    UndoSession, UndoState, ai_library_folder_set, apply_managed_setup, apply_monitoring_plan,
+    apply_plan, build_reprocess_to_recents_plan, build_stage_to_recents_plan,
+    canonical_source_identity, filter_recents_candidates, fingerprint_candidate,
+    persist_monitoring_plan, plan_monitor_candidates, recents_file_candidates,
+    reprocess_file_candidates, resume_apply_session, resume_apply_session_with_lock,
+    resume_managed_setup, resume_undo_session_with_lock, root_file_candidates,
+    undo_managed_directory_adoption, undo_session_with_lock,
     validate_managed_workspace_root_candidate,
 };
 
@@ -81,6 +84,20 @@ pub struct ManagedLibraryEditRedoResult {
     pub workspace: ManagedWorkspace,
     pub run: ManagedRun,
     pub session: ManagedLibraryEditRedoSession,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ManagedLibraryReorganizationResult {
+    pub workspace: ManagedWorkspace,
+    pub run: ManagedRun,
+    pub session: ApplySession,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ManagedLibraryReorganizationUndoResult {
+    pub workspace: ManagedWorkspace,
+    pub run: ManagedRun,
+    pub session: UndoSession,
 }
 
 impl ManagedService {
@@ -385,7 +402,7 @@ impl ManagedService {
             ManagedRunKind::Stage | ManagedRunKind::Classify => {
                 apply_indexed_run(&mut store, &workspace, &mut run)?
             }
-            ManagedRunKind::Setup | ManagedRunKind::Configure => {
+            ManagedRunKind::Setup | ManagedRunKind::Configure | ManagedRunKind::Reorganize => {
                 return Err(Error::InvalidState(
                     "this run kind requires its dedicated Apply service".into(),
                 ));
@@ -409,7 +426,7 @@ impl ManagedService {
             ManagedRunKind::Stage | ManagedRunKind::Classify => {
                 resume_indexed_run(&mut store, &workspace, &mut run)?
             }
-            ManagedRunKind::Setup | ManagedRunKind::Configure => {
+            ManagedRunKind::Setup | ManagedRunKind::Configure | ManagedRunKind::Reorganize => {
                 return Err(Error::InvalidState(
                     "this run kind requires its dedicated Resume service".into(),
                 ));
@@ -651,6 +668,7 @@ impl ManagedService {
                 "AI Library edit Undo requires a completed Configure session".into(),
             ));
         }
+        reject_active_reorganization_for_configuration(&store, &run.id, None)?;
         if run.undo_path.is_some() {
             return Err(Error::InvalidState(
                 "AI Library edit session has already been undone".into(),
@@ -1052,6 +1070,301 @@ impl ManagedService {
         })
     }
 
+    pub fn preview_library_reorganization(
+        &self,
+        workspace_id: &str,
+        configure_run_id: &str,
+    ) -> Result<ManagedLibraryReorganizationPlan, Error> {
+        let store = self.store()?;
+        let workspace = require_workspace(&store, workspace_id)?;
+        let configure_run = require_run(&store, configure_run_id)?;
+        let configure =
+            validate_reorganization_configuration(&store, &workspace, &configure_run, None)?;
+        build_reorganization_plan(
+            &store,
+            &workspace,
+            &configure_run,
+            &configure,
+            new_id("library-reorganization-plan")?,
+        )
+    }
+
+    pub fn apply_library_reorganization(
+        &self,
+        plan: &ManagedLibraryReorganizationPlan,
+    ) -> Result<ManagedLibraryReorganizationResult, Error> {
+        plan.validate()?;
+        if plan.entries.is_empty() {
+            return Err(Error::InvalidState(
+                "no tracked AI Library files require reorganization".into(),
+            ));
+        }
+        let mut store = self.store()?;
+        let workspace = require_workspace(&store, &plan.workspace_id)?;
+        let configure_run = require_run(&store, &plan.configure_run_id)?;
+        validate_reorganization_plan(&store, &workspace, &configure_run, plan, None)?;
+        let lock = SourceLock::acquire(Path::new(&workspace.source))?;
+        let workspace = require_workspace(&store, &plan.workspace_id)?;
+        let configure_run = require_run(&store, &plan.configure_run_id)?;
+        validate_reorganization_plan(&store, &workspace, &configure_run, plan, None)?;
+        let trusted = build_reorganization_plan(
+            &store,
+            &workspace,
+            &configure_run,
+            &validate_reorganization_configuration(&store, &workspace, &configure_run, None)?,
+            plan.id.clone(),
+        )?;
+        if &trusted != plan {
+            return Err(Error::InvalidState(
+                "AI Library reorganization Plan no longer matches trusted processed files".into(),
+            ));
+        }
+        let manifest = plan.move_manifest()?;
+
+        let directory = self.create_run_directory(&workspace.id, "reorganize")?;
+        let plan_path = directory.join("library-reorganization-plan.json");
+        let apply_path = directory.join("library-reorganization-apply.json");
+        write_json(&plan_path, plan)?;
+        let started = unix_ms()?;
+        let mut run = ManagedRun {
+            id: new_id("managed-reorganize")?,
+            workspace_id: workspace.id.clone(),
+            kind: ManagedRunKind::Reorganize,
+            state: RunState::Applying,
+            plan_path: Some(path_text(&plan_path)?),
+            apply_path: Some(path_text(&apply_path)?),
+            undo_path: None,
+            started_unix_ms: started,
+            finished_unix_ms: None,
+            move_count: plan.entries.len() as u64,
+            error: None,
+        };
+        store.insert_managed_run(&run)?;
+        let session = match apply_validated_move_manifest(manifest, &apply_path, &lock) {
+            Ok(session) => session,
+            Err(error) => {
+                finalize_apply_error(&mut store, &mut run, &apply_path, &error.to_string())?;
+                return Err(error);
+            }
+        };
+        if session.state != ApplyState::Completed {
+            return finish_reorganization_apply(&mut store, &mut run, &session);
+        }
+        mark_apply_finalization_pending(&mut store, &mut run)?;
+        finalize_reorganization_apply(&mut store, &workspace, &mut run)?;
+        Ok(ManagedLibraryReorganizationResult {
+            workspace,
+            run,
+            session,
+        })
+    }
+
+    pub fn resume_library_reorganization(
+        &self,
+        run_id: &str,
+    ) -> Result<ManagedLibraryReorganizationResult, Error> {
+        let mut store = self.store()?;
+        let mut run = require_run(&store, run_id)?;
+        if run.kind != ManagedRunKind::Reorganize
+            || !matches!(run.state, RunState::Applying | RunState::NeedsResume)
+        {
+            return Err(Error::InvalidState(
+                "Library reorganization run does not require resume".into(),
+            ));
+        }
+        let plan = ManagedLibraryReorganizationPlan::load(Path::new(
+            run.plan_path
+                .as_deref()
+                .ok_or_else(|| Error::InvalidState("reorganization run has no Plan".into()))?,
+        ))?;
+        let apply_path = Path::new(run.apply_path.as_deref().ok_or_else(|| {
+            Error::InvalidState("reorganization run has no Apply journal".into())
+        })?);
+        let workspace = require_workspace(&store, &run.workspace_id)?;
+        let configure_run = require_run(&store, &plan.configure_run_id)?;
+        validate_reorganization_plan(&store, &workspace, &configure_run, &plan, Some(&run.id))?;
+        let lock = SourceLock::acquire(Path::new(&workspace.source))?;
+        let current = ApplySession::load(apply_path)?;
+        if current.plan_sha256 != plan.sha256()? {
+            return Err(Error::InvalidState(
+                "reorganization Apply journal does not match its Plan".into(),
+            ));
+        }
+        let session = match current.state {
+            ApplyState::Running => resume_apply_session_with_lock(apply_path, &lock)?,
+            ApplyState::Completed => current,
+            _ => return finish_reorganization_apply(&mut store, &mut run, &current),
+        };
+        if session.state != ApplyState::Completed {
+            return finish_reorganization_apply(&mut store, &mut run, &session);
+        }
+        mark_apply_finalization_pending(&mut store, &mut run)?;
+        finalize_reorganization_apply(&mut store, &workspace, &mut run)?;
+        Ok(ManagedLibraryReorganizationResult {
+            workspace,
+            run,
+            session,
+        })
+    }
+
+    pub fn undo_library_reorganization(
+        &self,
+        run_id: &str,
+    ) -> Result<ManagedLibraryReorganizationUndoResult, Error> {
+        let mut store = self.store()?;
+        let mut run = require_run(&store, run_id)?;
+        if run.kind != ManagedRunKind::Reorganize
+            || !matches!(
+                run.state,
+                RunState::Completed | RunState::NeedsResume | RunState::Failed
+            )
+        {
+            return Err(Error::InvalidState(
+                "Library reorganization Undo requires a terminal or recoverable run".into(),
+            ));
+        }
+        if run.undo_path.is_some() {
+            return Err(Error::InvalidState(
+                "Library reorganization Undo already exists; use Resume when it is unfinished"
+                    .into(),
+            ));
+        }
+        let plan = ManagedLibraryReorganizationPlan::load(Path::new(
+            run.plan_path
+                .as_deref()
+                .ok_or_else(|| Error::InvalidState("reorganization run has no Plan".into()))?,
+        ))?;
+        let apply = ApplySession::load(Path::new(run.apply_path.as_deref().ok_or_else(|| {
+            Error::InvalidState("reorganization run has no Apply journal".into())
+        })?))?;
+        if apply.plan_sha256 != plan.sha256()? {
+            return Err(Error::InvalidState(
+                "reorganization Apply journal does not match its Plan".into(),
+            ));
+        }
+        let workspace = require_workspace(&store, &run.workspace_id)?;
+        let configure_run = require_run(&store, &plan.configure_run_id)?;
+        validate_reorganization_undo_plan(&store, &workspace, &configure_run, &plan)?;
+        let undo_path = Path::new(run.apply_path.as_deref().unwrap())
+            .parent()
+            .ok_or_else(|| Error::InvalidState("reorganization run directory is missing".into()))?
+            .join("library-reorganization-undo.json");
+        let lock = SourceLock::acquire(Path::new(&workspace.source))?;
+        run.undo_path = Some(path_text(&undo_path)?);
+        run.state = RunState::NeedsResume;
+        run.finished_unix_ms = Some(unix_ms()?);
+        run.error = Some("Library reorganization Undo is pending".into());
+        store.update_managed_run(&run)?;
+        let session = match undo_session_with_lock(&apply, &undo_path, &lock) {
+            Ok(session) => session,
+            Err(error) => {
+                run.error = Some(format!("Library reorganization Undo is pending: {error}"));
+                store.update_managed_run(&run)?;
+                return Err(error);
+            }
+        };
+        Self::finalize_reorganization_undo(
+            &mut store, &workspace, &mut run, &apply, &undo_path, session,
+        )
+    }
+
+    pub fn resume_library_reorganization_undo(
+        &self,
+        run_id: &str,
+    ) -> Result<ManagedLibraryReorganizationUndoResult, Error> {
+        let mut store = self.store()?;
+        let mut run = require_run(&store, run_id)?;
+        if run.kind != ManagedRunKind::Reorganize || run.state != RunState::NeedsResume {
+            return Err(Error::InvalidState(
+                "Library reorganization Undo does not require Resume".into(),
+            ));
+        }
+        let undo_path =
+            PathBuf::from(run.undo_path.as_deref().ok_or_else(|| {
+                Error::InvalidState("reorganization run has no Undo journal".into())
+            })?);
+        let plan = ManagedLibraryReorganizationPlan::load(Path::new(
+            run.plan_path
+                .as_deref()
+                .ok_or_else(|| Error::InvalidState("reorganization run has no Plan".into()))?,
+        ))?;
+        let apply = ApplySession::load(Path::new(run.apply_path.as_deref().ok_or_else(|| {
+            Error::InvalidState("reorganization run has no Apply journal".into())
+        })?))?;
+        if apply.plan_sha256 != plan.sha256()? {
+            return Err(Error::InvalidState(
+                "reorganization Apply journal does not match its Plan".into(),
+            ));
+        }
+        let workspace = require_workspace(&store, &run.workspace_id)?;
+        let configure_run = require_run(&store, &plan.configure_run_id)?;
+        validate_reorganization_undo_plan(&store, &workspace, &configure_run, &plan)?;
+        let lock = SourceLock::acquire(Path::new(&workspace.source))?;
+        let session = if undo_path.exists() {
+            let current = UndoSession::load(&undo_path)?;
+            match current.state {
+                UndoState::Running => resume_undo_session_with_lock(&apply, &undo_path, &lock)?,
+                UndoState::Completed => current,
+                UndoState::PartialFailure => {
+                    run.state = RunState::Failed;
+                    run.error = Some("Library reorganization Undo requires attention".into());
+                    store.update_managed_run(&run)?;
+                    return Err(Error::InvalidState(
+                        "Library reorganization Undo finished with partial failure".into(),
+                    ));
+                }
+            }
+        } else {
+            undo_session_with_lock(&apply, &undo_path, &lock)?
+        };
+        Self::finalize_reorganization_undo(
+            &mut store, &workspace, &mut run, &apply, &undo_path, session,
+        )
+    }
+
+    fn finalize_reorganization_undo(
+        store: &mut StateStore,
+        workspace: &ManagedWorkspace,
+        run: &mut ManagedRun,
+        apply: &ApplySession,
+        undo_path: &Path,
+        session: UndoSession,
+    ) -> Result<ManagedLibraryReorganizationUndoResult, Error> {
+        if session.state != UndoState::Completed {
+            run.state = RunState::Failed;
+            run.error = Some("Library reorganization Undo requires attention".into());
+            store.update_managed_run(run)?;
+            return Err(Error::InvalidState(format!(
+                "Library reorganization Undo finished with {:?}",
+                session.state
+            )));
+        }
+        let restored = session
+            .moves
+            .iter()
+            .filter(|movement| {
+                matches!(
+                    movement.outcome,
+                    UndoMoveOutcome::Restored | UndoMoveOutcome::AlreadyRestored
+                )
+            })
+            .filter_map(|movement| {
+                apply
+                    .moves
+                    .iter()
+                    .find(|applied| applied.file_id == movement.file_id)
+                    .map(|applied| applied.fingerprint.identity.clone())
+            })
+            .collect::<Vec<_>>();
+        store.finalize_managed_undo(&run.id, &path_text(undo_path)?, &restored, unix_ms()?)?;
+        let run = require_run(store, &run.id)?;
+        Ok(ManagedLibraryReorganizationUndoResult {
+            workspace: workspace.clone(),
+            run,
+            session,
+        })
+    }
+
     fn store(&self) -> Result<StateStore, Error> {
         StateStore::open(&self.state_path)
     }
@@ -1425,6 +1738,262 @@ fn reject_newer_configuration_run(store: &StateStore, target: &ManagedRun) -> Re
     Ok(())
 }
 
+fn validate_reorganization_configuration(
+    store: &StateStore,
+    workspace: &ManagedWorkspace,
+    configure_run: &ManagedRun,
+    excluded_reorganization_run_id: Option<&str>,
+) -> Result<ManagedLibraryEditPlan, Error> {
+    let current = validate_library_edit_workspace(store, workspace)?;
+    if configure_run.workspace_id != workspace.id
+        || configure_run.kind != ManagedRunKind::Configure
+        || configure_run.state != RunState::Completed
+    {
+        return Err(Error::InvalidState(
+            "Library reorganization requires a completed Configure run for this workspace".into(),
+        ));
+    }
+    reject_newer_configuration_run(store, configure_run)?;
+    reject_active_reorganization_for_configuration(
+        store,
+        &configure_run.id,
+        excluded_reorganization_run_id,
+    )?;
+    let configure = ManagedLibraryEditPlan::load(Path::new(
+        configure_run
+            .plan_path
+            .as_deref()
+            .ok_or_else(|| Error::InvalidState("Configure run has no Plan".into()))?,
+    ))?;
+    let apply = ManagedLibraryEditSession::load(Path::new(
+        configure_run
+            .apply_path
+            .as_deref()
+            .ok_or_else(|| Error::InvalidState("Configure run has no Apply session".into()))?,
+    ))?;
+    validate_library_edit_session(configure_run, workspace, &configure, &apply)?;
+    if workspace.folder_set_path != apply.after_folder_set_path
+        || workspace.folder_set_sha256 != apply.after_folder_set_sha256
+        || current != configure.after_folders
+    {
+        return Err(Error::InvalidState(
+            "Library reorganization requires the exact configured FolderSet binding".into(),
+        ));
+    }
+    Ok(configure)
+}
+
+fn validate_reorganization_plan(
+    store: &StateStore,
+    workspace: &ManagedWorkspace,
+    configure_run: &ManagedRun,
+    plan: &ManagedLibraryReorganizationPlan,
+    excluded_reorganization_run_id: Option<&str>,
+) -> Result<(), Error> {
+    plan.validate()?;
+    let configure = validate_reorganization_configuration(
+        store,
+        workspace,
+        configure_run,
+        excluded_reorganization_run_id,
+    )?;
+    if plan.workspace_id != workspace.id
+        || plan.configure_run_id != configure_run.id
+        || plan.configure_plan_id != configure.id
+        || plan.source != workspace.source
+        || plan.source_identity != workspace.source_identity
+        || plan.folder_set_path != workspace.folder_set_path
+        || plan.folder_set_sha256 != workspace.folder_set_sha256
+        || plan.before_folders != configure.before_folders
+        || plan.after_folders != configure.after_folders
+    {
+        return Err(Error::InvalidState(
+            "Library reorganization Plan provenance does not match the current workspace".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn build_reorganization_plan(
+    store: &StateStore,
+    workspace: &ManagedWorkspace,
+    configure_run: &ManagedRun,
+    configure: &ManagedLibraryEditPlan,
+    plan_id: String,
+) -> Result<ManagedLibraryReorganizationPlan, Error> {
+    let candidates = reprocess_file_candidates(
+        Path::new(&workspace.source),
+        ManagedReprocessArea::AiLibrary,
+        &ManagedReprocessSelection::All,
+    )?;
+    let fingerprints = candidates
+        .iter()
+        .map(|candidate| {
+            Ok((
+                candidate.source_path.clone(),
+                fingerprint_candidate(Path::new(&workspace.source), candidate)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    ManagedLibraryReorganizationPlan::build(
+        plan_id,
+        workspace.id.clone(),
+        configure_run.id.clone(),
+        workspace.source_identity.clone(),
+        workspace.folder_set_path.clone(),
+        configure,
+        &fingerprints,
+        &store.processed_files(&workspace.monitor_id)?,
+    )
+}
+
+fn validate_reorganization_undo_plan(
+    store: &StateStore,
+    workspace: &ManagedWorkspace,
+    configure_run: &ManagedRun,
+    plan: &ManagedLibraryReorganizationPlan,
+) -> Result<(), Error> {
+    plan.validate()?;
+    validate_library_edit_workspace(store, workspace)?;
+    if configure_run.workspace_id != workspace.id
+        || configure_run.kind != ManagedRunKind::Configure
+        || configure_run.state != RunState::Completed
+    {
+        return Err(Error::InvalidState(
+            "Library reorganization Undo has invalid Configure provenance".into(),
+        ));
+    }
+    let configure = ManagedLibraryEditPlan::load(Path::new(
+        configure_run
+            .plan_path
+            .as_deref()
+            .ok_or_else(|| Error::InvalidState("Configure run has no Plan".into()))?,
+    ))?;
+    let apply = ManagedLibraryEditSession::load(Path::new(
+        configure_run
+            .apply_path
+            .as_deref()
+            .ok_or_else(|| Error::InvalidState("Configure run has no Apply session".into()))?,
+    ))?;
+    validate_library_edit_session(configure_run, workspace, &configure, &apply)?;
+    if plan.workspace_id != workspace.id
+        || plan.configure_run_id != configure_run.id
+        || plan.configure_plan_id != configure.id
+        || plan.source != workspace.source
+        || plan.source_identity != workspace.source_identity
+        || plan.folder_set_path != apply.after_folder_set_path
+        || plan.folder_set_sha256 != apply.after_folder_set_sha256
+        || plan.before_folders != configure.before_folders
+        || plan.after_folders != configure.after_folders
+    {
+        return Err(Error::InvalidState(
+            "Library reorganization Undo provenance does not match its Configure run".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_active_reorganization_for_configuration(
+    store: &StateStore,
+    configure_run_id: &str,
+    excluded_run_id: Option<&str>,
+) -> Result<(), Error> {
+    for run in store.managed_runs(
+        &store
+            .managed_run(configure_run_id)?
+            .ok_or_else(|| Error::InvalidState("unknown Configure run".into()))?
+            .workspace_id,
+    )? {
+        if run.kind != ManagedRunKind::Reorganize
+            || excluded_run_id == Some(run.id.as_str())
+            || run.state == RunState::Noop
+            || !reorganization_run_has_active_effects(&run)?
+        {
+            continue;
+        }
+        let Some(path) = run.plan_path.as_deref() else {
+            continue;
+        };
+        if ManagedLibraryReorganizationPlan::load(Path::new(path))
+            .is_ok_and(|plan| plan.configure_run_id == configure_run_id)
+        {
+            return Err(Error::InvalidState(
+                "Undo the active Library reorganization before changing its Configure binding"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reorganization_run_has_active_effects(run: &ManagedRun) -> Result<bool, Error> {
+    if let Some(path) = run.undo_path.as_deref() {
+        return Ok(UndoSession::load(Path::new(path))?.state != crate::UndoState::Completed);
+    }
+    if run.state != RunState::Failed {
+        return Ok(true);
+    }
+    let Some(path) = run.apply_path.as_deref() else {
+        return Ok(false);
+    };
+    if !Path::new(path).exists() {
+        return Ok(false);
+    }
+    let apply = ApplySession::load(Path::new(path))?;
+    Ok(apply.moves.iter().any(|movement| {
+        matches!(
+            movement.outcome,
+            crate::MoveOutcome::Moved | crate::MoveOutcome::Moving
+        )
+    }) || apply
+        .directories
+        .iter()
+        .any(|directory| matches!(directory.outcome, crate::DirectoryOutcome::Created { .. })))
+}
+
+fn finish_reorganization_apply<T>(
+    store: &mut StateStore,
+    run: &mut ManagedRun,
+    session: &ApplySession,
+) -> Result<T, Error> {
+    let has_effects = session.moves.iter().any(|movement| {
+        matches!(
+            movement.outcome,
+            crate::MoveOutcome::Moved | crate::MoveOutcome::Moving
+        )
+    }) || session
+        .directories
+        .iter()
+        .any(|directory| matches!(directory.outcome, crate::DirectoryOutcome::Created { .. }));
+    run.state = if session.state == ApplyState::Running || has_effects {
+        RunState::NeedsResume
+    } else {
+        RunState::Failed
+    };
+    run.finished_unix_ms = Some(unix_ms()?);
+    run.error = Some(format!(
+        "reorganization Apply finished with {:?}",
+        session.state
+    ));
+    store.update_managed_run(run)?;
+    Err(Error::InvalidState(format!(
+        "Library reorganization Apply finished with {:?}",
+        session.state
+    )))
+}
+
+fn finalize_reorganization_apply(
+    store: &mut StateStore,
+    workspace: &ManagedWorkspace,
+    run: &mut ManagedRun,
+) -> Result<(), Error> {
+    observe_recents(store, workspace, unix_ms()?)?;
+    run.state = RunState::Completed;
+    run.finished_unix_ms = Some(unix_ms()?);
+    run.error = None;
+    store.update_managed_run(run)
+}
+
 fn managed_directory_identities(
     store: &StateStore,
     workspace: &ManagedWorkspace,
@@ -1668,7 +2237,10 @@ fn apply_indexed_run(
     let apply_path = parent.join(match run.kind {
         ManagedRunKind::Stage => "stage-apply.json",
         ManagedRunKind::Classify => "classify-apply.json",
-        ManagedRunKind::Setup | ManagedRunKind::Adopt | ManagedRunKind::Configure => {
+        ManagedRunKind::Setup
+        | ManagedRunKind::Adopt
+        | ManagedRunKind::Configure
+        | ManagedRunKind::Reorganize => {
             return Err(Error::InvalidState(
                 "setup runs cannot be applied through managed run".into(),
             ));
@@ -1684,7 +2256,10 @@ fn apply_indexed_run(
             let lock = SourceLock::acquire(Path::new(&workspace.source))?;
             apply_monitoring_plan(store, &run.id, &plan, &apply_path, &lock, apply_time)
         }
-        ManagedRunKind::Setup | ManagedRunKind::Adopt | ManagedRunKind::Configure => {
+        ManagedRunKind::Setup
+        | ManagedRunKind::Adopt
+        | ManagedRunKind::Configure
+        | ManagedRunKind::Reorganize => {
             unreachable!()
         }
     };
@@ -1723,7 +2298,10 @@ fn finalize_completed_apply(
         ManagedRunKind::Classify => {
             mark_recents_entries(store, workspace, plan, RecentsState::Moved, &run.id)?
         }
-        ManagedRunKind::Setup | ManagedRunKind::Adopt | ManagedRunKind::Configure => {
+        ManagedRunKind::Setup
+        | ManagedRunKind::Adopt
+        | ManagedRunKind::Configure
+        | ManagedRunKind::Reorganize => {
             unreachable!()
         }
     }
@@ -2222,7 +2800,7 @@ mod tests {
                     id: "text-rule".into(),
                     monitor_id: activation.workspace.monitor_id.clone(),
                     name_glob: "*.txt".into(),
-                    destination_id,
+                    destination_id: destination_id.clone(),
                     priority: 100,
                     enabled: true,
                 },
@@ -2239,6 +2817,66 @@ mod tests {
             .run_workspace(&activation.workspace.id, true)
             .unwrap();
         let classified = source.join("AI Library/Documents/baseline.txt");
+        assert!(classified.is_file());
+
+        let mut store = StateStore::open(&state).unwrap();
+        store
+            .set_managed_workspace_enabled(&activation.workspace.id, false, unix_ms().unwrap())
+            .unwrap();
+        drop(store);
+        let edit = service
+            .preview_library_edits(
+                &activation.workspace.id,
+                vec![ManagedLibraryEditDraft::Rename {
+                    id: destination_id,
+                    path: "Archive".into(),
+                    descendants: crate::ManagedDescendantPolicy::Reject,
+                }],
+            )
+            .unwrap();
+        let configured = service.apply_library_edit(&edit).unwrap();
+        fs::write(
+            source.join("AI Library/Documents/untracked.txt"),
+            b"untracked",
+        )
+        .unwrap();
+        let reorganization = service
+            .preview_library_reorganization(&activation.workspace.id, &configured.run.id)
+            .unwrap();
+        assert_eq!(reorganization.entries.len(), 1);
+        assert_eq!(reorganization.attention.len(), 1);
+        let mut forged = reorganization.clone();
+        forged.attention.clear();
+        assert!(service.apply_library_reorganization(&forged).is_err());
+        let reorganized = service
+            .apply_library_reorganization(&reorganization)
+            .unwrap();
+        assert!(service.undo_library_edit(&configured.run.id).is_err());
+        assert!(source.join("AI Library/Archive/baseline.txt").is_file());
+        assert!(source.join("AI Library/Documents/untracked.txt").is_file());
+        let apply_path = Path::new(reorganized.run.apply_path.as_deref().unwrap());
+        let apply = ApplySession::load(apply_path).unwrap();
+        let undo_path = apply_path
+            .parent()
+            .unwrap()
+            .join("library-reorganization-undo.json");
+        crate::undo_session(&apply, &undo_path).unwrap();
+        let mut interrupted_undo = reorganized.run.clone();
+        interrupted_undo.undo_path = Some(undo_path.display().to_string());
+        interrupted_undo.state = RunState::NeedsResume;
+        interrupted_undo.error = Some("Undo index finalization interrupted".into());
+        StateStore::open(&state)
+            .unwrap()
+            .update_managed_run(&interrupted_undo)
+            .unwrap();
+        service
+            .resume_library_reorganization_undo(&reorganized.run.id)
+            .unwrap();
+        service.undo_library_edit(&configured.run.id).unwrap();
+        StateStore::open(&state)
+            .unwrap()
+            .set_managed_workspace_enabled(&activation.workspace.id, true, unix_ms().unwrap())
+            .unwrap();
         assert!(classified.is_file());
 
         fs::rename(&classified, source.join("baseline.txt")).unwrap();

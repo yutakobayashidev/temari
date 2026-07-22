@@ -18,6 +18,10 @@ temari [global options] managed library apply <PLAN> [--yes]
 temari [global options] managed library undo <WORKSPACE_ID> <RUN_ID> [--yes]
 temari [global options] managed library redo <WORKSPACE_ID> <RUN_ID> [--yes]
 temari [global options] managed library resume <WORKSPACE_ID> <RUN_ID>
+temari [global options] managed library reorganize plan <WORKSPACE_ID> <CONFIGURE_RUN_ID> --out <PLAN>
+temari [global options] managed library reorganize apply <PLAN> [--yes]
+temari [global options] managed library reorganize resume <WORKSPACE_ID> <REORGANIZE_RUN_ID>
+temari [global options] managed library reorganize undo <WORKSPACE_ID> <REORGANIZE_RUN_ID> [--yes]
 temari [global options] managed undo-setup|resume-setup ...
 temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...
 temari [global options] propose <SOURCE> --out <PROPOSAL> [--include-subtree <PATH>]...
@@ -121,6 +125,8 @@ temari [global options] resume <APPLY_SESSION> [--yes]
 - `rule` manages case-insensitive basename globs for one workspace. Rules select reviewed opaque destination IDs, run before model classification, use descending priority and stable rule-ID ordering, and never store executable paths.
 - `library show` exports the current approved FolderSet. `library plan add|rename|describe|delete` builds a read-only immutable Plan for one operation; `library plan batch --operations <JSON>` accepts an ordered array of draft operations. Core assigns Add IDs, replays every operation, and records the exact before/after FolderSet. Rename and Delete accept `--descendants reject|cascade|reparent`, defaulting to reject. AI Library edits require a disabled workspace and update only logical FolderSet revisions and the workspace binding. They never move files or rename or delete physical directories.
 - Each completed AI Library Configure run owns fixed Apply, Undo, and Redo journals. `library undo` and `library redo` accept a workspace ID and run ID, derive journal paths from that run, and require confirmation. `library resume` verifies workspace ownership and resumes Apply from an `applying` run or dispatches the run-owned Undo or Redo journal from a `needs_resume` run. Redo is rejected after a newer Configure run.
+- `library reorganize plan` is a separate read-only physical follow-up to one completed Configure run. It matches current AI Library files to completed classification records by filesystem identity, size, and content hash. Preserved destination IDs map files to their revised approved subtree; removed destination IDs map files directly to Recents. Untracked, changed, unknown, and manually relocated files remain untouched as explicit attention items. The reviewed Plan records exact collision-resolved destinations and required directories.
+- `library reorganize apply|resume|undo` use the shared filesystem journal engine and fixed run-owned artifact paths. Apply never overwrites or removes old directories. The source Configure run cannot be undone while its physical reorganization remains active.
 - `undo-setup` and `resume-setup` operate only from their versioned setup journals. Setup Undo refuses a changed Manual Library directory, occupied original path, or changed area identity.
 - SQLite stores mutable retention and history indexes only. Setup Plans, normal Plans, Apply sessions, and Undo sessions remain authoritative JSON artifacts outside the managed source.
 - Only the current area layout and SQLite schema are supported. Earlier experimental artifacts and databases are rejected; no public migration command or automatic upgrade path exists.

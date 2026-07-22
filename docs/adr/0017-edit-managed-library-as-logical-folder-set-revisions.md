@@ -18,7 +18,7 @@
 - Preserve destination IDs for Rename and Description edits. Generate a new non-reused opaque ID only for Add.
 - Keep system fallback destinations private and immutable. Reject deletion of the final model-visible destination and any destination referenced by an active local rule.
 - Require the workspace to be disabled and all earlier runs to be terminal before Apply.
-- Treat these operations as logical configuration changes. They never rename or delete physical directories and never move existing files. Existing files move only through the explicit Reprocess workflow.
+- Treat these operations as logical configuration changes. They never rename or delete physical directories and never move existing files. Existing files move only through explicit Reprocess or physical Library reorganization workflows.
 - Persist one durable Configure Session for the complete batch. Undo and Redo use fixed, run-owned journals beside that Session and switch between the two immutable bindings. Interrupted Apply, Undo, or Redo remains recoverable before the workspace can be enabled.
 - Redo requires a completed Undo, the exact previous binding, and no newer Configure run. Neither adapters nor users may select recovery journal paths.
 
@@ -26,12 +26,12 @@
 
 - Positive: historical Plans remain self-contained, stable IDs keep rules valid across Rename, and editing cannot silently relocate private files.
 - Positive: stale previews, injected FolderSets, and partially updated monitor/workspace bindings are rejected.
-- Negative: a renamed or deleted logical destination can leave existing files at its former physical path until the user explicitly reprocesses them.
-- Negative: logical Undo and Redo do not move files that already occupy an earlier physical hierarchy; explicit Reprocess remains necessary.
+- Negative: a renamed or deleted logical destination leaves existing files at its former physical path until the user explicitly reviews a Reprocess or reorganization Plan.
+- Negative: logical Undo and Redo do not move files that already occupy an earlier physical hierarchy; physical changes have an independent Undo lifecycle.
 
 ## Adoption and Exceptions
 
 - Core validates that replaying the reviewed operation against the before `FolderSet` produces the exact after `FolderSet`.
 - Tauri keeps the Plan behind a single-use preview token; the frontend submits neither artifacts nor journal paths.
 - Tests must cover stable IDs, ordered batches, subtree policies, immutable revisions, stale bindings, active rules for every removed subtree ID, unfinished runs, Apply/Undo/Redo crash recovery, and the no-physical-move boundary.
-- Any future physical reorganization must remain a separate reviewed Plan/Apply/Undo workflow and must not be added to logical FolderSet editing.
+- Physical reorganization remains the separate reviewed Plan/Apply/Undo workflow defined by ADR 0018 and must not be added to logical FolderSet editing.

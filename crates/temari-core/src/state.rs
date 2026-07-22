@@ -14,7 +14,7 @@ use crate::{
     Plan, artifact::normalize_relative_path,
 };
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -143,6 +143,7 @@ pub enum ManagedRunKind {
     Stage,
     Classify,
     Configure,
+    Reorganize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -501,18 +502,18 @@ impl StateStore {
         let mut workspace = managed_workspace_for_update(&transaction, id)?;
         validate_workspace_update_time(&workspace, updated_unix_ms)?;
         if enabled {
-            let configuration_pending: bool = transaction.query_row(
+            let library_work_pending: bool = transaction.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM managed_runs
-                    WHERE workspace_id = ?1 AND kind = 'configure'
+                    WHERE workspace_id = ?1 AND kind IN ('configure', 'reorganize')
                       AND state IN ('applying', 'needs_resume')
                  )",
                 [id],
                 |row| row.get(0),
             )?;
-            if configuration_pending {
+            if library_work_pending {
                 return Err(Error::InvalidState(
-                    "managed workspace cannot be enabled while a AI Library edit needs recovery"
+                    "managed workspace cannot be enabled while AI Library work needs recovery"
                         .into(),
                 ));
             }
@@ -1354,11 +1355,12 @@ impl StateStore {
             )
             .optional()?
             .ok_or_else(|| Error::InvalidState(format!("unknown managed run {run_id:?}")))?;
-        if matches!(
-            kind,
-            ManagedRunKind::Setup | ManagedRunKind::Adopt | ManagedRunKind::Configure
-        ) || state != RunState::Completed
-        {
+        let valid_state = match kind {
+            ManagedRunKind::Reorganize => state == RunState::NeedsResume,
+            ManagedRunKind::Stage | ManagedRunKind::Classify => state == RunState::Completed,
+            ManagedRunKind::Setup | ManagedRunKind::Adopt | ManagedRunKind::Configure => false,
+        };
+        if !valid_state {
             return Err(Error::InvalidState(
                 "managed Undo journals require a completed file-move run".into(),
             ));
@@ -1377,9 +1379,21 @@ impl StateStore {
             "managed run",
             run_id,
         )?;
+        if kind == ManagedRunKind::Reorganize {
+            require_changed(
+                transaction.execute(
+                    "UPDATE managed_runs
+                     SET state = 'completed', finished_unix_ms = ?2, error = NULL
+                     WHERE id = ?1 AND state = 'needs_resume'",
+                    params![run_id, created_unix_ms],
+                )?,
+                "recoverable reorganization run",
+                run_id,
+            )?;
+        }
         for identity in restored {
             match kind {
-                ManagedRunKind::Stage => {
+                ManagedRunKind::Stage | ManagedRunKind::Reorganize => {
                     transaction.execute(
                         "DELETE FROM recents_items
                          WHERE workspace_id = ?1 AND file_device = ?2 AND file_inode = ?3",
@@ -1982,6 +1996,19 @@ impl StateStore {
         )?)
     }
 
+    pub fn processed_files(&self, monitor_id: &str) -> Result<Vec<ProcessedFileRecord>, Error> {
+        validate_identifier("monitor ID", monitor_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT monitor_id, file_device, file_inode, relative_path,
+                    content_sha256, size_bytes, processing_signature, run_id,
+                    classification_basis, rule_id, destination_id, processed_unix_ms
+             FROM processed_files WHERE monitor_id = ?1
+             ORDER BY file_device, file_inode",
+        )?;
+        let rows = statement.query_map([monitor_id], processed_file_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Forgets the processed marker for exactly one filesystem identity.
     ///
     /// A missing marker is accepted so recovery and repeated Undo reconciliation
@@ -2074,6 +2101,7 @@ impl ManagedRunKind {
             Self::Stage => "stage",
             Self::Classify => "classify",
             Self::Configure => "configure",
+            Self::Reorganize => "reorganize",
         }
     }
 
@@ -2084,6 +2112,7 @@ impl ManagedRunKind {
             "stage" => Ok(Self::Stage),
             "classify" => Ok(Self::Classify),
             "configure" => Ok(Self::Configure),
+            "reorganize" => Ok(Self::Reorganize),
             other => Err(format!("unknown managed run kind {other:?}")),
         }
     }
@@ -2293,7 +2322,9 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), Error> {
         CREATE TABLE IF NOT EXISTS managed_runs (
             id TEXT PRIMARY KEY,
             workspace_id TEXT NOT NULL REFERENCES managed_workspaces(id) ON DELETE CASCADE,
-            kind TEXT NOT NULL CHECK(kind IN ('setup', 'adopt', 'stage', 'classify', 'configure')),
+            kind TEXT NOT NULL CHECK(kind IN (
+                'setup', 'adopt', 'stage', 'classify', 'configure', 'reorganize'
+            )),
             state TEXT NOT NULL CHECK(state IN (
                 'planning', 'planned', 'applying', 'completed',
                 'noop', 'failed', 'needs_resume'
@@ -2497,6 +2528,29 @@ fn managed_run_from_row(row: &Row<'_>) -> rusqlite::Result<ManagedRun> {
         finished_unix_ms: row.get(8)?,
         move_count: i64_to_u64(row.get(9)?, 9)?,
         error: row.get(10)?,
+    })
+}
+
+fn processed_file_from_row(row: &Row<'_>) -> rusqlite::Result<ProcessedFileRecord> {
+    let device: String = row.get(1)?;
+    let inode: String = row.get(2)?;
+    let basis: String = row.get(8)?;
+    Ok(ProcessedFileRecord {
+        monitor_id: row.get(0)?,
+        file_identity: FsIdentity {
+            device: parse_u64_column(device, 1)?,
+            inode: parse_u64_column(inode, 2)?,
+        },
+        relative_path: row.get(3)?,
+        content_sha256: row.get(4)?,
+        size_bytes: i64_to_u64(row.get(5)?, 5)?,
+        processing_signature: row.get(6)?,
+        run_id: row.get(7)?,
+        classification_basis: ClassificationBasis::parse(&basis)
+            .map_err(|error| conversion_error(8, error))?,
+        rule_id: row.get(9)?,
+        destination_id: row.get(10)?,
+        processed_unix_ms: row.get(11)?,
     })
 }
 

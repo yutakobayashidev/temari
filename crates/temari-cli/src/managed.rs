@@ -13,9 +13,9 @@ use directories::ProjectDirs;
 use serde::Serialize;
 use temari_core::{
     ApplySession, Config, FolderSet, LocalRule, MANAGED_AREAS, ManagedDescendantPolicy,
-    ManagedLibraryEditDraft, ManagedLibraryEditPlan, ManagedReprocessArea,
-    ManagedReprocessSelection, ManagedRunKind, ManagedService, ManagedSetupPlan,
-    ManagedSetupSession, ManagedSetupState, ManagedSetupUndoSession,
+    ManagedLibraryEditDraft, ManagedLibraryEditPlan, ManagedLibraryReorganizationPlan,
+    ManagedReprocessArea, ManagedReprocessSelection, ManagedRunKind, ManagedService,
+    ManagedSetupPlan, ManagedSetupSession, ManagedSetupState, ManagedSetupUndoSession,
     ManagedUndoMoveOutcome as ManagedSetupUndoMoveOutcome, ManagedWorkspace,
     RecentsReconcileSummary, RecentsState, RuleSet, RunState, SourceLock, StateStore,
     UndoMoveOutcome, UndoSession, UndoState, build_managed_setup_plan, canonical_source_identity,
@@ -387,6 +387,50 @@ pub enum LibraryCommand {
         /// Configure run ID requiring recovery.
         run_id: String,
     },
+    /// Review and move existing files after an AI Library structure edit.
+    Reorganize {
+        #[command(subcommand)]
+        command: LibraryReorganizeCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LibraryReorganizeCommand {
+    /// Build a read-only Plan for existing AI Library files.
+    Plan {
+        /// Managed workspace ID.
+        workspace_id: String,
+        /// Completed Configure run that changed the approved structure.
+        configure_run_id: String,
+        /// Output path for the reviewed Plan JSON.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Apply a reviewed physical reorganization Plan.
+    Apply {
+        /// Reviewed physical reorganization Plan JSON.
+        plan: PathBuf,
+        /// Confirm the filesystem mutation without prompting.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Resume an interrupted physical reorganization Apply.
+    Resume {
+        /// Managed workspace ID.
+        workspace_id: String,
+        /// Reorganize run ID requiring recovery.
+        run_id: String,
+    },
+    /// Undo a completed physical reorganization using its run-owned journal.
+    Undo {
+        /// Managed workspace ID.
+        workspace_id: String,
+        /// Completed Reorganize run ID.
+        run_id: String,
+        /// Confirm the filesystem mutation without prompting.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -570,7 +614,98 @@ fn run_library(cli: &Cli, command: &LibraryCommand) -> Result<()> {
             workspace_id,
             run_id,
         } => library_resume(cli, workspace_id, run_id),
+        LibraryCommand::Reorganize { command } => library_reorganize(cli, command),
     }
+}
+
+fn library_reorganize(cli: &Cli, command: &LibraryReorganizeCommand) -> Result<()> {
+    match command {
+        LibraryReorganizeCommand::Plan {
+            workspace_id,
+            configure_run_id,
+            out,
+        } => {
+            let context = ManagedContext::new(cli)?;
+            let store = context.store()?;
+            let workspace = require_workspace(&store, workspace_id)?;
+            let out = resolve_artifact_output(
+                out,
+                Path::new(&workspace.source),
+                "AI Library reorganization Plan",
+            )?;
+            drop(store);
+            let plan = ManagedService::new(&context.state)
+                .preview_library_reorganization(workspace_id, configure_run_id)?;
+            write_artifact(&out, &plan)?;
+            print_output_result(cli, &out)
+        }
+        LibraryReorganizeCommand::Apply { plan, yes } => {
+            let plan_path = fs::canonicalize(plan)
+                .with_context(|| format!("failed to resolve {}", plan.display()))?;
+            let plan = ManagedLibraryReorganizationPlan::load(&plan_path)?;
+            ensure_outside(
+                &plan_path,
+                Path::new(&plan.source),
+                "AI Library reorganization Plan",
+            )?;
+            confirm(
+                cli,
+                *yes,
+                "Apply this reviewed AI Library reorganization Plan? [y/N] ",
+            )?;
+            let context = ManagedContext::new(cli)?;
+            let result = ManagedService::new(&context.state).apply_library_reorganization(&plan)?;
+            print_value(cli, &result, &result.run.id)
+        }
+        LibraryReorganizeCommand::Resume {
+            workspace_id,
+            run_id,
+        } => {
+            require_run_kind(cli, workspace_id, run_id, ManagedRunKind::Reorganize)?;
+            let context = ManagedContext::new(cli)?;
+            let store = context.store()?;
+            let undo_pending = store
+                .managed_run(run_id)?
+                .is_some_and(|run| run.undo_path.is_some());
+            drop(store);
+            let service = ManagedService::new(&context.state);
+            if undo_pending {
+                let result = service.resume_library_reorganization_undo(run_id)?;
+                print_value(cli, &result, &result.run.id)
+            } else {
+                let result = service.resume_library_reorganization(run_id)?;
+                print_value(cli, &result, &result.run.id)
+            }
+        }
+        LibraryReorganizeCommand::Undo {
+            workspace_id,
+            run_id,
+            yes,
+        } => {
+            require_run_kind(cli, workspace_id, run_id, ManagedRunKind::Reorganize)?;
+            confirm(cli, *yes, "Undo this AI Library reorganization? [y/N] ")?;
+            let context = ManagedContext::new(cli)?;
+            let result = ManagedService::new(&context.state).undo_library_reorganization(run_id)?;
+            print_value(cli, &result, &result.run.id)
+        }
+    }
+}
+
+fn require_run_kind(
+    cli: &Cli,
+    workspace_id: &str,
+    run_id: &str,
+    kind: ManagedRunKind,
+) -> Result<()> {
+    let context = ManagedContext::new(cli)?;
+    let store = context.store()?;
+    let run = store
+        .managed_run(run_id)?
+        .ok_or_else(|| anyhow::anyhow!("unknown managed run {run_id:?}"))?;
+    if run.workspace_id != workspace_id || run.kind != kind {
+        bail!("managed run {run_id:?} is not a {kind:?} run for workspace {workspace_id:?}");
+    }
+    Ok(())
 }
 
 fn library_show(cli: &Cli, workspace_id: &str, out: &Path) -> Result<()> {
@@ -1415,6 +1550,9 @@ fn undo_run(cli: &Cli, run_id: &str, out: &Path, files: &[String], yes: bool) ->
         ManagedService::new(&context.state).undo_adoption_run(run_id, &out)?;
         return print_output_result(cli, &out);
     }
+    if run.kind == ManagedRunKind::Reorganize {
+        bail!("AI Library reorganization runs must be undone with managed library reorganize undo");
+    }
     let apply_path = run
         .apply_path
         .as_deref()
@@ -1907,6 +2045,37 @@ mod tests {
             vec!["library", "undo", "workspace-1", "run-1", "--yes"],
             vec!["library", "redo", "workspace-1", "run-1", "--yes"],
             vec!["library", "resume", "workspace-1", "run-1"],
+            vec![
+                "library",
+                "reorganize",
+                "plan",
+                "workspace-1",
+                "configure-1",
+                "--out",
+                "reorganization.json",
+            ],
+            vec![
+                "library",
+                "reorganize",
+                "apply",
+                "reorganization.json",
+                "--yes",
+            ],
+            vec![
+                "library",
+                "reorganize",
+                "resume",
+                "workspace-1",
+                "reorganize-1",
+            ],
+            vec![
+                "library",
+                "reorganize",
+                "undo",
+                "workspace-1",
+                "reorganize-1",
+                "--yes",
+            ],
         ] {
             let mut command = vec!["temari", "managed"];
             command.extend(arguments);

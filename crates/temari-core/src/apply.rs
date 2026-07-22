@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::HashSet,
     fs::{self, File},
     io::{self, Write},
@@ -79,6 +80,28 @@ pub enum MoveOutcome {
     Moved,
     Conflict { message: String },
     Failed { message: String },
+}
+
+/// An owned, already-authorized set of filesystem moves.
+///
+/// Callers must validate their workflow-specific artifact before constructing
+/// this manifest. The executor still validates its filesystem-facing shape and
+/// stale-state checks before creating a journal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedMoveManifest {
+    pub(crate) digest: String,
+    pub(crate) source: String,
+    pub(crate) source_identity: FsIdentity,
+    pub(crate) directories: Vec<String>,
+    pub(crate) moves: Vec<ValidatedMove>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedMove {
+    pub(crate) file_id: String,
+    pub(crate) source_path: String,
+    pub(crate) destination_path: String,
+    pub(crate) fingerprint: FileFingerprint,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -388,36 +411,55 @@ pub fn apply_plan_with_lock(
 ) -> Result<ApplySession, Error> {
     lock.validate_source(&plan.source, &plan.source_identity)?;
     preflight_apply(plan, journal_path)?;
+    apply_preflighted_move_manifest(move_manifest_from_plan(plan)?, journal_path)
+}
+
+/// Applies a separately validated workflow artifact through the standard move
+/// journal and recovery engine while reusing a caller-held source lock.
+pub(crate) fn apply_validated_move_manifest(
+    manifest: ValidatedMoveManifest,
+    journal_path: &Path,
+    lock: &SourceLock,
+) -> Result<ApplySession, Error> {
+    lock.validate_source(&manifest.source, &manifest.source_identity)?;
+    preflight_validated_move_manifest(&manifest, journal_path)?;
+    apply_preflighted_move_manifest(manifest, journal_path)
+}
+
+fn apply_preflighted_move_manifest(
+    manifest: ValidatedMoveManifest,
+    journal_path: &Path,
+) -> Result<ApplySession, Error> {
     let mut session = ApplySession {
         version: 2,
         id: format!("{}-{}", now_unix_ms()?, std::process::id()),
-        plan_sha256: plan.sha256()?,
-        source: plan.source.clone(),
-        source_identity: plan.source_identity.clone(),
+        plan_sha256: manifest.digest,
+        source: manifest.source,
+        source_identity: manifest.source_identity,
         state: ApplyState::Running,
         started_unix_ms: now_unix_ms()?,
         finished_unix_ms: None,
-        directories: plan
+        directories: manifest
             .directories
-            .iter()
+            .into_iter()
             .map(|path| DirectoryRecord {
-                path: path.clone(),
+                path,
                 outcome: DirectoryOutcome::Pending,
             })
             .collect(),
-        moves: plan
-            .entries
-            .iter()
-            .map(|entry| MoveRecord {
-                file_id: entry.file_id.clone(),
-                source_path: entry.source_path.clone(),
-                destination_path: entry.destination_path.clone(),
-                fingerprint: entry.source_fingerprint.clone(),
+        moves: manifest
+            .moves
+            .into_iter()
+            .map(|movement| MoveRecord {
+                file_id: movement.file_id,
+                source_path: movement.source_path,
+                destination_path: movement.destination_path,
+                fingerprint: movement.fingerprint,
                 outcome: MoveOutcome::Pending,
             })
             .collect(),
     };
-    create_journal(journal_path, &session, Path::new(&plan.source))?;
+    create_journal(journal_path, &session, Path::new(&session.source))?;
     continue_apply(&mut session, journal_path)?;
     Ok(session)
 }
@@ -523,6 +565,40 @@ pub fn undo_session(apply: &ApplySession, journal_path: &Path) -> Result<UndoSes
     undo_session_with_lock(apply, journal_path, &lock)
 }
 
+/// Resumes a running Undo journal after conservatively reconciling each
+/// in-progress filesystem operation against its Apply Session.
+pub fn resume_undo_session(
+    apply: &ApplySession,
+    journal_path: &Path,
+) -> Result<UndoSession, Error> {
+    let lock = SourceLock::acquire(Path::new(&apply.source))?;
+    resume_undo_session_with_lock(apply, journal_path, &lock)
+}
+
+/// Resumes a running Undo journal while reusing a caller-held source lock.
+pub fn resume_undo_session_with_lock(
+    apply: &ApplySession,
+    journal_path: &Path,
+    lock: &SourceLock,
+) -> Result<UndoSession, Error> {
+    apply.validate()?;
+    lock.validate_recovery_source(&apply.source, &apply.source_identity)?;
+    let mut undo = UndoSession::load(journal_path)?;
+    if undo.state != UndoState::Running {
+        return Err(Error::InvalidArtifact(format!(
+            "only a running undo session can be resumed; found {:?}",
+            undo.state
+        )));
+    }
+    validate_undo_provenance(apply, &undo)?;
+    validate_existing_journal(journal_path, Path::new(&apply.source))?;
+    reconcile_running_undo(apply, &mut undo, journal_path, lock)?;
+    if undo.state == UndoState::Running {
+        continue_undo_session(apply, &mut undo, journal_path, lock)?;
+    }
+    Ok(undo)
+}
+
 /// Restores selected applied files from a terminal apply session without
 /// removing any directories created by that session.
 pub fn undo_session_files(
@@ -586,8 +662,6 @@ pub fn undo_session_with_lock(
     lock.validate_recovery_source(&apply.source, &apply.source_identity)?;
     preflight_undo(apply, journal_path)?;
     let root = PathBuf::from(&apply.source);
-    let recorded_source_device = apply.source_identity.device;
-    let current_source_device = lock.identity().device;
     let mut undo = UndoSession {
         version: 2,
         apply_session_id: apply.id.clone(),
@@ -618,10 +692,38 @@ pub fn undo_session_with_lock(
             .collect(),
     };
     create_journal(journal_path, &undo, &root)?;
+    continue_undo_session(apply, &mut undo, journal_path, lock)?;
+    Ok(undo)
+}
+
+fn continue_undo_session(
+    apply: &ApplySession,
+    undo: &mut UndoSession,
+    journal_path: &Path,
+    lock: &SourceLock,
+) -> Result<(), Error> {
+    let root = PathBuf::from(&apply.source);
+    let recorded_source_device = apply.source_identity.device;
+    let current_source_device = lock.identity().device;
     let mut partial = false;
 
     for undo_index in 0..undo.moves.len() {
-        let apply_record = &apply.moves[apply.moves.len() - 1 - undo_index];
+        let apply_record = apply_move_for_undo(apply, &undo.moves[undo_index])?;
+        match &undo.moves[undo_index].outcome {
+            UndoMoveOutcome::Restored
+            | UndoMoveOutcome::AlreadyRestored
+            | UndoMoveOutcome::NotApplied => continue,
+            UndoMoveOutcome::Conflict { .. } | UndoMoveOutcome::Failed { .. } => {
+                partial = true;
+                continue;
+            }
+            UndoMoveOutcome::Restoring => {
+                return Err(Error::InvalidArtifact(
+                    "in-progress Undo move was not reconciled before continuation".into(),
+                ));
+            }
+            UndoMoveOutcome::Pending => {}
+        }
         if !matches!(
             apply_record.outcome,
             MoveOutcome::Moved | MoveOutcome::Moving
@@ -681,7 +783,24 @@ pub fn undo_session_with_lock(
     }
 
     for undo_index in 0..undo.directories.len() {
-        let apply_record = &apply.directories[apply.directories.len() - 1 - undo_index];
+        let apply_record = apply_directory_for_undo(apply, &undo.directories[undo_index])?;
+        match &undo.directories[undo_index].outcome {
+            UndoDirectoryOutcome::Removed
+            | UndoDirectoryOutcome::NotPresent
+            | UndoDirectoryOutcome::NotCreatedBySession => continue,
+            UndoDirectoryOutcome::NotEmpty
+            | UndoDirectoryOutcome::Conflict { .. }
+            | UndoDirectoryOutcome::Failed { .. } => {
+                partial = true;
+                continue;
+            }
+            UndoDirectoryOutcome::Removing => {
+                return Err(Error::InvalidArtifact(
+                    "in-progress Undo directory was not reconciled before continuation".into(),
+                ));
+            }
+            UndoDirectoryOutcome::Pending => {}
+        }
         let DirectoryOutcome::Created {
             identity: expected_identity,
         } = &apply_record.outcome
@@ -765,33 +884,367 @@ pub fn undo_session_with_lock(
     };
     undo.finished_unix_ms = Some(now_unix_ms()?);
     update_journal(journal_path, &undo)?;
-    Ok(undo)
+    Ok(())
+}
+
+fn validate_undo_provenance(apply: &ApplySession, undo: &UndoSession) -> Result<(), Error> {
+    if undo.apply_session_id != apply.id
+        || undo.source != apply.source
+        || undo.source_identity != apply.source_identity
+    {
+        return Err(Error::InvalidArtifact(
+            "Undo journal does not match its Apply Session".into(),
+        ));
+    }
+    let mut previous_move_index = apply.moves.len();
+    for movement in &undo.moves {
+        let index = apply
+            .moves
+            .iter()
+            .position(|record| record.file_id == movement.file_id)
+            .ok_or_else(|| {
+                Error::InvalidArtifact("Undo references an unknown Apply move".into())
+            })?;
+        let record = &apply.moves[index];
+        if index >= previous_move_index
+            || movement.source_path != record.source_path
+            || movement.destination_path != record.destination_path
+        {
+            return Err(Error::InvalidArtifact(
+                "Undo move order or paths do not match the Apply Session".into(),
+            ));
+        }
+        previous_move_index = index;
+    }
+    if !undo.directories.is_empty()
+        && (undo.directories.len() != apply.directories.len()
+            || undo
+                .directories
+                .iter()
+                .zip(apply.directories.iter().rev())
+                .any(|(undo, apply)| undo.path != apply.path))
+    {
+        return Err(Error::InvalidArtifact(
+            "Undo directories do not match the reversed Apply Session".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_move_for_undo<'a>(
+    apply: &'a ApplySession,
+    undo: &UndoMoveRecord,
+) -> Result<&'a MoveRecord, Error> {
+    apply
+        .moves
+        .iter()
+        .find(|record| {
+            record.file_id == undo.file_id
+                && record.source_path == undo.source_path
+                && record.destination_path == undo.destination_path
+        })
+        .ok_or_else(|| Error::InvalidArtifact("Undo move does not match its Apply Session".into()))
+}
+
+fn apply_directory_for_undo<'a>(
+    apply: &'a ApplySession,
+    undo: &UndoDirectoryRecord,
+) -> Result<&'a DirectoryRecord, Error> {
+    apply
+        .directories
+        .iter()
+        .find(|record| record.path == undo.path)
+        .ok_or_else(|| {
+            Error::InvalidArtifact("Undo directory does not match its Apply Session".into())
+        })
+}
+
+fn reconcile_running_undo(
+    apply: &ApplySession,
+    undo: &mut UndoSession,
+    journal_path: &Path,
+    lock: &SourceLock,
+) -> Result<(), Error> {
+    let root = Path::new(&apply.source);
+    let recorded_source_device = apply.source_identity.device;
+    let current_source_device = lock.identity().device;
+    for index in 0..undo.moves.len() {
+        let apply_record = apply_move_for_undo(apply, &undo.moves[index])?;
+        let original = checked_join(root, &apply_record.source_path)?;
+        let destination = checked_join(root, &apply_record.destination_path)?;
+        verify_source_parent(root, &apply_record.source_path)?;
+        verify_directory_chain(root, relative_parent(&apply_record.destination_path)?)?;
+        let next = match &undo.moves[index].outcome {
+            UndoMoveOutcome::Pending => match reconcile_move_for_recovery(
+                &original,
+                &destination,
+                &apply_record.fingerprint,
+                recorded_source_device,
+                current_source_device,
+            )? {
+                ReconciledMove::AtDestination => None,
+                ReconciledMove::AlreadyRestored => Some(UndoMoveOutcome::AlreadyRestored),
+                ReconciledMove::Conflict(message) => Some(UndoMoveOutcome::Conflict { message }),
+            },
+            UndoMoveOutcome::Restoring => match reconcile_move_for_recovery(
+                &original,
+                &destination,
+                &apply_record.fingerprint,
+                recorded_source_device,
+                current_source_device,
+            )? {
+                ReconciledMove::AtDestination => Some(UndoMoveOutcome::Pending),
+                ReconciledMove::AlreadyRestored => Some(UndoMoveOutcome::Restored),
+                ReconciledMove::Conflict(message) => Some(UndoMoveOutcome::Conflict { message }),
+            },
+            UndoMoveOutcome::Restored | UndoMoveOutcome::AlreadyRestored => {
+                match reconcile_move_for_recovery(
+                    &original,
+                    &destination,
+                    &apply_record.fingerprint,
+                    recorded_source_device,
+                    current_source_device,
+                )? {
+                    ReconciledMove::AlreadyRestored => None,
+                    ReconciledMove::AtDestination => Some(UndoMoveOutcome::Conflict {
+                        message: "restored file returned to its applied destination".into(),
+                    }),
+                    ReconciledMove::Conflict(message) => {
+                        Some(UndoMoveOutcome::Conflict { message })
+                    }
+                }
+            }
+            UndoMoveOutcome::NotApplied => {
+                if matches!(
+                    apply_record.outcome,
+                    MoveOutcome::Moved | MoveOutcome::Moving
+                ) {
+                    return Err(Error::InvalidArtifact(
+                        "Undo marks an applied move as not applied".into(),
+                    ));
+                }
+                None
+            }
+            UndoMoveOutcome::Conflict { .. } | UndoMoveOutcome::Failed { .. } => None,
+        };
+        if let Some(outcome) = next {
+            undo.moves[index].outcome = outcome;
+            update_journal(journal_path, undo)?;
+        }
+    }
+
+    for index in 0..undo.directories.len() {
+        let apply_record = apply_directory_for_undo(apply, &undo.directories[index])?;
+        let DirectoryOutcome::Created {
+            identity: expected_identity,
+        } = &apply_record.outcome
+        else {
+            if undo.directories[index].outcome != UndoDirectoryOutcome::NotCreatedBySession {
+                undo.directories[index].outcome = UndoDirectoryOutcome::NotCreatedBySession;
+                update_journal(journal_path, undo)?;
+            }
+            continue;
+        };
+        let path = checked_join(root, &apply_record.path)?;
+        if let Some(parent) = apply_record.path.rsplit_once('/').map(|(parent, _)| parent) {
+            verify_directory_chain(root, parent)?;
+        }
+        let state = match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(io_error("inspect", &path, error)),
+            Ok(metadata)
+                if metadata.file_type().is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && identity_matches_for_recovery(
+                        &identity(&metadata),
+                        expected_identity,
+                        recorded_source_device,
+                        current_source_device,
+                    ) =>
+            {
+                Some(
+                    fs::read_dir(&path)
+                        .map_err(|source| io_error("read", &path, source))?
+                        .next()
+                        .is_some(),
+                )
+            }
+            Ok(_) => {
+                undo.directories[index].outcome = UndoDirectoryOutcome::Conflict {
+                    message: "directory identity or type changed during Undo".into(),
+                };
+                update_journal(journal_path, undo)?;
+                continue;
+            }
+        };
+        let next = match (&undo.directories[index].outcome, state) {
+            (UndoDirectoryOutcome::Pending, None) => Some(UndoDirectoryOutcome::NotPresent),
+            (UndoDirectoryOutcome::Pending, Some(_)) => None,
+            (UndoDirectoryOutcome::Removing, None) => Some(UndoDirectoryOutcome::Removed),
+            (UndoDirectoryOutcome::Removing, Some(false)) => Some(UndoDirectoryOutcome::Pending),
+            (UndoDirectoryOutcome::Removing, Some(true)) => Some(UndoDirectoryOutcome::NotEmpty),
+            (UndoDirectoryOutcome::Removed | UndoDirectoryOutcome::NotPresent, None) => None,
+            (UndoDirectoryOutcome::Removed | UndoDirectoryOutcome::NotPresent, Some(_)) => {
+                Some(UndoDirectoryOutcome::Conflict {
+                    message: "removed Undo directory reappeared".into(),
+                })
+            }
+            (
+                UndoDirectoryOutcome::NotEmpty
+                | UndoDirectoryOutcome::Conflict { .. }
+                | UndoDirectoryOutcome::Failed { .. },
+                _,
+            ) => None,
+            (UndoDirectoryOutcome::NotCreatedBySession, _) => {
+                return Err(Error::InvalidArtifact(
+                    "Undo directory provenance contradicts the Apply Session".into(),
+                ));
+            }
+        };
+        if let Some(outcome) = next {
+            undo.directories[index].outcome = outcome;
+            update_journal(journal_path, undo)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn preflight_apply(plan: &Plan, journal_path: &Path) -> Result<(), Error> {
     plan.validate()?;
-    let root = verify_source(&plan.source, &plan.source_identity)?;
-    for entry in &plan.entries {
-        verify_source_parent(&root, &entry.source_path)?;
-        let source = checked_join(&root, &entry.source_path)?;
-        if fingerprint(&source)? != entry.source_fingerprint {
+    preflight_validated_move_manifest(&move_manifest_from_plan(plan)?, journal_path)
+}
+
+/// Performs the common stale-file, destination, and journal checks for a
+/// workflow-specific manifest that has already passed its semantic validation.
+pub(crate) fn preflight_validated_move_manifest(
+    manifest: &ValidatedMoveManifest,
+    journal_path: &Path,
+) -> Result<(), Error> {
+    validate_move_manifest(manifest)?;
+    let root = verify_source(&manifest.source, &manifest.source_identity)?;
+    for movement in &manifest.moves {
+        verify_source_parent(&root, &movement.source_path)?;
+        let source = checked_join(&root, &movement.source_path)?;
+        if fingerprint(&source)? != movement.fingerprint {
             return Err(Error::InvalidArtifact(format!(
                 "source changed after planning: {:?}",
-                entry.source_path
+                movement.source_path
             )));
         }
-        let parent = relative_parent(&entry.destination_path)?;
+        let parent = relative_parent(&movement.destination_path)?;
         verify_directory_chain(&root, parent)?;
-        let destination = checked_join(&root, &entry.destination_path)?;
+        let destination = checked_join(&root, &movement.destination_path)?;
         if path_exists(&destination)? {
             return Err(Error::InvalidArtifact(format!(
                 "planned destination is now occupied: {:?}",
-                entry.destination_path
+                movement.destination_path
             )));
         }
     }
     validate_journal_target(journal_path, &root)?;
     Ok(())
+}
+
+fn move_manifest_from_plan(plan: &Plan) -> Result<ValidatedMoveManifest, Error> {
+    Ok(ValidatedMoveManifest {
+        digest: plan.sha256()?,
+        source: plan.source.clone(),
+        source_identity: plan.source_identity.clone(),
+        directories: plan.directories.clone(),
+        moves: plan
+            .entries
+            .iter()
+            .map(|entry| ValidatedMove {
+                file_id: entry.file_id.clone(),
+                source_path: entry.source_path.clone(),
+                destination_path: entry.destination_path.clone(),
+                fingerprint: entry.source_fingerprint.clone(),
+            })
+            .collect(),
+    })
+}
+
+fn validate_move_manifest(manifest: &ValidatedMoveManifest) -> Result<(), Error> {
+    validate_digest(&manifest.digest)?;
+    if !Path::new(&manifest.source).is_absolute() || manifest.source.chars().any(char::is_control) {
+        return Err(Error::InvalidArtifact(
+            "move manifest source must be an absolute path without control characters".into(),
+        ));
+    }
+
+    let mut previous_directory: Option<&str> = None;
+    let mut directories = HashSet::new();
+    for directory in &manifest.directories {
+        normalize_relative_path(directory)?;
+        if !directories.insert(directory.as_str()) {
+            return Err(Error::InvalidArtifact(format!(
+                "duplicate move manifest directory {directory:?}"
+            )));
+        }
+        if let Some(previous) = previous_directory
+            && move_directory_order(previous, directory) == Ordering::Greater
+        {
+            return Err(Error::InvalidArtifact(
+                "move manifest directories must be in parent-first lexical order".into(),
+            ));
+        }
+        previous_directory = Some(directory);
+    }
+
+    let mut file_ids = HashSet::new();
+    let mut sources = HashSet::new();
+    let mut destinations = HashSet::new();
+    for movement in &manifest.moves {
+        if movement.file_id.trim().is_empty()
+            || movement.file_id.chars().any(char::is_control)
+            || !file_ids.insert(movement.file_id.as_str())
+        {
+            return Err(Error::InvalidArtifact(format!(
+                "duplicate or invalid move manifest file ID {:?}",
+                movement.file_id
+            )));
+        }
+        normalize_relative_path(&movement.source_path)?;
+        normalize_relative_path(&movement.destination_path)?;
+        if movement.source_path == movement.destination_path {
+            return Err(Error::InvalidArtifact(format!(
+                "move manifest source and destination must differ: {:?}",
+                movement.source_path
+            )));
+        }
+        if !sources.insert(movement.source_path.as_str()) {
+            return Err(Error::InvalidArtifact(format!(
+                "duplicate move manifest source {:?}",
+                movement.source_path
+            )));
+        }
+        if !destinations.insert(movement.destination_path.as_str()) {
+            return Err(Error::InvalidArtifact(format!(
+                "duplicate move manifest destination {:?}",
+                movement.destination_path
+            )));
+        }
+        validate_fingerprint(&movement.fingerprint)?;
+    }
+    for directory in &manifest.directories {
+        if !manifest.moves.iter().any(|movement| {
+            relative_parent(&movement.destination_path).is_ok_and(|parent| {
+                parent == directory || parent.starts_with(&format!("{directory}/"))
+            })
+        }) {
+            return Err(Error::InvalidArtifact(format!(
+                "move manifest directory is not required by any move: {directory:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn move_directory_order(left: &str, right: &str) -> Ordering {
+    left.split('/')
+        .count()
+        .cmp(&right.split('/').count())
+        .then_with(|| left.cmp(right))
 }
 
 pub fn preflight_undo(apply: &ApplySession, journal_path: &Path) -> Result<(), Error> {
@@ -1448,6 +1901,160 @@ mod tests {
         assert!(root.path().join("report.txt").exists());
         assert!(!root.path().join("Documents").exists());
         assert_eq!(fs::read(&apply_path).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn resumes_undo_from_a_journal_created_before_filesystem_mutation() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        let apply = apply_plan(&plan(root.path()), &journals.path().join("apply.json")).unwrap();
+        let undo_path = journals.path().join("undo.json");
+        let undo = UndoSession {
+            version: 2,
+            apply_session_id: apply.id.clone(),
+            source: apply.source.clone(),
+            source_identity: apply.source_identity.clone(),
+            state: UndoState::Running,
+            started_unix_ms: now_unix_ms().unwrap(),
+            finished_unix_ms: None,
+            moves: apply
+                .moves
+                .iter()
+                .rev()
+                .map(|record| UndoMoveRecord {
+                    file_id: record.file_id.clone(),
+                    source_path: record.source_path.clone(),
+                    destination_path: record.destination_path.clone(),
+                    outcome: UndoMoveOutcome::Pending,
+                })
+                .collect(),
+            directories: apply
+                .directories
+                .iter()
+                .rev()
+                .map(|record| UndoDirectoryRecord {
+                    path: record.path.clone(),
+                    outcome: UndoDirectoryOutcome::Pending,
+                })
+                .collect(),
+        };
+        create_journal(&undo_path, &undo, root.path()).unwrap();
+
+        let resumed = resume_undo_session(&apply, &undo_path).unwrap();
+
+        assert_eq!(resumed.state, UndoState::Completed);
+        assert!(root.path().join("report.txt").is_file());
+        assert!(!root.path().join("Documents").exists());
+    }
+
+    #[test]
+    fn resume_reconciles_completed_undo_operations_and_keeps_terminal_journal_immutable() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        let apply = apply_plan(&plan(root.path()), &journals.path().join("apply.json")).unwrap();
+        let undo_path = journals.path().join("undo.json");
+        let mut interrupted = undo_session(&apply, &undo_path).unwrap();
+        interrupted.state = UndoState::Running;
+        interrupted.finished_unix_ms = None;
+        for movement in &mut interrupted.moves {
+            if movement.outcome == UndoMoveOutcome::Restored {
+                movement.outcome = UndoMoveOutcome::Restoring;
+            }
+        }
+        for directory in &mut interrupted.directories {
+            if directory.outcome == UndoDirectoryOutcome::Removed {
+                directory.outcome = UndoDirectoryOutcome::Removing;
+            }
+        }
+        update_journal(&undo_path, &interrupted).unwrap();
+
+        let resumed = resume_undo_session(&apply, &undo_path).unwrap();
+
+        assert_eq!(resumed.state, UndoState::Completed);
+        assert!(
+            resumed
+                .moves
+                .iter()
+                .all(|record| record.outcome == UndoMoveOutcome::Restored)
+        );
+        assert!(
+            resumed
+                .directories
+                .iter()
+                .filter(|record| apply
+                    .directories
+                    .iter()
+                    .any(|apply| apply.path == record.path
+                        && matches!(apply.outcome, DirectoryOutcome::Created { .. })))
+                .all(|record| record.outcome == UndoDirectoryOutcome::Removed)
+        );
+        let terminal_bytes = fs::read(&undo_path).unwrap();
+        assert!(resume_undo_session(&apply, &undo_path).is_err());
+        assert_eq!(fs::read(&undo_path).unwrap(), terminal_bytes);
+    }
+
+    #[test]
+    fn validated_manifest_moves_within_an_approved_style_tree() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("AI Library/Old")).unwrap();
+        fs::write(root.path().join("AI Library/Old/report.txt"), b"report").unwrap();
+        let (_, source_identity) = canonical_directory(root.path()).unwrap();
+        let manifest = ValidatedMoveManifest {
+            digest: "a".repeat(64),
+            source: root.path().display().to_string(),
+            source_identity,
+            directories: vec!["AI Library/New".into()],
+            moves: vec![ValidatedMove {
+                file_id: "f000001".into(),
+                source_path: "AI Library/Old/report.txt".into(),
+                destination_path: "AI Library/New/report.txt".into(),
+                fingerprint: fingerprint(&root.path().join("AI Library/Old/report.txt")).unwrap(),
+            }],
+        };
+        let apply_path = journals.path().join("apply.json");
+        let lock = SourceLock::acquire(root.path()).unwrap();
+
+        preflight_validated_move_manifest(&manifest, &apply_path).unwrap();
+        let apply = apply_validated_move_manifest(manifest, &apply_path, &lock).unwrap();
+
+        assert_eq!(apply.state, ApplyState::Completed);
+        assert!(!root.path().join("AI Library/Old/report.txt").exists());
+        assert!(root.path().join("AI Library/New/report.txt").exists());
+        drop(lock);
+
+        let undo = undo_session(&apply, &journals.path().join("undo.json")).unwrap();
+        assert_eq!(undo.state, UndoState::Completed);
+        assert!(root.path().join("AI Library/Old/report.txt").exists());
+        assert!(!root.path().join("AI Library/New").exists());
+    }
+
+    #[test]
+    fn validated_manifest_rejects_unsafe_shape_before_journaling() {
+        let root = tempdir().unwrap();
+        let journals = tempdir().unwrap();
+        fs::write(root.path().join("report.txt"), b"report").unwrap();
+        let (_, source_identity) = canonical_directory(root.path()).unwrap();
+        let file_fingerprint = fingerprint(&root.path().join("report.txt")).unwrap();
+        let movement = ValidatedMove {
+            file_id: "f000001".into(),
+            source_path: "report.txt".into(),
+            destination_path: "Documents/report.txt".into(),
+            fingerprint: file_fingerprint,
+        };
+        let manifest = ValidatedMoveManifest {
+            digest: "a".repeat(64),
+            source: root.path().display().to_string(),
+            source_identity,
+            directories: vec!["Documents".into()],
+            moves: vec![movement.clone(), movement],
+        };
+        let journal = journals.path().join("apply.json");
+        let lock = SourceLock::acquire(root.path()).unwrap();
+
+        assert!(apply_validated_move_manifest(manifest, &journal, &lock).is_err());
+        assert!(!journal.exists());
+        assert!(root.path().join("report.txt").exists());
     }
 
     #[test]

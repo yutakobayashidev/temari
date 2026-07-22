@@ -71,7 +71,7 @@ $ cargo run -p temari-cli -- resume downloads.apply.json
 
 ## Desktop proof of concept
 
-`apps/temari-desktop` contains a Tauri 2 proof of concept for Linux and macOS. Its primary surface is the same managed three-area workflow as the CLI: propose an AI Library hierarchy, review the exact setup preview, apply the backend-held preview, run finite organization cycles, inspect status and move history, reprocess selected files through Recents, and undo either a complete run or one move. The CLI and desktop both call the shared `ManagedService` in `temari-core`; neither shells out to the other. OS schedule rendering and installation are shared through the separate `temari-schedule` crate.
+`apps/temari-desktop` contains a Tauri 2 proof of concept for Linux and macOS. Its primary surface is the same managed three-area workflow as the CLI: propose an AI Library hierarchy, review the exact setup preview, apply the backend-held preview, run finite organization cycles, inspect status and move history, reprocess selected files through Recents, edit the logical Library, separately review physical reorganization moves, and undo either a complete run or one move. The CLI and desktop both call the shared `ManagedService` in `temari-core`; neither shells out to the other. OS schedule rendering and installation are shared through the separate `temari-schedule` crate.
 
 ```console
 $ nix develop
@@ -103,6 +103,10 @@ $ temari managed library show <WORKSPACE_ID> --out library.folders.json
 $ temari managed library plan <WORKSPACE_ID> --out library-edit.plan.json \
     add --path Research --description "Research material"
 $ temari managed library apply library-edit.plan.json --yes
+$ temari managed library reorganize plan <WORKSPACE_ID> <CONFIGURE_RUN_ID> \
+    --out library-reorganization.plan.json
+$ temari managed library reorganize apply library-reorganization.plan.json --yes
+$ temari managed library reorganize undo <WORKSPACE_ID> <REORGANIZE_RUN_ID> --yes
 $ temari managed library undo <WORKSPACE_ID> <CONFIGURE_RUN_ID> --yes
 $ temari managed library redo <WORKSPACE_ID> <CONFIGURE_RUN_ID> --yes
 $ temari managed schedule install <WORKSPACE_ID> \
@@ -116,6 +120,8 @@ Arrival time is the first local observation stored in SQLite, not file modificat
 `managed reprocess` creates a model-free reviewed Plan from explicitly selected `Manual Library` or `AI Library` files back to `Recents`; normal retention and classification then apply. AI Library supports explicit `--all`, while Manual Library always requires `--path`. Workspace registration can be enabled, disabled, edited, reconciled, and removed without deleting the three physical areas or JSON recovery artifacts.
 
 `managed library` edits the approved AI Library structure while a workspace is disabled. `show` exports the current FolderSet; `plan add|rename|describe|delete` writes a single-operation Plan, and `plan batch --operations <JSON>` writes one ordered multi-operation Plan. Parent Rename and Delete require a reviewed `reject`, `cascade`, or `reparent` descendant policy. `apply` changes the workspace's FolderSet binding only: it does not move files or rename or delete physical directories. Each completed Configure run owns fixed Apply, Undo, and Redo artifacts, so callers never supply a journal path and `resume` dispatches interrupted recovery from the recorded run state.
+
+After a logical Rename or Delete, `managed library reorganize` offers a separate model-free Plan/Apply/Resume/Undo workflow for files already in AI Library. Core matches files to completed classification records by filesystem identity, size, and content hash. Stable destination IDs map renamed paths to the new approved subtree; removed destinations return files directly to Recents. Untracked, changed, or manually relocated files are reported as attention items and left untouched. The Plan shows collision-resolved destinations, Apply never overwrites, old directories are not removed, and the run owns fixed Apply and Undo journals.
 
 Temari supports only the current `Manual Library`, `Recents`, and `AI Library` layout. Experimental artifacts and state databases from earlier layouts are rejected instead of being upgraded or interpreted through compatibility paths. After an incompatible schema change, preserve the old database if recovery is still needed, restore or move the existing managed contents manually, then create a fresh database and initialize the workspace again. Temari never deletes or rewrites those physical files automatically.
 

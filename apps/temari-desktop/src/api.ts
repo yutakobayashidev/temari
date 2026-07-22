@@ -5,6 +5,7 @@ import type {
   LibraryEditOperation,
   LibraryEditPreview,
   LibraryFolder,
+  LibraryReorganizationPreview,
   ManagedMove,
   ManagedRunResult,
   ManagedWorkspace,
@@ -90,6 +91,9 @@ let demoLibraryPreviewWorkspaceId: string | null = null;
 let demoLibraryUndoSnapshot: LibraryFolder[] | null = null;
 let demoLibraryRedoSnapshot: LibraryFolder[] | null = null;
 let demoLatestConfiguration: ManagedWorkspaceStatus["latestConfiguration"] = null;
+let demoLatestReorganization: ManagedWorkspaceStatus["latestReorganization"] = null;
+let demoLibraryReorganizationPreview: LibraryReorganizationPreview | null = null;
+let demoLibraryReorganizationWorkspaceId: string | null = null;
 
 function isTauri(): boolean {
   return "__TAURI_INTERNALS__" in window;
@@ -180,6 +184,7 @@ export async function getManagedWorkspace(workspaceId: string): Promise<ManagedW
       runs: { total: 41, actionable: [] },
       libraryFolders: structuredClone(demoLibraryFolders),
       latestConfiguration: structuredClone(demoLatestConfiguration),
+      latestReorganization: structuredClone(demoLatestReorganization),
     };
   }
   return invoke<ManagedWorkspaceStatus>("managed_get_workspace", { request: { workspaceId } });
@@ -350,6 +355,86 @@ export async function redoLibraryEdit(workspaceId: string, runId: string): Promi
 export async function resumeLibraryEdit(workspaceId: string, runId: string): Promise<ManagedWorkspaceStatus> {
   if (!isTauri()) return getManagedWorkspace(workspaceId);
   return invoke<ManagedWorkspaceStatus>("managed_resume_library_edit", { request: { workspaceId, runId } });
+}
+
+export async function previewLibraryReorganization(
+  workspaceId: string,
+  configureRunId: string,
+): Promise<LibraryReorganizationPreview> {
+  if (!isTauri()) {
+    demoLibraryReorganizationWorkspaceId = workspaceId;
+    demoLibraryReorganizationPreview = {
+      token: `demo-library-reorganization-${Date.now()}`,
+      directories: ["AI Library/Archive"],
+      moves: [{
+        sourcePath: "AI Library/Work/quarterly-notes.pdf",
+        requestedDestination: "AI Library/Archive/quarterly-notes.pdf",
+        destinationPath: "AI Library/Archive/quarterly-notes.pdf",
+        target: "approved",
+      }],
+      attention: [{ sourcePath: "AI Library/Work/edited-locally.txt", reason: "changed" }],
+    };
+    return structuredClone(demoLibraryReorganizationPreview);
+  }
+  return invoke<LibraryReorganizationPreview>("managed_preview_library_reorganization", {
+    request: { workspaceId, configureRunId },
+  });
+}
+
+export async function applyLibraryReorganization(previewToken: string): Promise<ManagedWorkspaceStatus> {
+  if (!isTauri()) {
+    if (!demoLibraryReorganizationPreview || demoLibraryReorganizationPreview.token !== previewToken) {
+      throw new Error("AI Library file reorganization preview expired.");
+    }
+    const configuration = demoLatestConfiguration;
+    if (!configuration) throw new Error("No AI Library structure edit is available.");
+    const runId = `demo-reorganize-${Date.now()}`;
+    for (const [index, move] of demoLibraryReorganizationPreview.moves.entries()) {
+      demoHistory.unshift({
+        sessionId: runId,
+        kind: "reorganize",
+        moveId: `r${String(index + 1).padStart(6, "0")}`,
+        sourcePath: move.sourcePath,
+        destinationPath: move.destinationPath,
+        undone: false,
+        undoOutcome: null,
+        finishedUnixMs: Date.now(),
+      });
+    }
+    demoLatestReorganization = {
+      runId,
+      configureRunId: configuration.runId,
+      state: "completed",
+      undone: false,
+      moveCount: demoLibraryReorganizationPreview.moves.length,
+      finishedUnixMs: Date.now(),
+    };
+    demoLibraryReorganizationPreview = null;
+    const workspaceId = demoLibraryReorganizationWorkspaceId;
+    demoLibraryReorganizationWorkspaceId = null;
+    if (!workspaceId) throw new Error("AI Library file reorganization preview expired.");
+    return getManagedWorkspace(workspaceId);
+  }
+  return invoke<ManagedWorkspaceStatus>("managed_apply_library_reorganization", { request: { previewToken } });
+}
+
+export async function resumeLibraryReorganization(workspaceId: string, runId: string): Promise<ManagedWorkspaceStatus> {
+  if (!isTauri()) return getManagedWorkspace(workspaceId);
+  return invoke<ManagedWorkspaceStatus>("managed_resume_library_reorganization", { request: { workspaceId, runId } });
+}
+
+export async function undoLibraryReorganization(workspaceId: string, runId: string): Promise<ManagedWorkspaceStatus> {
+  if (!isTauri()) {
+    if (!demoLatestReorganization || demoLatestReorganization.runId !== runId) {
+      throw new Error("AI Library file reorganization can no longer be undone.");
+    }
+    demoLatestReorganization = { ...demoLatestReorganization, undone: true };
+    demoHistory = demoHistory.map((move) => move.sessionId === runId
+      ? { ...move, undone: true, undoOutcome: "restored" }
+      : move);
+    return getManagedWorkspace(workspaceId);
+  }
+  return invoke<ManagedWorkspaceStatus>("managed_undo_library_reorganization", { request: { workspaceId, runId } });
 }
 
 export async function runManagedWorkspace(workspaceId: string): Promise<ManagedRunResult> {

@@ -15,6 +15,7 @@ The native flow is:
 7. Reprocess selected `Manual Library` or `AI Library` entries through Recents when classification should run again.
 8. Undo a completed run or one selected move with a separate durable Undo journal.
 9. Pause a workspace to review an ordered batch of logical AI Library edits, including explicit subtree behavior, then Apply, Undo, or Redo that Configure session.
+10. Review existing AI Library files as a separate physical reorganization preview, including exact collision-resolved moves and untouched attention items, then Apply, Resume, or Undo the run-owned journals.
 
 ## Trust boundary
 
@@ -26,7 +27,8 @@ The native flow is:
 - Workspace status is computed by Core from physical Recents, indexed deadlines, and actionable runs. IPC responses use explicit camel-case view types and omit internal artifact paths rather than exposing database records.
 - History merges immutable file Apply/Undo journals and directory-adoption setup/Undo journals. File moves support session or individual Undo; directory adoption supports session Undo only so managed areas remain intact. Undo allocates the journal path in the backend and reconciles SQLite only after filesystem outcomes are known.
 - AI Library structure editing exposes only model-visible destinations. An ordered batch of Add, Rename, Description, and Delete operations produces one immutable `FolderSet` revision while preserving existing opaque IDs. Parent edits require an explicit reject, cascade, or reparent policy. The confirmation shows the exact backend-produced before/after delta, including affected descendants, before Apply atomically consumes the preview token and updates both bindings.
-- AI Library edits are logical configuration changes: they do not rename directories or move existing files. The editor links back to Reprocess when existing files should pass through Recents under the revised structure.
+- AI Library edits are logical configuration changes: they do not rename directories or move existing files. A separate backend-held reorganization preview maps trusted processed identities through stable destination IDs, returns files from removed destinations to Recents, and lists every changed, untracked, or manually relocated file that will remain untouched.
+- Reorganization Apply consumes that preview once and uses fixed private run artifacts. Interrupted Apply and Undo recovery dispatch through Core from the recorded run state; the frontend never supplies a filesystem path or reconstructs a move.
 - Configure Apply, Undo, and Redo require a disabled workspace. System fallbacks, the final visible destination, active-rule targets anywhere in a removed subtree, stale previews, newer revisions, and workspaces with unfinished runs are rejected.
 - New root directories are moved to `Manual Library`. A classified file manually returned to the root retains its processed identity and is left in place until the user explicitly requests reprocessing.
 - Setup rejects a managed area or any directory below one before requesting a folder proposal. The same activation boundary remains enforced in `temari-core`; a native picker never grants a selected path authority by itself.
@@ -56,7 +58,7 @@ For frontend-only work, start the Vite preview:
 $ corepack pnpm --dir apps/temari-desktop dev
 ```
 
-Outside Tauri, the API adapter uses fixed sample data and simulates Apply, Undo, and Redo. This browser mode is visually useful but does not access the filesystem, write journals, or prove native model integration.
+Outside Tauri, the API adapter uses fixed sample data and simulates logical Apply, Undo, and Redo plus physical reorganization Apply and Undo. This browser mode is visually useful but does not access the filesystem, write journals, or prove native model integration.
 
 Run the independent checks with:
 

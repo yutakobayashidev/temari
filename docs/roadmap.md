@@ -37,7 +37,7 @@ This roadmap records the remaining parity work identified through binary analysi
   - Add a detail screen for Manual Library, Recents, and AI Library with bounded file previews, counts, last run, and recent moves.
   - Keep content extraction opt-in and bounded; never expose raw file contents by default.
   - Acceptance: the view is read-only and uses the same identity and privacy rules as planning.
-- [ ] **Physical Library reorganization workflow** (Core, CLI, Tauri)
+- [x] **Physical Library reorganization workflow** (Core, CLI, Tauri)
   - Add a separate reviewed Plan/Apply/Undo flow for moving existing Library files after a logical structure edit.
   - Preview source, destination, collision resolution, created directories, and affected file count.
   - Acceptance: logical editing never silently moves files; reorganization remains independently undoable.
