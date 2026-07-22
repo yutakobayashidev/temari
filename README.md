@@ -103,6 +103,8 @@ $ temari managed library show <WORKSPACE_ID> --out library.folders.json
 $ temari managed library plan <WORKSPACE_ID> --out library-edit.plan.json \
     add --path Research --description "Research material"
 $ temari managed library apply library-edit.plan.json --yes
+$ temari managed library undo <WORKSPACE_ID> <CONFIGURE_RUN_ID> --yes
+$ temari managed library redo <WORKSPACE_ID> <CONFIGURE_RUN_ID> --yes
 $ temari managed schedule install <WORKSPACE_ID> \
     --every-seconds 300 --executable ~/.local/bin/temari --yes
 ```
@@ -113,7 +115,7 @@ Arrival time is the first local observation stored in SQLite, not file modificat
 
 `managed reprocess` creates a model-free reviewed Plan from explicitly selected `Manual Library` or `AI Library` files back to `Recents`; normal retention and classification then apply. AI Library supports explicit `--all`, while Manual Library always requires `--path`. Workspace registration can be enabled, disabled, edited, reconciled, and removed without deleting the three physical areas or JSON recovery artifacts.
 
-`managed library` edits the approved AI Library structure while a workspace is disabled. `show` exports the current FolderSet, and `plan add|rename|describe|delete` writes a reviewable immutable Plan. `apply` changes the workspace's FolderSet binding only: it does not move files or rename or delete physical directories. Each completed Configure run owns its recovery artifacts, so `undo <WORKSPACE_ID> <RUN_ID>` does not accept a caller-selected journal path and `resume` dispatches interrupted Apply or Undo recovery from the recorded run state.
+`managed library` edits the approved AI Library structure while a workspace is disabled. `show` exports the current FolderSet; `plan add|rename|describe|delete` writes a single-operation Plan, and `plan batch --operations <JSON>` writes one ordered multi-operation Plan. Parent Rename and Delete require a reviewed `reject`, `cascade`, or `reparent` descendant policy. `apply` changes the workspace's FolderSet binding only: it does not move files or rename or delete physical directories. Each completed Configure run owns fixed Apply, Undo, and Redo artifacts, so callers never supply a journal path and `resume` dispatches interrupted recovery from the recorded run state.
 
 Temari supports only the current `Manual Library`, `Recents`, and `AI Library` layout. Experimental artifacts and state databases from earlier layouts are rejected instead of being upgraded or interpreted through compatibility paths. After an incompatible schema change, preserve the old database if recovery is still needed, restore or move the existing managed contents manually, then create a fresh database and initialize the workspace again. Temari never deletes or rewrites those physical files automatically.
 

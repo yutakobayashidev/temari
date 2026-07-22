@@ -21,8 +21,16 @@ export type RecentsSummary = {
   indexedPending: number;
   indexedPlanned: number;
   indexedMoved: number;
-  eligibleNow: number;
-  nextEligibleUnixMs: number | null;
+};
+
+export type WaitingFile = {
+  relativePath: string;
+  sizeBytes: number;
+  eligibleUnixMs: number;
+  reasons: Array<
+    | { kind: "retention"; untilUnixMs: number }
+    | { kind: "settling"; untilUnixMs: number }
+  >;
 };
 
 export type ManagedRun = {
@@ -40,6 +48,16 @@ export type ManagedWorkspaceStatus = {
   issues: string[];
   workspace: ManagedWorkspace;
   recents: RecentsSummary;
+  queue: {
+    pendingRuns: number;
+    waitingFiles: WaitingFile[];
+    eligibleFiles: number;
+    nextEligibleUnixMs: number | null;
+  };
+  activity: {
+    state: "idle" | "running" | "failed" | "recoverable";
+    run: null | Pick<ManagedRun, "id" | "kind" | "state" | "error">;
+  };
   runs: {
     total: number;
     actionable: ManagedRun[];
@@ -49,6 +67,7 @@ export type ManagedWorkspaceStatus = {
     runId: string;
     state: ManagedRun["state"];
     undone: boolean;
+    redone: boolean;
     finishedUnixMs: number | null;
   };
 };
@@ -57,13 +76,17 @@ export type LibraryFolder = { id: string; path: string; description: string };
 
 export type LibraryEditOperation =
   | { kind: "add"; path: string; description: string }
-  | { kind: "rename"; id: string; path: string }
+  | { kind: "rename"; id: string; path: string; descendants: "reject" | "cascade" | "reparent" }
   | { kind: "edit_description"; id: string; description: string }
-  | { kind: "delete"; id: string };
+  | { kind: "delete"; id: string; descendants: "reject" | "cascade" | "reparent" };
+
+export type PlannedLibraryEditOperation =
+  | { kind: "add"; id: string; path: string; description: string }
+  | Exclude<LibraryEditOperation, { kind: "add" }>;
 
 export type LibraryEditPreview = {
   token: string;
-  operation: LibraryEditOperation;
+  operations: PlannedLibraryEditOperation[];
   beforeFolders: LibraryFolder[];
   afterFolders: LibraryFolder[];
 };

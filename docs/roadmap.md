@@ -13,20 +13,20 @@ This roadmap records the remaining parity work identified through binary analysi
   - Keep journals, SQLite indexes, and immutable workflow artifacts in the application state directory; only the three user-visible workflow areas and approved destination folders belong under the selected root.
   - Reject obsolete artifacts and state schemas instead of maintaining compatibility or migration paths. Treat obsolete area names as ordinary user directories rather than hidden reserved names.
   - Acceptance: selecting `~/Downloads` does not make its three managed areas eligible as separate roots, and status remains healthy after setup Undo.
-- [ ] **Multi-operation AI Library edit plans** (`temari-core`, CLI, Tauri)
+- [x] **Multi-operation AI Library edit plans** (`temari-core`, CLI, Tauri)
   - Allow one reviewed plan to contain an ordered set of add, rename, description, and delete operations.
   - Validate the complete before/after FolderSet delta and preserve stable IDs across every operation.
   - Keep one atomic binding switch and one Configure Apply/Undo journal for the batch.
   - Acceptance: a stale or partially edited batch is rejected; no physical directory or existing file is changed.
-- [ ] **Nested AI Library editing and subtree policy** (`temari-core`, CLI, Tauri)
+- [x] **Nested AI Library editing and subtree policy** (`temari-core`, CLI, Tauri)
   - Add an explicit policy for renaming or deleting a parent with approved descendants: cascade, reparent, or reject.
   - Display the affected subtree in the preview and require exact confirmation.
   - Acceptance: no orphaned destination IDs, duplicate paths, or implicit physical moves.
-- [ ] **AI Library edit Redo** (`temari-core`, CLI, Tauri)
+- [x] **AI Library edit Redo** (`temari-core`, CLI, Tauri)
   - Add a journal-backed Redo transition for a completed Configure Undo.
   - Reject Redo after a newer configuration revision or conflicting workspace change.
   - Acceptance: Undo/Redo remains deterministic across restart and does not accept caller-supplied journal paths.
-- [ ] **Continuous monitoring UX** (Tauri)
+- [x] **Continuous monitoring UX** (Tauri)
   - Show pending, waiting, eligible, running, failed, and recoverable states per workspace.
   - Expose the next eligibility time and the reason a file is waiting.
   - Acceptance: every displayed action maps to an existing finite Core service; no resident daemon is introduced implicitly.

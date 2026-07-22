@@ -104,6 +104,7 @@ pub fn run() {
             managed_api::managed_preview_library_edit,
             managed_api::managed_apply_library_edit,
             managed_api::managed_undo_library_edit,
+            managed_api::managed_redo_library_edit,
             managed_api::managed_resume_library_edit,
             managed_api::managed_get_workspace,
             managed_api::managed_set_workspace_enabled,

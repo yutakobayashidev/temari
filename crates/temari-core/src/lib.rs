@@ -9,6 +9,7 @@ mod managed;
 mod managed_cycle;
 mod managed_library;
 mod managed_service;
+mod managed_status;
 mod model;
 mod monitor;
 mod plan;
@@ -55,12 +56,18 @@ pub use managed_cycle::{
     recents_file_candidates, reprocess_file_candidates, root_file_candidates,
 };
 pub use managed_library::{
-    ManagedLibraryEdit, ManagedLibraryEditPlan, ManagedLibraryEditSession, ManagedLibraryEditState,
+    ManagedDescendantPolicy, ManagedLibraryEdit, ManagedLibraryEditDraft, ManagedLibraryEditPlan,
+    ManagedLibraryEditRedoSession, ManagedLibraryEditSession, ManagedLibraryEditState,
     ManagedLibraryEditUndoSession,
 };
 pub use managed_service::{
     ManagedActivationResult, ManagedCycleResult, ManagedDirectoryAdoption,
-    ManagedLibraryEditResult, ManagedLibraryEditUndoResult, ManagedService,
+    ManagedLibraryEditRedoResult, ManagedLibraryEditResult, ManagedLibraryEditUndoResult,
+    ManagedService,
+};
+pub use managed_status::{
+    ManagedActivity, ManagedActivityRunSnapshot, ManagedActivitySnapshot, ManagedQueueSnapshot,
+    ManagedWorkspaceSnapshot, WaitingFileSnapshot, WaitingReason, build_workspace_snapshot,
 };
 pub use model::{
     Classification, ClassificationBasis, Classifier, ContentCandidate, FolderProposer,

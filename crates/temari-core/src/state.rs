@@ -738,7 +738,7 @@ impl StateStore {
         expected_sha256: &str,
         replacement_path: &str,
         replacement_sha256: &str,
-        removed_destination_id: Option<&str>,
+        removed_destination_ids: &[&str],
         updated_unix_ms: i64,
     ) -> Result<ManagedWorkspace, Error> {
         validate_absolute_path("expected FolderSet path", expected_path)?;
@@ -783,7 +783,7 @@ impl StateStore {
                 "AI Library editing requires every managed run to be finished".into(),
             ));
         }
-        if let Some(destination_id) = removed_destination_id {
+        for destination_id in removed_destination_ids {
             let referenced: bool = transaction.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM rules

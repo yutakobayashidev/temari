@@ -11,10 +11,10 @@ The native flow is:
 3. Review the backend-held setup preview: existing directories go to `Manual Library`, loose files go to `Recents`, and approved destinations are created below `AI Library`.
 4. Confirm and apply that exact preview, creating durable setup artifacts and registering the workspace in the shared SQLite state.
 5. Run explicit finite cycles that adopt new root directories, stage new files, and classify eligible Recents files.
-6. Inspect workspace health, Recents deadlines, actionable runs, and detailed move history.
+6. Inspect workspace health, per-file Recents waiting reasons, next eligibility, actionable runs, and detailed move history. Visible windows refresh finite read-only snapshots every 30 seconds; hidden windows and open editors do not poll.
 7. Reprocess selected `Manual Library` or `AI Library` entries through Recents when classification should run again.
 8. Undo a completed run or one selected move with a separate durable Undo journal.
-9. Pause a workspace to review and apply one logical AI Library destination edit, then Undo that Configure session when needed.
+9. Pause a workspace to review an ordered batch of logical AI Library edits, including explicit subtree behavior, then Apply, Undo, or Redo that Configure session.
 
 ## Trust boundary
 
@@ -23,11 +23,11 @@ The native flow is:
 - The canonical model configuration path is stored with the workspace and revalidated before runs. Manual runs and generated schedules therefore use the same model and privacy policy selected during setup.
 - `ManagedService` owns workspace activation, binding validation, private artifact directories, Recents reconciliation, stage/classify persistence, Apply finalization, directory adoption, and explicit reprocessing for both CLI and desktop.
 - Managed filesystem and model operations run on blocking workers instead of the Tauri event loop.
-- Workspace status is computed by the backend from physical Recents, indexed deadlines, and actionable runs. IPC responses use explicit camel-case view types rather than exposing database records.
+- Workspace status is computed by Core from physical Recents, indexed deadlines, and actionable runs. IPC responses use explicit camel-case view types and omit internal artifact paths rather than exposing database records.
 - History merges immutable file Apply/Undo journals and directory-adoption setup/Undo journals. File moves support session or individual Undo; directory adoption supports session Undo only so managed areas remain intact. Undo allocates the journal path in the backend and reconciles SQLite only after filesystem outcomes are known.
-- AI Library structure editing exposes only model-visible destinations. Add, Rename, Description, and Delete produce a new immutable `FolderSet` revision while preserving existing opaque IDs. Apply atomically updates the monitor and workspace bindings from a backend-held preview token.
+- AI Library structure editing exposes only model-visible destinations. An ordered batch of Add, Rename, Description, and Delete operations produces one immutable `FolderSet` revision while preserving existing opaque IDs. Parent edits require an explicit reject, cascade, or reparent policy. The confirmation shows the exact backend-produced before/after delta, including affected descendants, before Apply atomically consumes the preview token and updates both bindings.
 - AI Library edits are logical configuration changes: they do not rename directories or move existing files. The editor links back to Reprocess when existing files should pass through Recents under the revised structure.
-- Configure Apply and Undo require a disabled workspace. System fallbacks, the final visible destination, active-rule targets, stale previews, and workspaces with unfinished runs are rejected.
+- Configure Apply, Undo, and Redo require a disabled workspace. System fallbacks, the final visible destination, active-rule targets anywhere in a removed subtree, stale previews, newer revisions, and workspaces with unfinished runs are rejected.
 - New root directories are moved to `Manual Library`. A classified file manually returned to the root retains its processed identity and is left in place until the user explicitly requests reprocessing.
 - Setup rejects a managed area or any directory below one before requesting a folder proposal. The same activation boundary remains enforced in `temari-core`; a native picker never grants a selected path authority by itself.
 - OS scheduling uses `temari-schedule`, creates shell-free systemd or launchd definitions, and requires an explicitly selected stable Temari CLI executable. Setup never installs a schedule implicitly.
@@ -56,7 +56,7 @@ For frontend-only work, start the Vite preview:
 $ corepack pnpm --dir apps/temari-desktop dev
 ```
 
-Outside Tauri, the API adapter uses fixed sample data and simulates Apply and Undo. This browser mode is visually useful but does not access the filesystem, write journals, or prove native model integration.
+Outside Tauri, the API adapter uses fixed sample data and simulates Apply, Undo, and Redo. This browser mode is visually useful but does not access the filesystem, write journals, or prove native model integration.
 
 Run the independent checks with:
 

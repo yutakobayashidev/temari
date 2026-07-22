@@ -88,6 +88,7 @@ let demoLibraryFolders: LibraryFolder[] = [
 let demoLibraryPreview: LibraryEditPreview | null = null;
 let demoLibraryPreviewWorkspaceId: string | null = null;
 let demoLibraryUndoSnapshot: LibraryFolder[] | null = null;
+let demoLibraryRedoSnapshot: LibraryFolder[] | null = null;
 let demoLatestConfiguration: ManagedWorkspaceStatus["latestConfiguration"] = null;
 
 function isTauri(): boolean {
@@ -163,9 +164,19 @@ export async function getManagedWorkspace(workspaceId: string): Promise<ManagedW
         indexedPending: workspaceId === "workspace-downloads" ? 7 : 1,
         indexedPlanned: 0,
         indexedMoved: 34,
-        eligibleNow: workspaceId === "workspace-downloads" ? 2 : 0,
-        nextEligibleUnixMs: now + 42 * 60_000,
       },
+      queue: {
+        pendingRuns: 0,
+        waitingFiles: workspaceId === "workspace-downloads" ? [{
+          relativePath: "Recents/meeting-notes.pdf",
+          sizeBytes: 42_000,
+          eligibleUnixMs: now + 42 * 60_000,
+          reasons: [{ kind: "retention", untilUnixMs: now + 42 * 60_000 }],
+        }] : [],
+        eligibleFiles: workspaceId === "workspace-downloads" ? 2 : 0,
+        nextEligibleUnixMs: workspaceId === "workspace-downloads" ? now + 42 * 60_000 : null,
+      },
+      activity: { state: "idle", run: null },
       runs: { total: 41, actionable: [] },
       libraryFolders: structuredClone(demoLibraryFolders),
       latestConfiguration: structuredClone(demoLatestConfiguration),
@@ -241,21 +252,53 @@ export async function setManagedWorkspaceEnabled(workspaceId: string, enabled: b
   return invoke<ManagedWorkspace>("managed_set_workspace_enabled", { request: { workspaceId }, enabled });
 }
 
+function applyDemoLibraryOperation(folders: LibraryFolder[], operation: LibraryEditPreview["operations"][number]): void {
+  if (operation.kind === "add") {
+    folders.push({ id: operation.id, path: operation.path, description: operation.description });
+    return;
+  }
+  const index = folders.findIndex((folder) => folder.id === operation.id);
+  if (index < 0) throw new Error(`Unknown AI Library destination ${operation.id}.`);
+  if (operation.kind === "edit_description") {
+    folders[index].description = operation.description;
+    return;
+  }
+  const oldPath = folders[index].path;
+  const descendants = folders.filter((folder) => folder.id !== operation.id && folder.path.startsWith(`${oldPath}/`));
+  if (descendants.length && operation.descendants === "reject") {
+    throw new Error("Choose how nested destinations should be handled.");
+  }
+  if (operation.descendants === "cascade" && operation.kind === "rename") {
+    descendants.forEach((folder) => { folder.path = `${operation.path}${folder.path.slice(oldPath.length)}`; });
+  }
+  if (operation.descendants === "reparent") {
+    const parent = oldPath.includes("/") ? oldPath.slice(0, oldPath.lastIndexOf("/")) : "";
+    descendants.forEach((folder) => { folder.path = `${parent ? `${parent}/` : ""}${folder.path.slice(oldPath.length + 1)}`; });
+  }
+  if (operation.kind === "rename") folders[index].path = operation.path;
+  else {
+    const removed = new Set([operation.id, ...(operation.descendants === "cascade" ? descendants.map((folder) => folder.id) : [])]);
+    for (let position = folders.length - 1; position >= 0; position -= 1) {
+      if (removed.has(folders[position].id)) folders.splice(position, 1);
+    }
+  }
+}
+
 export async function previewLibraryEdit(
   workspaceId: string,
-  operation: LibraryEditOperation,
+  operations: LibraryEditOperation[],
 ): Promise<LibraryEditPreview> {
   if (!isTauri()) {
     const after = structuredClone(demoLibraryFolders);
-    if (operation.kind === "add") after.push({ id: `demo-${Date.now()}`, path: operation.path, description: operation.description });
-    if (operation.kind === "rename") after.find((folder) => folder.id === operation.id)!.path = operation.path;
-    if (operation.kind === "edit_description") after.find((folder) => folder.id === operation.id)!.description = operation.description;
-    if (operation.kind === "delete") after.splice(after.findIndex((folder) => folder.id === operation.id), 1);
-    demoLibraryPreview = { token: "demo-library-edit", operation, beforeFolders: structuredClone(demoLibraryFolders), afterFolders: after };
+    const planned = operations.map((operation, index) => operation.kind === "add"
+      ? { ...operation, id: `demo-${Date.now()}-${index}` }
+      : operation);
+    for (const operation of planned) applyDemoLibraryOperation(after, operation);
+    demoLibraryPreview = { token: "demo-library-edit", operations: planned, beforeFolders: structuredClone(demoLibraryFolders), afterFolders: after };
     demoLibraryPreviewWorkspaceId = workspaceId;
     return structuredClone(demoLibraryPreview);
   }
-  return invoke<LibraryEditPreview>("managed_preview_library_edit", { request: { workspaceId, operation } });
+  return invoke<LibraryEditPreview>("managed_preview_library_edit", { request: { workspaceId, operations } });
 }
 
 export async function applyLibraryEdit(previewToken: string): Promise<ManagedWorkspaceStatus> {
@@ -263,11 +306,13 @@ export async function applyLibraryEdit(previewToken: string): Promise<ManagedWor
     if (!demoLibraryPreview || !demoLibraryPreviewWorkspaceId || demoLibraryPreview.token !== previewToken) throw new Error("AI Library edit preview expired.");
     const workspaceId = demoLibraryPreviewWorkspaceId;
     demoLibraryUndoSnapshot = structuredClone(demoLibraryPreview.beforeFolders);
+    demoLibraryRedoSnapshot = structuredClone(demoLibraryPreview.afterFolders);
     demoLibraryFolders = structuredClone(demoLibraryPreview.afterFolders);
     demoLatestConfiguration = {
       runId: `demo-config-${Date.now()}`,
       state: "completed",
       undone: false,
+      redone: false,
       finishedUnixMs: Date.now(),
     };
     demoLibraryPreview = null;
@@ -288,6 +333,18 @@ export async function undoLibraryEdit(workspaceId: string, runId: string): Promi
     return getManagedWorkspace(workspaceId);
   }
   return invoke<ManagedWorkspaceStatus>("managed_undo_library_edit", { request: { workspaceId, runId } });
+}
+
+export async function redoLibraryEdit(workspaceId: string, runId: string): Promise<ManagedWorkspaceStatus> {
+  if (!isTauri()) {
+    if (!demoLatestConfiguration || demoLatestConfiguration.runId !== runId || !demoLibraryRedoSnapshot) {
+      throw new Error("AI Library edit can no longer be redone.");
+    }
+    demoLibraryFolders = structuredClone(demoLibraryRedoSnapshot);
+    demoLatestConfiguration = { ...demoLatestConfiguration, undone: false, redone: true };
+    return getManagedWorkspace(workspaceId);
+  }
+  return invoke<ManagedWorkspaceStatus>("managed_redo_library_edit", { request: { workspaceId, runId } });
 }
 
 export async function resumeLibraryEdit(workspaceId: string, runId: string): Promise<ManagedWorkspaceStatus> {

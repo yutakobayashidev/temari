@@ -15,11 +15,14 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 use temari_core::{
     ApplySession, Config, FolderProposal, FolderProposer, FolderSet, RecentsState,
-    ManagedCycleResult, ManagedLibraryEdit, ManagedLibraryEditPlan, ManagedReprocessArea,
+    ManagedActivitySnapshot, ManagedCycleResult, ManagedLibraryEdit, ManagedLibraryEditDraft,
+    ManagedLibraryEditPlan, ManagedLibraryEditRedoSession, ManagedLibraryEditState,
+    ManagedQueueSnapshot, ManagedReprocessArea,
     ManagedReprocessSelection, ManagedRun, ManagedRunKind, ManagedService, ManagedSetupPlan,
     ManagedSetupSession, ManagedSetupUndoSession, ManagedSetupUndoState, ManagedUndoMoveOutcome,
     ManagedWorkspace, OpenAiCompatibleModel, Proposal, RunState, ScanScope, SourceLock, StateStore,
     UndoMoveOutcome, UndoSession, MANAGED_AREAS, build_managed_setup_plan,
+    build_workspace_snapshot,
     recents_file_candidates, scan_directory, select_representative_files,
     undo_session_files_with_lock, undo_session_with_lock,
     validate_managed_workspace_root_candidate,
@@ -206,7 +209,7 @@ pub(crate) struct ManagedUndoMoveRequest {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct ManagedLibraryEditPreviewRequest {
     pub workspace_id: String,
-    pub operation: ManagedLibraryEdit,
+    pub operations: Vec<ManagedLibraryEditDraft>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,8 +284,6 @@ pub(crate) struct RecentsSummaryView {
     pub indexed_pending: usize,
     pub indexed_planned: usize,
     pub indexed_moved: usize,
-    pub eligible_now: usize,
-    pub next_eligible_unix_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -306,6 +307,7 @@ pub(crate) struct LibraryConfigurationView {
     pub run_id: String,
     pub state: RunState,
     pub undone: bool,
+    pub redone: bool,
     pub finished_unix_ms: Option<i64>,
 }
 
@@ -316,6 +318,8 @@ pub(crate) struct ManagedWorkspaceStatus {
     pub issues: Vec<String>,
     pub workspace: ManagedWorkspaceView,
     pub recents: RecentsSummaryView,
+    pub queue: ManagedQueueSnapshot,
+    pub activity: ManagedActivitySnapshot,
     pub runs: ManagedRunsView,
     pub library_folders: Vec<LibraryFolderView>,
     pub latest_configuration: Option<LibraryConfigurationView>,
@@ -325,7 +329,7 @@ pub(crate) struct ManagedWorkspaceStatus {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LibraryEditPreviewView {
     pub token: String,
-    pub operation: ManagedLibraryEdit,
+    pub operations: Vec<ManagedLibraryEdit>,
     pub before_folders: Vec<LibraryFolderView>,
     pub after_folders: Vec<LibraryFolderView>,
 }
@@ -643,17 +647,16 @@ pub(crate) async fn managed_preview_library_edit(
         drafts.begin_library_edit()
     };
     let token = setup_token("library-edit", revision);
-    let operation = request.operation.clone();
     let plan = tauri::async_runtime::spawn_blocking(move || {
         managed_service()?
-            .preview_library_edit(&request.workspace_id, request.operation)
+            .preview_library_edits(&request.workspace_id, request.operations)
             .map_err(error_text)
     })
     .await
     .map_err(|error| format!("AI Library edit preview task failed: {error}"))??;
     let view = LibraryEditPreviewView {
         token: token.clone(),
-        operation,
+        operations: plan.operations.clone(),
         before_folders: editable_library_folders(&plan.before_folders),
         after_folders: editable_library_folders(&plan.after_folders),
     };
@@ -695,15 +698,31 @@ pub(crate) async fn managed_apply_library_edit(
 pub(crate) async fn managed_undo_library_edit(
     request: ManagedLibraryEditUndoRequest,
 ) -> Result<ManagedWorkspaceStatus, String> {
-    let (state_path, journal_path) = library_edit_undo_path(&request)?;
+    let (state_path, _) = library_edit_undo_path(&request)?;
     let workspace_id = request.workspace_id;
     tauri::async_runtime::spawn_blocking(move || {
         ManagedService::new(&state_path)
-            .undo_library_edit(&request.run_id, &journal_path)
+            .undo_library_edit(&request.run_id)
             .map_err(error_text)
     })
     .await
     .map_err(|error| format!("AI Library edit Undo task failed: {error}"))??;
+    with_store(|store| workspace_status(store, &workspace_id))
+}
+
+#[tauri::command]
+pub(crate) async fn managed_redo_library_edit(
+    request: ManagedLibraryEditUndoRequest,
+) -> Result<ManagedWorkspaceStatus, String> {
+    let (state_path, _) = library_edit_undo_path(&request)?;
+    let workspace_id = request.workspace_id;
+    tauri::async_runtime::spawn_blocking(move || {
+        ManagedService::new(&state_path)
+            .redo_library_edit(&request.run_id)
+            .map_err(error_text)
+    })
+    .await
+    .map_err(|error| format!("AI Library edit Redo task failed: {error}"))??;
     with_store(|store| workspace_status(store, &workspace_id))
 }
 
@@ -724,11 +743,20 @@ pub(crate) async fn managed_resume_library_edit(
             return Err("Configure run does not belong to the requested workspace".into());
         }
         let state = run.state;
+        let redo_pending = run
+            .apply_path
+            .as_deref()
+            .and_then(|path| Path::new(path).parent())
+            .is_some_and(|parent| parent.join("library-edit-redo.json").is_file());
         drop(store);
         let service = ManagedService::new(&state_path);
         match state {
             RunState::Applying => service
                 .resume_library_edit(&request.run_id)
+                .map(|_| ())
+                .map_err(error_text),
+            RunState::NeedsResume if redo_pending => service
+                .resume_library_edit_redo(&request.run_id)
                 .map(|_| ())
                 .map_err(error_text),
             RunState::NeedsResume => service
@@ -934,23 +962,26 @@ fn workspace_status(
         issues.push(format!("{} run(s) need attention", actionable.len()));
     }
     let count_state = |state| recents.iter().filter(|item| item.state == state).count();
-    let eligible_now = recents
-        .iter()
-        .filter(|item| item.state == RecentsState::Pending && item.eligible_unix_ms <= now)
-        .count();
-    let next_eligible_unix_ms = recents
-        .iter()
-        .filter(|item| item.state == RecentsState::Pending && item.eligible_unix_ms > now)
-        .map(|item| item.eligible_unix_ms)
-        .min();
+    let snapshot = build_workspace_snapshot(&workspace, &recents, &runs, now);
     let latest_configuration = runs
         .iter()
         .find(|run| run.kind == ManagedRunKind::Configure)
-        .map(|run| LibraryConfigurationView {
-            run_id: run.id.clone(),
-            state: run.state,
-            undone: run.undo_path.is_some() && run.state == RunState::Completed,
-            finished_unix_ms: run.finished_unix_ms,
+        .map(|run| {
+            let redone = run
+                .apply_path
+                .as_deref()
+                .and_then(|path| Path::new(path).parent())
+                .map(|parent| parent.join("library-edit-redo.json"))
+                .filter(|path| path.is_file())
+                .and_then(|path| ManagedLibraryEditRedoSession::load(&path).ok())
+                .is_some_and(|session| session.state == ManagedLibraryEditState::Completed);
+            LibraryConfigurationView {
+                run_id: run.id.clone(),
+                state: run.state,
+                undone: run.undo_path.is_some() && run.state == RunState::Completed && !redone,
+                redone,
+                finished_unix_ms: run.finished_unix_ms,
+            }
         });
     let health = if !issues.is_empty() {
         "attention"
@@ -968,9 +999,9 @@ fn workspace_status(
             indexed_pending: count_state(RecentsState::Pending),
             indexed_planned: count_state(RecentsState::Planned),
             indexed_moved: count_state(RecentsState::Moved),
-            eligible_now,
-            next_eligible_unix_ms,
         },
+        queue: snapshot.queue,
+        activity: snapshot.activity,
         runs: ManagedRunsView {
             total: runs.len(),
             actionable,
@@ -1892,12 +1923,12 @@ timeout_seconds = 2
             .set_managed_workspace_enabled(&activation.workspace.id, false, unix_ms().unwrap())
             .unwrap();
         let plan = service
-            .preview_library_edit(
+            .preview_library_edits(
                 &activation.workspace.id,
-                ManagedLibraryEdit::Add {
+                vec![ManagedLibraryEditDraft::Add {
                     path: "Research".into(),
                     description: "Research material".into(),
-                },
+                }],
             )
             .unwrap();
         let mut drafts = ManagedDrafts::default();
@@ -1922,13 +1953,7 @@ timeout_seconds = 2
             status.latest_configuration.as_ref().unwrap().run_id,
             applied.run.id
         );
-        let undo_path = Path::new(applied.run.apply_path.as_deref().unwrap())
-            .parent()
-            .unwrap()
-            .join("library-edit-undo.json");
-        service
-            .undo_library_edit(&applied.run.id, &undo_path)
-            .unwrap();
+        service.undo_library_edit(&applied.run.id).unwrap();
         let status = get_workspace_at(&state_path, &activation.workspace.id).unwrap();
         assert!(
             !status
@@ -1937,6 +1962,18 @@ timeout_seconds = 2
                 .any(|folder| folder.path == "Research")
         );
         assert!(status.latest_configuration.unwrap().undone);
+
+        service.redo_library_edit(&applied.run.id).unwrap();
+        let status = get_workspace_at(&state_path, &activation.workspace.id).unwrap();
+        assert!(
+            status
+                .library_folders
+                .iter()
+                .any(|folder| folder.path == "Research")
+        );
+        let latest = status.latest_configuration.unwrap();
+        assert!(latest.redone);
+        assert!(!latest.undone);
     }
 
     #[test]

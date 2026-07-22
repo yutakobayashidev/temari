@@ -230,10 +230,16 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .library-editor-rows { display: grid; gap: 8px; }
 .library-editor-rows article { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 7px 10px; padding: 12px; border: 1px solid var(--line); border-radius: 6px; }
 .library-editor-rows label { display: grid; gap: 4px; color: var(--muted); font-size: 8px; }
-.library-editor-rows input, .library-add input { min-width: 0; height: 34px; padding: 0 8px; font-size: 9px; }
+.library-editor-rows input, .library-editor-rows select, .library-add input { min-width: 0; height: 34px; padding: 0 8px; font-size: 9px; }
+.library-editor-rows .toggle-row { display: flex; }
 .library-editor-rows .danger-text { grid-column: 2; color: #8b4c46; }
 .library-add { display: grid; grid-template-columns: .8fr 1.2fr auto; gap: 8px; align-items: end; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
 .library-add .eyebrow { grid-column: 1 / -1; margin: 0; }
+
+.waiting-files { display: grid; gap: 1px; margin-top: 10px; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--line); }
+.waiting-files div { display: grid; grid-template-columns: minmax(120px,.8fr) minmax(0,1.2fr); gap: 12px; padding: 9px 11px; background: rgba(255,255,255,.78); }
+.waiting-files strong { font: 9px "SFMono-Regular", Consolas, monospace; overflow-wrap: anywhere; }
+.waiting-files span { color: var(--muted); font-size: 9px; }
 
 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid #6e7f9f; outline-offset: 2px; }
 

@@ -13,9 +13,10 @@ temari [global options] managed list|status|enable|disable|edit|remove|reconcile
 temari [global options] managed run|reprocess|schedule|apply-run|resume-run|history|undo ...
 temari [global options] managed rule add|list|enable|disable|remove ...
 temari [global options] managed library show <WORKSPACE_ID> --out <FOLDER_SET|->
-temari [global options] managed library plan <WORKSPACE_ID> --out <PLAN> add|rename|describe|delete ...
+temari [global options] managed library plan <WORKSPACE_ID> --out <PLAN> add|rename|describe|delete|batch ...
 temari [global options] managed library apply <PLAN> [--yes]
 temari [global options] managed library undo <WORKSPACE_ID> <RUN_ID> [--yes]
+temari [global options] managed library redo <WORKSPACE_ID> <RUN_ID> [--yes]
 temari [global options] managed library resume <WORKSPACE_ID> <RUN_ID>
 temari [global options] managed undo-setup|resume-setup ...
 temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...
@@ -118,8 +119,8 @@ temari [global options] resume <APPLY_SESSION> [--yes]
 - `resume-run` conservatively reconciles a running directory-adoption or file Apply journal, then synchronizes mutable indexes before marking the managed run completed. A completed filesystem Apply with interrupted index finalization remains resumable. Failed and partial-failure journals are not mislabeled as resumable, and other terminal runs are immutable.
 - `history` lists each recent indexed file move or root-directory adoption with its original path, destination, and Undo state. `undo` restores a directory-adoption session as a whole without removing `Manual Library`, `Recents`, or `AI Library`; for file runs it restores either the complete session or repeated `--file <FILE_ID_OR_SOURCE_PATH>` selections. It keeps the source lock through atomic journal and Recents reconciliation. Every individual file Undo journal is indexed without replacing earlier Undo state, and selected-file Undo never removes shared directories.
 - `rule` manages case-insensitive basename globs for one workspace. Rules select reviewed opaque destination IDs, run before model classification, use descending priority and stable rule-ID ordering, and never store executable paths.
-- `library show` exports the current approved FolderSet. `library plan add|rename|describe|delete` is read-only and writes an immutable edit Plan; `library apply` separately confirms and applies that reviewed Plan. AI Library edits require a disabled workspace and update only logical FolderSet revisions and the workspace binding. They never move files or rename or delete physical directories.
-- Each completed AI Library Configure run owns its Apply and Undo journals. `library undo` accepts a workspace ID and run ID, derives the journal path from that run, and requires confirmation. `library resume` verifies workspace ownership and resumes Apply from an `applying` run or Undo from a `needs_resume` run; terminal runs remain immutable.
+- `library show` exports the current approved FolderSet. `library plan add|rename|describe|delete` builds a read-only immutable Plan for one operation; `library plan batch --operations <JSON>` accepts an ordered array of draft operations. Core assigns Add IDs, replays every operation, and records the exact before/after FolderSet. Rename and Delete accept `--descendants reject|cascade|reparent`, defaulting to reject. AI Library edits require a disabled workspace and update only logical FolderSet revisions and the workspace binding. They never move files or rename or delete physical directories.
+- Each completed AI Library Configure run owns fixed Apply, Undo, and Redo journals. `library undo` and `library redo` accept a workspace ID and run ID, derive journal paths from that run, and require confirmation. `library resume` verifies workspace ownership and resumes Apply from an `applying` run or dispatches the run-owned Undo or Redo journal from a `needs_resume` run. Redo is rejected after a newer Configure run.
 - `undo-setup` and `resume-setup` operate only from their versioned setup journals. Setup Undo refuses a changed Manual Library directory, occupied original path, or changed area identity.
 - SQLite stores mutable retention and history indexes only. Setup Plans, normal Plans, Apply sessions, and Undo sessions remain authoritative JSON artifacts outside the managed source.
 - Only the current area layout and SQLite schema are supported. Earlier experimental artifacts and databases are rejected; no public migration command or automatic upgrade path exists.
