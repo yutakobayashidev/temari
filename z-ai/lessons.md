@@ -31,3 +31,8 @@
 - When the user authorizes a concrete implementation, do not repeatedly stop at plans or partial status reports. Continue through code, verification, documentation, and commit unless a genuine external blocker requires user input.
 - Browser demo state must preserve the selected workspace identity across preview and Apply, and should model the resulting recovery metadata; otherwise UI E2E can pass against a different workspace or cannot exercise Undo.
 - When a public-release request does not specify licensing terms, keep the license explicitly TBD and blocking; do not infer a proprietary or open-source grant from repository visibility.
+
+# UI design
+
+- When the user asks for minimalism, remove repeated cards, shadows, decorative badges, and fake controls before reducing functionality. Let whitespace, typography, and one restrained signature carry the hierarchy.
+- For an explicit commit-and-push request that does not include a pull request, do not block on GitHub CLI authentication when ordinary Git credentials may still support the requested push.

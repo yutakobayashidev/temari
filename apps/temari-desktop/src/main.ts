@@ -316,12 +316,10 @@ function dashboard(): string {
       <aside class="control-panel">
         <section>
           <div class="control-heading"><div><p class="eyebrow">Timing</p><h2>Waiting room</h2></div></div>
-          <label class="field"><span>Keep new files in Recents</span><select id="retention-days" disabled>
-            ${[1, 2, 3, 5, 7, 14].map((days) => `<option value="${days}" ${workspace.retentionSeconds === days * 86_400 ? "selected" : ""}>${days} ${days === 1 ? "day" : "days"}</option>`).join("")}
-          </select></label>
-          <label class="field"><span>Wait until unchanged</span><select id="settle-seconds" disabled>
-            ${[10, 30, 60, 300].map((seconds) => `<option value="${seconds}" ${workspace.settleSeconds === seconds ? "selected" : ""}>${formatDuration(seconds)}</option>`).join("")}
-          </select></label>
+          <dl class="timing-values">
+            <div><dt>Keep new files in Recents</dt><dd>${escapeHtml(formatDuration(workspace.retentionSeconds))}</dd></div>
+            <div><dt>Wait until unchanged</dt><dd>${escapeHtml(formatDuration(workspace.settleSeconds))}</dd></div>
+          </dl>
           <label class="toggle-row"><span><strong>Watch this folder</strong><small>Allow scheduled and manual runs</small></span><input id="workspace-enabled" type="checkbox" ${workspace.enabled ? "checked" : ""} /></label>
           <p class="field-note">Timing is shown here; edit it with the managed CLI for now.</p>
           <button class="secondary-button" id="save-settings" type="button">Save watch state</button>
@@ -355,9 +353,10 @@ function setupDialog(): string {
     <div class="sheet-backdrop" data-close-setup></div>
     <section class="sheet-card">
       <button class="dialog-close" data-close-setup aria-label="Close" type="button">×</button>
-      <p class="eyebrow">Add a managed folder · ${sourceStep ? "1" : structureStep ? "2" : "3"} of 3</p>
-      <h2 id="setup-title">${sourceStep ? "Choose one folder" : structureStep ? "Approve its AI Library" : "Review the exact setup"}</h2>
-      ${sourceStep ? `
+      <div class="setup-step">
+        <p class="eyebrow">Add a managed folder · ${sourceStep ? "1" : structureStep ? "2" : "3"} of 3</p>
+        <h2 id="setup-title">${sourceStep ? "Choose one folder" : structureStep ? "Approve its AI Library" : "Review the exact setup"}</h2>
+        ${sourceStep ? `
         <p>Each folder stays independent and gets its own Manual Library, Recents, and AI Library.</p>
         ${state.defaultSources.length ? `<div class="source-suggestions" aria-label="Suggested folders">
           <div><strong>Common places</strong><span>Suggestions only · nothing is added until Apply</span></div>
@@ -380,6 +379,7 @@ function setupDialog(): string {
         <div class="setup-summary"><div><strong>${state.setupPreview!.directories.length}</strong><span>Folders created</span></div><div><strong>${state.setupPreview!.moves.length}</strong><span>Initial moves</span></div></div>
         <div class="setup-moves">${state.setupPreview!.moves.map((move) => `<div><span>${escapeHtml(move.sourcePath)}</span><b>→</b><strong>${escapeHtml(move.destinationPath)}</strong></div>`).join("")}</div>
         <button class="primary-button full" id="apply-workspace" type="button">Apply this setup</button>` : ""}
+      </div>
     </section>
   </dialog>`;
 }
@@ -436,7 +436,111 @@ function confirmationDialog(): string {
   </dialog>`;
 }
 
+const EASE_OUT = "cubic-bezier(0.23, 1, 0.32, 1)";
+const DIALOG_ENTER_MS = 220;
+const DIALOG_EXIT_MS = 160;
+let animateSetupStepOnNextRender = false;
+let pointerInitiated = true;
+const closingDialogs = new WeakMap<HTMLDialogElement, Promise<void>>();
+
+document.addEventListener("pointerdown", (event) => {
+  pointerInitiated = true;
+  const button = event.target instanceof Element ? event.target.closest<HTMLButtonElement>("button") : null;
+  if (button && !button.disabled) button.dataset.pointerActive = "";
+}, true);
+
+document.addEventListener("keydown", () => {
+  pointerInitiated = false;
+}, true);
+
+for (const eventName of ["pointerup", "pointercancel"] as const) {
+  document.addEventListener(eventName, () => {
+    document.querySelectorAll<HTMLElement>("[data-pointer-active]").forEach((element) => {
+      delete element.dataset.pointerActive;
+    });
+  }, true);
+}
+
+function dialogSurface(dialog: HTMLDialogElement): HTMLElement | null {
+  return dialog.querySelector<HTMLElement>(".sheet-card, :scope > form, :scope > section");
+}
+
+function animateDialogEntry(previousDialogId: string | null): void {
+  const dialog = document.querySelector<HTMLDialogElement>("dialog[open]");
+  if (!dialog || dialog.id === previousDialogId || !pointerInitiated) return;
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  dialog.animate([{ opacity: 0 }, { opacity: 1 }], {
+    duration: DIALOG_ENTER_MS,
+    easing: EASE_OUT,
+  });
+  if (!reduced) {
+    dialogSurface(dialog)?.animate(
+      [{ transform: "scale(0.97)" }, { transform: "scale(1)" }],
+      { duration: DIALOG_ENTER_MS, easing: EASE_OUT },
+    );
+  }
+}
+
+function closeDialog(dialogId: string, close: () => void): Promise<void> {
+  const dialog = document.querySelector<HTMLDialogElement>(`#${dialogId}`);
+  if (!dialog) return Promise.resolve();
+  const pendingClose = closingDialogs.get(dialog);
+  if (pendingClose) return pendingClose;
+  if (!pointerInitiated) {
+    close();
+    render();
+    return Promise.resolve();
+  }
+
+  const completion = (async () => {
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const surface = dialogSurface(dialog);
+    const currentOpacity = getComputedStyle(dialog).opacity;
+    const currentTransform = surface ? getComputedStyle(surface).transform : "none";
+    for (const element of [dialog, surface]) {
+      element?.getAnimations().forEach((animation) => animation.cancel());
+    }
+    const animations = [dialog.animate(
+      [{ opacity: currentOpacity }, { opacity: 0 }],
+      { duration: DIALOG_EXIT_MS, easing: EASE_OUT },
+    )];
+    if (surface && !reduced) {
+      animations.push(surface.animate(
+        [{ transform: currentTransform }, { transform: "scale(0.98)" }],
+        { duration: DIALOG_EXIT_MS, easing: EASE_OUT },
+      ));
+    }
+    await Promise.all(animations.map((animation) => animation.finished.catch(() => undefined)));
+    close();
+    render();
+  })();
+  closingDialogs.set(dialog, completion);
+  return completion;
+}
+
+function animateSetupStep(): void {
+  if (!animateSetupStepOnNextRender) return;
+  animateSetupStepOnNextRender = false;
+  if (!pointerInitiated) return;
+  const step = document.querySelector<HTMLElement>("#setup-dialog .setup-step");
+  if (!step) return;
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  step.animate(
+    reduced
+      ? [{ opacity: 0 }, { opacity: 1 }]
+      : [
+          { opacity: 0, transform: "translateY(4px)" },
+          { opacity: 1, transform: "translateY(0)" },
+        ],
+    {
+      duration: 180,
+      easing: EASE_OUT,
+    },
+  );
+}
+
 function render(): void {
+  const previousDialogId = document.querySelector<HTMLDialogElement>("dialog[open]")?.id ?? null;
   app.innerHTML = `<div class="app-shell">
     <header class="topbar">
       <a class="wordmark" href="#" aria-label="Temari home"><span class="wordmark-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>temari</span></a>
@@ -450,6 +554,8 @@ function render(): void {
     ${state.busy && !state.status && state.workspaces.length === 0 ? `<main class="loading-state">Loading managed folders…</main>` : dashboard()}
   </div>${setupDialog()}${libraryEditDialog()}${reprocessDialog()}${confirmationDialog()}`;
   bindEvents();
+  animateDialogEntry(previousDialogId);
+  animateSetupStep();
 }
 
 function setBusy(busy: boolean): void {
@@ -533,31 +639,36 @@ async function reviewLibraryEdits(operations: LibraryEditOperation[]): Promise<v
     render();
     return;
   }
+  let handedOff = false;
   setBusy(true);
   try {
     const preview = await previewLibraryEdit(state.status.workspace.id, operations);
     const exactChanges = libraryDiffDetails(preview);
     state.libraryEditPreview = preview;
-    state.libraryEditOpen = false;
-    askForConfirmation({
-      title: `Apply ${operations.length} AI Library structure change${operations.length === 1 ? "" : "s"}?`,
-      copy: "Only the approved structure changes. Existing files do not move; use Reprocess when they should be organized again.",
-      details: [
-        ...exactChanges,
-        ["Result", `${preview.beforeFolders.length} → ${preview.afterFolders.length} destinations`],
-      ],
-      confirmLabel: "Apply structure edit",
-      action: async () => {
-        await applyLibraryEdit(preview.token);
-        state.libraryEditPreview = null;
-        await refreshSelected("AI Library structure updated. Existing files were not moved.");
-      },
+    state.busy = false;
+    await closeDialog("library-edit-dialog", () => {
+      state.libraryEditOpen = false;
+      state.pendingConfirmation = {
+        title: `Apply ${operations.length} AI Library structure change${operations.length === 1 ? "" : "s"}?`,
+        copy: "Only the approved structure changes. Existing files do not move; use Reprocess when they should be organized again.",
+        details: [
+          ...exactChanges,
+          ["Result", `${preview.beforeFolders.length} → ${preview.afterFolders.length} destinations`],
+        ],
+        confirmLabel: "Apply structure edit",
+        action: async () => {
+          await applyLibraryEdit(preview.token);
+          state.libraryEditPreview = null;
+          await refreshSelected("AI Library structure updated. Existing files were not moved.");
+        },
+      };
     });
+    handedOff = true;
   } catch (error) {
     state.notice = { tone: "error", message: formatError(error) };
   } finally {
     state.busy = false;
-    render();
+    if (!handedOff) render();
   }
 }
 
@@ -615,13 +726,14 @@ function bindEvents(): void {
     render();
   }));
   document.querySelectorAll<HTMLElement>("[data-close-setup]").forEach((button) => button.addEventListener("click", () => {
-    state.setupOpen = false;
-    render();
+    void closeDialog("setup-dialog", () => { state.setupOpen = false; });
   }));
   document.querySelectorAll<HTMLButtonElement>("[data-workspace-id]").forEach((button) => button.addEventListener("click", () => void loadWorkspace(button.dataset.workspaceId!)));
 
   document.querySelector("#open-library-editor")?.addEventListener("click", () => { state.libraryEditOpen = true; render(); });
-  document.querySelectorAll("[data-close-library-edit]").forEach((button) => button.addEventListener("click", () => { state.libraryEditOpen = false; render(); }));
+  document.querySelectorAll("[data-close-library-edit]").forEach((button) => button.addEventListener("click", () => {
+    void closeDialog("library-edit-dialog", () => { state.libraryEditOpen = false; });
+  }));
   document.querySelector("#review-library-batch")?.addEventListener("click", () => {
     if (!state.status) return;
     const originals = new Map(state.status.libraryFolders.map((folder) => [folder.id, folder]));
@@ -723,6 +835,7 @@ function bindEvents(): void {
     setBusy(true);
     try {
       state.proposal = await proposeManagedWorkspace(state.setupSource, state.configPath);
+      animateSetupStepOnNextRender = pointerInitiated;
       state.setupStep = "structure";
     } catch (error) {
       state.notice = { tone: "error", message: formatError(error) };
@@ -739,6 +852,7 @@ function bindEvents(): void {
     setBusy(true);
     try {
       state.setupPreview = await previewManagedWorkspace(state.proposal, retentionDays * 86_400, settleSeconds);
+      animateSetupStepOnNextRender = pointerInitiated;
       state.setupStep = "preview";
     } catch (error) {
       state.notice = { tone: "error", message: formatError(error) };
@@ -750,21 +864,23 @@ function bindEvents(): void {
   document.querySelector("#apply-workspace")?.addEventListener("click", () => {
     if (!state.setupPreview) return;
     const preview = state.setupPreview;
-    state.setupOpen = false;
-    askForConfirmation({
-      title: `Set up ${basename(preview.source)}?`,
-      copy: "Temari will create Manual Library, Recents, and AI Library, then perform only the moves shown in the reviewed setup.",
-      details: [["Folder", preview.source], ["Initial moves", String(preview.moves.length)], ["Directories", String(preview.directories.length)]],
-      confirmLabel: "Apply reviewed setup",
-      action: async () => {
-        const result = await applyManagedWorkspace(preview.token);
-        state.workspaces = await listManagedWorkspaces();
-        state.selectedId = result.workspace.id;
-        state.status = result;
-        state.schedule = await loadSchedule(result.workspace.id);
-        state.history = [];
-        state.notice = { tone: "success", message: "Managed folder created. Its initial moves are journaled." };
-      },
+    void closeDialog("setup-dialog", () => {
+      state.setupOpen = false;
+      state.pendingConfirmation = {
+        title: `Set up ${basename(preview.source)}?`,
+        copy: "Temari will create Manual Library, Recents, and AI Library, then perform only the moves shown in the reviewed setup.",
+        details: [["Folder", preview.source], ["Initial moves", String(preview.moves.length)], ["Directories", String(preview.directories.length)]],
+        confirmLabel: "Apply reviewed setup",
+        action: async () => {
+          const result = await applyManagedWorkspace(preview.token);
+          state.workspaces = await listManagedWorkspaces();
+          state.selectedId = result.workspace.id;
+          state.status = result;
+          state.schedule = await loadSchedule(result.workspace.id);
+          state.history = [];
+          state.notice = { tone: "success", message: "Managed folder created. Its initial moves are journaled." };
+        },
+      };
     });
   });
 
@@ -826,7 +942,9 @@ function bindEvents(): void {
   });
 
   document.querySelector("#open-reprocess")?.addEventListener("click", () => { state.reprocessOpen = true; render(); });
-  document.querySelectorAll("[data-close-reprocess]").forEach((button) => button.addEventListener("click", () => { state.reprocessOpen = false; render(); }));
+  document.querySelectorAll("[data-close-reprocess]").forEach((button) => button.addEventListener("click", () => {
+    void closeDialog("reprocess-dialog", () => { state.reprocessOpen = false; });
+  }));
   document.querySelector("#reprocess-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
     if (!state.status) return;
@@ -834,17 +952,19 @@ function bindEvents(): void {
     const paths = (document.querySelector("#reprocess-paths") as HTMLTextAreaElement).value.split("\n").map((path) => path.trim()).filter(Boolean);
     if (paths.length === 0) return;
     const workspaceId = state.status.workspace.id;
-    state.reprocessOpen = false;
-    askForConfirmation({
-      title: `Return ${paths.length} selection${paths.length === 1 ? "" : "s"} to Recents?`,
-      copy: "This reviewed step does not classify directly from Manual Library or AI Library. A later run handles eligible Recents files.",
-      details: [["From", area === "manual_library" ? "Manual Library" : "AI Library"], ["Selections", paths.join(", ")]],
-      confirmLabel: "Apply return to Recents",
-      action: async () => {
-        const result = await reprocessManagedFiles(workspaceId, area, paths);
-        const moved = result.runs.reduce((total, run) => total + run.moveCount, 0);
-        await refreshSelected(`${moved} selection${moved === 1 ? "" : "s"} returned to Recents.`);
-      },
+    void closeDialog("reprocess-dialog", () => {
+      state.reprocessOpen = false;
+      state.pendingConfirmation = {
+        title: `Return ${paths.length} selection${paths.length === 1 ? "" : "s"} to Recents?`,
+        copy: "This reviewed step does not classify directly from Manual Library or AI Library. A later run handles eligible Recents files.",
+        details: [["From", area === "manual_library" ? "Manual Library" : "AI Library"], ["Selections", paths.join(", ")]],
+        confirmLabel: "Apply return to Recents",
+        action: async () => {
+          const result = await reprocessManagedFiles(workspaceId, area, paths);
+          const moved = result.runs.reduce((total, run) => total + run.moveCount, 0);
+          await refreshSelected(`${moved} selection${moved === 1 ? "" : "s"} returned to Recents.`);
+        },
+      };
     });
   });
 
@@ -877,7 +997,9 @@ function bindEvents(): void {
     });
   }));
 
-  document.querySelectorAll("[data-cancel-confirmation]").forEach((button) => button.addEventListener("click", () => { state.pendingConfirmation = null; render(); }));
+  document.querySelectorAll("[data-cancel-confirmation]").forEach((button) => button.addEventListener("click", () => {
+    void closeDialog("confirmation-dialog", () => { state.pendingConfirmation = null; });
+  }));
   document.querySelector("#confirm-action")?.addEventListener("click", () => void performConfirmation());
 }
 
