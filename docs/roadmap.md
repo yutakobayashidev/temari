@@ -6,12 +6,13 @@ This roadmap records the remaining parity work identified through binary analysi
 
 ### P0 — make the current managed workflow complete
 
-- [ ] **Separate user roots from internal workflow state** (Core, CLI, Tauri)
-  - Treat `Desktop`, `Downloads`, and optionally `Documents` as default suggestions only, never as implicit registrations.
-  - Reject registering a managed area or a nested root beneath an existing workspace unless the user explicitly converts it through a reviewed migration.
-  - Stop creating fixed `Kept`, `Inbox`, and `Library` directories in the user's selected root by default. Represent Manual, Recents, and Library as logical areas; create only approved destination folders and keep journals/indexes in the application state directory.
-  - Define an explicit migration and recovery path for the current three-directory workspaces before changing the default.
-  - Acceptance: selecting `~/Downloads` does not make `~/Downloads/Kept`, `~/Downloads/Inbox`, or `~/Downloads/Library` eligible as separate roots, and status remains healthy after a setup Undo.
+- [ ] **Separate default roots from app-managed areas** (Core, CLI, Tauri)
+  - Treat `Desktop`, `Downloads`, and optionally `Documents` as default onboarding suggestions, never as implicit registrations.
+  - Preserve the physical three-area workflow, but use product terminology aligned with the analyzed behavior: Manual Library, Recents, and AI Library.
+  - Reject registering a managed area or a nested root beneath an existing workspace; recognize existing app-managed areas by the setup journal, filesystem identity, and reserved-area metadata.
+  - Keep journals, SQLite indexes, and immutable workflow artifacts in the application state directory; only the three user-visible workflow areas and approved destination folders belong under the selected root.
+  - Define an explicit migration and recovery path for current `Kept/Inbox/Library` names, including setup Undo and stale planned runs.
+  - Acceptance: selecting `~/Downloads` does not make its three managed areas eligible as separate roots, and status remains healthy after setup Undo.
 - [ ] **Multi-operation Library edit plans** (`temari-core`, CLI, Tauri)
   - Allow one reviewed plan to contain an ordered set of add, rename, description, and delete operations.
   - Validate the complete before/after FolderSet delta and preserve stable IDs across every operation.
