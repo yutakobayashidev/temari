@@ -19,9 +19,8 @@ use temari_core::{
     ManagedReprocessSelection, ManagedRun, ManagedRunKind, ManagedService, ManagedSetupPlan,
     ManagedSetupSession, ManagedSetupUndoSession, ManagedSetupUndoState, ManagedUndoMoveOutcome,
     ManagedWorkspace, OpenAiCompatibleModel, Proposal, RunState, ScanScope, SourceLock, StateStore,
-    UndoMoveOutcome, UndoSession,
-    build_managed_setup_plan, inbox_file_candidates, scan_directory, select_representative_files,
-    undo_session_files_with_lock, undo_session_with_lock,
+    UndoMoveOutcome, UndoSession, build_managed_setup_plan, inbox_file_candidates, scan_directory,
+    select_representative_files, undo_session_files_with_lock, undo_session_with_lock,
 };
 use temari_schedule::{
     ScheduleSpec, ScheduleStatus as CoreScheduleStatus, SchedulerPlatform, install_schedule,
@@ -110,7 +109,10 @@ impl ManagedDrafts {
             return Err("the reviewed Library edit is no longer active".into());
         }
         self.revision = self.revision.wrapping_add(1);
-        Ok(self.library_edit.take().expect("Library edit token was checked"))
+        Ok(self
+            .library_edit
+            .take()
+            .expect("Library edit token was checked"))
     }
 }
 
@@ -641,7 +643,9 @@ pub(crate) async fn managed_preview_library_edit(
     let token = setup_token("library-edit", revision);
     let operation = request.operation.clone();
     let plan = tauri::async_runtime::spawn_blocking(move || {
-        managed_service()?.preview_library_edit(&request.workspace_id, request.operation).map_err(error_text)
+        managed_service()?
+            .preview_library_edit(&request.workspace_id, request.operation)
+            .map_err(error_text)
     })
     .await
     .map_err(|error| format!("Library edit preview task failed: {error}"))??;
@@ -1006,6 +1010,7 @@ fn propose_workspace(
     }
     let config = Config::load(&config_path).map_err(error_text)?;
     let source = canonical_source(&request.source)?;
+    reject_managed_area_source(&source)?;
     let files = scan_directory(&source, &ScanScope::default(), &[]).map_err(error_text)?;
     if files.is_empty() {
         return Err("no regular files were found in the selected folder".into());
@@ -1026,6 +1031,37 @@ fn propose_workspace(
         },
         config_path,
     })
+}
+
+pub(crate) fn reject_managed_area_source(source: &Path) -> Result<(), String> {
+    const AREA_FAMILIES: [[&str; 3]; 2] = [
+        ["Kept", "Inbox", "Library"],
+        ["Manual Library", "Recents", "AI Library"],
+    ];
+
+    for ancestor in source.ancestors() {
+        let Some(name) = ancestor.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(family) = AREA_FAMILIES.iter().find(|family| family.contains(&name)) else {
+            continue;
+        };
+        let Some(parent) = ancestor.parent() else {
+            continue;
+        };
+        if family
+            .iter()
+            .filter(|candidate| parent.join(candidate).is_dir())
+            .count()
+            >= 2
+        {
+            return Err(format!(
+                "choose the workspace root instead of its managed area: {}",
+                ancestor.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn preview_workspace(
@@ -1598,6 +1634,29 @@ timeout_seconds = 2
     }
 
     #[test]
+    fn managed_areas_and_their_descendants_are_not_setup_sources() {
+        let root = tempdir().unwrap();
+        for area in ["Manual Library", "Recents", "AI Library"] {
+            fs::create_dir(root.path().join(area)).unwrap();
+        }
+        let nested = root.path().join("Recents/nested");
+        fs::create_dir(&nested).unwrap();
+
+        assert!(reject_managed_area_source(&root.path().join("Recents")).is_err());
+        assert!(reject_managed_area_source(&nested).is_err());
+        assert!(reject_managed_area_source(root.path()).is_ok());
+    }
+
+    #[test]
+    fn ordinary_folder_with_a_reserved_name_remains_selectable() {
+        let root = tempdir().unwrap();
+        let ordinary = root.path().join("Recents");
+        fs::create_dir(&ordinary).unwrap();
+
+        assert!(reject_managed_area_source(&ordinary).is_ok());
+    }
+
+    #[test]
     fn out_of_order_proposal_results_cannot_replace_the_latest_request() {
         let source = tempdir().unwrap();
         let mut drafts = ManagedDrafts::default();
@@ -1859,7 +1918,12 @@ timeout_seconds = 2
 
         let applied = service.apply_library_edit(&reviewed.plan).unwrap();
         let status = get_workspace_at(&state_path, &activation.workspace.id).unwrap();
-        assert!(status.library_folders.iter().any(|folder| folder.path == "Research"));
+        assert!(
+            status
+                .library_folders
+                .iter()
+                .any(|folder| folder.path == "Research")
+        );
         assert_eq!(
             status.latest_configuration.as_ref().unwrap().run_id,
             applied.run.id
@@ -1872,7 +1936,12 @@ timeout_seconds = 2
             .undo_library_edit(&applied.run.id, &undo_path)
             .unwrap();
         let status = get_workspace_at(&state_path, &activation.workspace.id).unwrap();
-        assert!(!status.library_folders.iter().any(|folder| folder.path == "Research"));
+        assert!(
+            !status
+                .library_folders
+                .iter()
+                .any(|folder| folder.path == "Research")
+        );
         assert!(status.latest_configuration.unwrap().undone);
     }
 

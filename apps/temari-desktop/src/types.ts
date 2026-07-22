@@ -1,5 +1,11 @@
 export type WorkspaceHealth = "healthy" | "disabled" | "attention";
 
+export type DefaultSourceLocation = {
+  id: "desktop" | "downloads" | "documents";
+  label: string;
+  path: string;
+};
+
 export type ManagedWorkspace = {
   id: string;
   source: string;

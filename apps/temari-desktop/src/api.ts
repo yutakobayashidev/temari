@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
+  DefaultSourceLocation,
   LibraryEditOperation,
   LibraryEditPreview,
   LibraryFolder,
@@ -44,8 +45,8 @@ let demoHistory: ManagedMove[] = [
     sessionId: "run-20260722-01",
     kind: "classify",
     moveId: "f0001",
-    sourcePath: "Inbox/quarterly-notes.pdf",
-    destinationPath: "Library/Work/quarterly-notes.pdf",
+    sourcePath: "Recents/quarterly-notes.pdf",
+    destinationPath: "AI Library/Work/quarterly-notes.pdf",
     undone: false,
     undoOutcome: null,
     finishedUnixMs: now - 18 * 60_000,
@@ -55,7 +56,7 @@ let demoHistory: ManagedMove[] = [
     kind: "stage",
     moveId: "f0002",
     sourcePath: "receipt-july.pdf",
-    destinationPath: "Inbox/receipt-july.pdf",
+    destinationPath: "Recents/receipt-july.pdf",
     undone: false,
     undoOutcome: null,
     finishedUnixMs: now - 28 * 60 * 60_000,
@@ -64,8 +65,8 @@ let demoHistory: ManagedMove[] = [
     sessionId: "run-20260720-02",
     kind: "classify",
     moveId: "f0003",
-    sourcePath: "Inbox/screenshot-1842.png",
-    destinationPath: "Library/Images/Screenshots/screenshot-1842.png",
+    sourcePath: "Recents/screenshot-1842.png",
+    destinationPath: "AI Library/Images/Screenshots/screenshot-1842.png",
     undone: true,
     undoOutcome: "restored",
     finishedUnixMs: now - 2 * 86_400_000,
@@ -105,6 +106,17 @@ export async function defaultConfigLocation(): Promise<ConfigLocation> {
     return { path, defaultPath: path };
   }
   return invoke<ConfigLocation>("default_config_location");
+}
+
+export async function defaultSourceLocations(): Promise<DefaultSourceLocation[]> {
+  if (!isTauri()) {
+    return [
+      { id: "desktop", label: "Desktop", path: "/Users/you/Desktop" },
+      { id: "downloads", label: "Downloads", path: "/Users/you/Downloads" },
+      { id: "documents", label: "Documents", path: "/Users/you/Documents" },
+    ];
+  }
+  return invoke<DefaultSourceLocation[]>("default_source_locations");
 }
 
 export async function chooseSource(): Promise<string | null> {
@@ -192,10 +204,10 @@ export async function previewManagedWorkspace(
     return {
       token: "demo-preview",
       source: proposal.source,
-      directories: ["Kept", "Inbox", "Library", ...proposal.folders.map((folder) => `Library/${folder.path}`)],
+      directories: ["Manual Library", "Recents", "AI Library", ...proposal.folders.map((folder) => `AI Library/${folder.path}`)],
       moves: [
-        { sourcePath: "Existing folder", destinationPath: "Kept/Existing folder", area: "kept" },
-        { sourcePath: "notes.pdf", destinationPath: "Inbox/notes.pdf", area: "inbox" },
+        { sourcePath: "Existing folder", destinationPath: "Manual Library/Existing folder", area: "kept" },
+        { sourcePath: "notes.pdf", destinationPath: "Recents/notes.pdf", area: "inbox" },
       ],
     };
   }

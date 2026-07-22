@@ -6,6 +6,7 @@ import {
   chooseSource,
   chooseTemariExecutable,
   defaultConfigLocation,
+  defaultSourceLocations,
   disableManagedSchedule,
   enableManagedSchedule,
   getManagedHistory,
@@ -24,6 +25,7 @@ import {
   resumeLibraryEdit,
 } from "./api";
 import type {
+  DefaultSourceLocation,
   LibraryEditOperation,
   LibraryEditPreview,
   ManagedMove,
@@ -53,6 +55,7 @@ type AppState = {
   history: ManagedMove[];
   configPath: string;
   defaultConfigPath: string;
+  defaultSources: DefaultSourceLocation[];
   scheduleExecutablePath: string;
   busy: boolean;
   notice: Notice | null;
@@ -75,6 +78,7 @@ const state: AppState = {
   history: [],
   configPath: "",
   defaultConfigPath: "",
+  defaultSources: [],
   scheduleExecutablePath: "",
   busy: true,
   notice: null,
@@ -154,7 +158,7 @@ function historyRows(): string {
         <span aria-hidden="true">→</span>
         <strong>${escapeHtml(move.destinationPath)}</strong>
       </div>
-      <span class="move-kind">${move.kind === "classify" ? "Classified" : move.kind === "adopt" ? "Kept" : move.kind === "configure" ? "Configured" : "Staged"}</span>
+      <span class="move-kind">${move.kind === "classify" ? "Classified" : move.kind === "adopt" ? "Manual" : move.kind === "configure" ? "Configured" : "Staged"}</span>
       ${move.undone
         ? `<span class="undo-state">Undone</span>`
         : move.kind === "adopt"
@@ -213,24 +217,24 @@ function dashboard(): string {
     ${state.status.issues.length ? `<div class="issue-list"><strong>Needs attention</strong>${state.status.issues.map((issue) => `<span>${escapeHtml(issue)}</span>`).join("")}</div>` : ""}
 
     <section class="areas" aria-labelledby="areas-title">
-      <div class="section-heading"><div><p class="eyebrow">Workspace flow</p><h2 id="areas-title">Three places, one clear boundary</h2></div><span>Root → Inbox → Library</span></div>
+      <div class="section-heading"><div><p class="eyebrow">Workspace flow</p><h2 id="areas-title">Three places, one clear boundary</h2></div><span>Root → Recents → AI Library</span></div>
       <div class="area-flow">
         <article class="area-card area-kept">
           <div class="area-index">K</div>
-          <div><p>Leave alone</p><h3>Kept</h3><span>${keptNote}</span></div>
+          <div><p>Leave alone</p><h3>Manual Library</h3><span>${keptNote}</span></div>
           <strong class="area-value">Protected</strong>
         </article>
         <span class="flow-thread" aria-hidden="true"></span>
         <article class="area-card area-inbox">
           <div class="area-index">I</div>
-          <div><p>Wait here</p><h3>Inbox</h3><span>${escapeHtml(inboxNote)}</span></div>
+          <div><p>Wait here</p><h3>Recents</h3><span>${escapeHtml(inboxNote)}</span></div>
           <strong class="area-value">${inbox.physicalFiles}</strong>
           <small class="area-detail">${inbox.eligibleNow} ready now</small>
         </article>
         <span class="flow-thread" aria-hidden="true"></span>
         <article class="area-card area-library">
           <div class="area-index">L</div>
-          <div><p>Organized by meaning</p><h3>Library</h3><span>Approved destinations only</span></div>
+          <div><p>Organized by meaning</p><h3>AI Library</h3><span>Approved destinations only</span></div>
           <strong class="area-value">${classified || inbox.indexedMoved}</strong>
           <small class="area-detail">recently indexed</small>
         </article>
@@ -239,7 +243,7 @@ function dashboard(): string {
 
     <section class="library-ledger" aria-labelledby="library-ledger-title">
       <div class="section-heading compact">
-        <div><p class="eyebrow">Approved destinations</p><h2 id="library-ledger-title">Library structure</h2></div>
+        <div><p class="eyebrow">Approved destinations</p><h2 id="library-ledger-title">AI Library structure</h2></div>
         <button class="text-button" id="open-library-editor" type="button" ${workspace.enabled ? "disabled" : ""}>Edit structure</button>
       </div>
       <div class="library-ledger-rows">${state.status.libraryFolders.map((folder) => `<div><strong>${escapeHtml(folder.path)}</strong><span>${escapeHtml(folder.description)}</span></div>`).join("")}</div>
@@ -258,7 +262,7 @@ function dashboard(): string {
       <aside class="control-panel">
         <section>
           <div class="control-heading"><div><p class="eyebrow">Timing</p><h2>Waiting room</h2></div></div>
-          <label class="field"><span>Keep new files in Inbox</span><select id="retention-days" disabled>
+          <label class="field"><span>Keep new files in Recents</span><select id="retention-days" disabled>
             ${[1, 2, 3, 5, 7, 14].map((days) => `<option value="${days}" ${workspace.retentionSeconds === days * 86_400 ? "selected" : ""}>${days} ${days === 1 ? "day" : "days"}</option>`).join("")}
           </select></label>
           <label class="field"><span>Wait until unchanged</span><select id="settle-seconds" disabled>
@@ -279,8 +283,8 @@ function dashboard(): string {
         </section>
 
         <section>
-          <div class="control-heading"><div><p class="eyebrow">Send back through Inbox</p><h2>Reprocess files</h2></div></div>
-          <p class="control-copy">Select files from Kept or Library. Temari creates a reviewed move back to Inbox first.</p>
+          <div class="control-heading"><div><p class="eyebrow">Send back through Recents</p><h2>Reprocess files</h2></div></div>
+          <p class="control-copy">Select files from Manual Library or AI Library. Temari creates a reviewed move back to Recents first.</p>
           <button class="secondary-button" id="open-reprocess" type="button">Choose files to reprocess</button>
         </section>
       </aside>
@@ -298,20 +302,27 @@ function setupDialog(): string {
     <section class="sheet-card">
       <button class="dialog-close" data-close-setup aria-label="Close" type="button">×</button>
       <p class="eyebrow">Add a managed folder · ${sourceStep ? "1" : structureStep ? "2" : "3"} of 3</p>
-      <h2 id="setup-title">${sourceStep ? "Choose one folder" : structureStep ? "Approve its Library" : "Review the exact setup"}</h2>
+      <h2 id="setup-title">${sourceStep ? "Choose one folder" : structureStep ? "Approve its AI Library" : "Review the exact setup"}</h2>
       ${sourceStep ? `
-        <p>Each folder stays independent and gets its own Kept, Inbox, and Library.</p>
+        <p>Each folder stays independent and gets its own Manual Library, Recents, and AI Library.</p>
+        ${state.defaultSources.length ? `<div class="source-suggestions" aria-label="Suggested folders">
+          <div><strong>Common places</strong><span>Suggestions only · nothing is added until Apply</span></div>
+          <div class="source-suggestion-list">${state.defaultSources.map((source) => `
+            <button class="source-suggestion ${state.setupSource === source.path ? "is-selected" : ""}" data-source-path="${escapeAttribute(source.path)}" type="button">
+              <span class="source-folder" aria-hidden="true"></span><strong>${escapeHtml(source.label)}</strong><small>${escapeHtml(source.path)}</small>
+            </button>`).join("")}</div>
+        </div>` : ""}
         <label class="picker-field"><span>Folder</span><div><input id="setup-source" readonly value="${escapeAttribute(state.setupSource)}" placeholder="No folder selected" /><button id="pick-setup-source" type="button">Choose</button></div></label>
         <label class="picker-field"><span>Model configuration</span><div><input id="setup-config" readonly value="${escapeAttribute(state.configPath)}" placeholder="No configuration selected" /><button id="pick-setup-config" type="button">Choose</button></div></label>
-        <button class="primary-button full" id="propose-workspace" type="button" ${!state.setupSource || !state.configPath || state.busy ? "disabled" : ""}>${state.busy ? "Reading file names…" : "Propose a Library"}</button>` : ""}
+        <button class="primary-button full" id="propose-workspace" type="button" ${!state.setupSource || !state.configPath || state.busy ? "disabled" : ""}>${state.busy ? "Reading file names…" : "Propose an AI Library"}</button>` : ""}
       ${structureStep ? `
         <p>${state.proposal!.filesConsidered} file names informed this proposal. Edit every destination before approval.</p>
         <div class="folder-proposal" id="setup-folders">${state.proposal!.folders.map((folder, index) => `
           <fieldset data-folder-index="${index}"><legend>Destination ${index + 1}</legend><input name="path" value="${escapeAttribute(folder.path)}" aria-label="Destination path" /><input name="description" value="${escapeAttribute(folder.description)}" aria-label="Destination purpose" /></fieldset>`).join("")}</div>
-        <div class="setup-timing"><label>Inbox retention<select id="setup-retention"><option value="1">1 day</option><option value="3" selected>3 days</option><option value="7">7 days</option></select></label><label>Stable for<select id="setup-settle"><option value="30" selected>30 seconds</option><option value="60">1 minute</option><option value="300">5 minutes</option></select></label></div>
+        <div class="setup-timing"><label>Recents retention<select id="setup-retention"><option value="1">1 day</option><option value="3" selected>3 days</option><option value="7">7 days</option></select></label><label>Stable for<select id="setup-settle"><option value="30" selected>30 seconds</option><option value="60">1 minute</option><option value="300">5 minutes</option></select></label></div>
         <button class="primary-button full" id="preview-workspace" type="button" ${state.busy ? "disabled" : ""}>${state.busy ? "Building setup…" : "Preview exact setup"}</button>` : ""}
       ${previewStep ? `
-        <p>Nothing has moved. Directories go to Kept; loose files go to Inbox before classification.</p>
+        <p>Nothing has moved. Directories go to Manual Library; loose files go to Recents before classification.</p>
         <div class="setup-summary"><div><strong>${state.setupPreview!.directories.length}</strong><span>Folders created</span></div><div><strong>${state.setupPreview!.moves.length}</strong><span>Initial moves</span></div></div>
         <div class="setup-moves">${state.setupPreview!.moves.map((move) => `<div><span>${escapeHtml(move.sourcePath)}</span><b>→</b><strong>${escapeHtml(move.destinationPath)}</strong></div>`).join("")}</div>
         <button class="primary-button full" id="apply-workspace" type="button">Apply this setup</button>` : ""}
@@ -324,9 +335,9 @@ function reprocessDialog(): string {
   return `<dialog class="small-dialog" id="reprocess-dialog" open aria-labelledby="reprocess-title">
     <form id="reprocess-form">
       <button class="dialog-close" data-close-reprocess aria-label="Close" type="button">×</button>
-      <p class="eyebrow">Reviewed return to Inbox</p><h2 id="reprocess-title">Reprocess files</h2>
-      <label class="field"><span>Current area</span><select id="reprocess-area"><option value="library">Library</option><option value="kept">Kept</option></select></label>
-      <label class="field"><span>Area-relative paths</span><textarea id="reprocess-paths" placeholder="Work/old-report.pdf&#10;Images/reference.png" required></textarea><small>One file or directory per line. Kept requires explicit paths.</small></label>
+      <p class="eyebrow">Reviewed return to Recents</p><h2 id="reprocess-title">Reprocess files</h2>
+      <label class="field"><span>Current area</span><select id="reprocess-area"><option value="library">AI Library</option><option value="kept">Manual Library</option></select></label>
+      <label class="field"><span>Area-relative paths</span><textarea id="reprocess-paths" placeholder="Work/old-report.pdf&#10;Images/reference.png" required></textarea><small>One file or directory per line. Manual Library requires explicit paths.</small></label>
       <button class="primary-button full" type="submit">Review reprocessing</button>
     </form>
   </dialog>`;
@@ -339,7 +350,7 @@ function libraryEditDialog(): string {
     <section class="sheet-card library-editor">
       <button class="dialog-close" data-close-library-edit aria-label="Close" type="button">×</button>
       <p class="eyebrow">Approved destinations ledger</p>
-      <h2 id="library-edit-title">Edit Library structure</h2>
+      <h2 id="library-edit-title">Edit AI Library structure</h2>
       <p>These changes update future organization only. Existing files stay where they are until you use Reprocess.</p>
       <div class="library-editor-rows">${state.status.libraryFolders.map((folder) => `
         <article data-library-folder="${escapeAttribute(folder.id)}">
@@ -462,7 +473,7 @@ async function reviewLibraryEdit(operation: LibraryEditOperation): Promise<void>
     const after = preview.afterFolders.find((folder) => "id" in operation && folder.id === operation.id)
       ?? preview.afterFolders.find((folder) => !preview.beforeFolders.some((old) => old.id === folder.id));
     askForConfirmation({
-      title: "Apply this Library structure edit?",
+      title: "Apply this AI Library structure edit?",
       copy: "Only the approved structure changes. Existing files do not move; use Reprocess when they should be organized again.",
       details: [
         ["Change", operation.kind.replace("edit_description", "description")],
@@ -473,7 +484,7 @@ async function reviewLibraryEdit(operation: LibraryEditOperation): Promise<void>
       action: async () => {
         await applyLibraryEdit(preview.token);
         state.libraryEditPreview = null;
-        await refreshSelected("Library structure updated. Existing files were not moved.");
+        await refreshSelected("AI Library structure updated. Existing files were not moved.");
       },
     });
   } catch (error) {
@@ -525,11 +536,11 @@ function bindEvents(): void {
     const workspaceId = state.status.workspace.id;
     const runId = state.status.latestConfiguration.runId;
     askForConfirmation({
-      title: "Undo the last Library structure edit?",
+      title: "Undo the last AI Library structure edit?",
       copy: "The previous approved structure returns. Existing files stay in place.",
       details: [["Configure run", runId]],
       confirmLabel: "Undo structure edit",
-      action: async () => { await undoLibraryEdit(workspaceId, runId); await refreshSelected("Library structure edit undone."); },
+      action: async () => { await undoLibraryEdit(workspaceId, runId); await refreshSelected("AI Library structure edit undone."); },
     });
   });
   document.querySelector("#resume-library-edit")?.addEventListener("click", async () => {
@@ -537,7 +548,7 @@ function bindEvents(): void {
     setBusy(true);
     try {
       await resumeLibraryEdit(state.status.workspace.id, state.status.latestConfiguration.runId);
-      await refreshSelected("Library structure recovery completed.");
+      await refreshSelected("AI Library structure recovery completed.");
     } catch (error) { state.notice = { tone: "error", message: formatError(error) }; }
     finally { state.busy = false; render(); }
   });
@@ -547,6 +558,10 @@ function bindEvents(): void {
     if (source) state.setupSource = source;
     render();
   });
+  document.querySelectorAll<HTMLButtonElement>("[data-source-path]").forEach((button) => button.addEventListener("click", () => {
+    state.setupSource = button.dataset.sourcePath ?? "";
+    render();
+  }));
   document.querySelector("#pick-setup-config")?.addEventListener("click", async () => {
     const config = await chooseConfig();
     if (config) state.configPath = config;
@@ -586,7 +601,7 @@ function bindEvents(): void {
     state.setupOpen = false;
     askForConfirmation({
       title: `Set up ${basename(preview.source)}?`,
-      copy: "Temari will create Kept, Inbox, and Library, then perform only the moves shown in the reviewed setup.",
+      copy: "Temari will create Manual Library, Recents, and AI Library, then perform only the moves shown in the reviewed setup.",
       details: [["Folder", preview.source], ["Initial moves", String(preview.moves.length)], ["Directories", String(preview.directories.length)]],
       confirmLabel: "Apply reviewed setup",
       action: async () => {
@@ -606,7 +621,7 @@ function bindEvents(): void {
     const workspace = state.status.workspace;
     askForConfirmation({
       title: `Run ${basename(workspace.source)} now?`,
-      copy: "Loose root files will move to Inbox. Eligible Inbox files will move only to approved Library destinations.",
+      copy: "Loose root files will move to Recents. Eligible files will move only to approved AI Library destinations.",
       details: [["Folder", workspace.source], ["Ready now", String(state.status!.inbox.eligibleNow)], ["Collision policy", "Rename safely"]],
       confirmLabel: "Run and apply moves",
       action: async () => {
@@ -669,14 +684,14 @@ function bindEvents(): void {
     const workspaceId = state.status.workspace.id;
     state.reprocessOpen = false;
     askForConfirmation({
-      title: `Return ${paths.length} selection${paths.length === 1 ? "" : "s"} to Inbox?`,
-      copy: "This reviewed step does not classify directly from Kept or Library. A later run handles eligible Inbox files.",
-      details: [["From", area === "kept" ? "Kept" : "Library"], ["Selections", paths.join(", ")]],
-      confirmLabel: "Apply return to Inbox",
+      title: `Return ${paths.length} selection${paths.length === 1 ? "" : "s"} to Recents?`,
+      copy: "This reviewed step does not classify directly from Manual Library or AI Library. A later run handles eligible Recents files.",
+      details: [["From", area === "kept" ? "Manual Library" : "AI Library"], ["Selections", paths.join(", ")]],
+      confirmLabel: "Apply return to Recents",
       action: async () => {
         const result = await reprocessManagedFiles(workspaceId, area, paths);
         const moved = result.runs.reduce((total, run) => total + run.moveCount, 0);
-        await refreshSelected(`${moved} selection${moved === 1 ? "" : "s"} returned to Inbox.`);
+        await refreshSelected(`${moved} selection${moved === 1 ? "" : "s"} returned to Recents.`);
       },
     });
   });
@@ -716,9 +731,14 @@ function bindEvents(): void {
 
 async function initialize(): Promise<void> {
   try {
-    const [location, workspaces] = await Promise.all([defaultConfigLocation(), listManagedWorkspaces()]);
+    const [location, defaultSources, workspaces] = await Promise.all([
+      defaultConfigLocation(),
+      defaultSourceLocations(),
+      listManagedWorkspaces(),
+    ]);
     state.defaultConfigPath = location.defaultPath;
     state.configPath = location.path ?? "";
+    state.defaultSources = defaultSources;
     state.workspaces = workspaces;
     if (workspaces.length > 0) {
       state.selectedId = workspaces[0].id;
