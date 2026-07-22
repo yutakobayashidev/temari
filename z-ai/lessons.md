@@ -19,6 +19,7 @@
 - Once a stateful product workflow becomes the primary experience, remove overlapping implementation-oriented public commands instead of asking users to choose between equivalent mechanisms. Keep reusable engines internal and move rules, history, and recovery under the product-facing workspace identity.
 - When the user narrows a parity phase, implement the named workflow gaps completely and keep explicitly deferred product areas out of the patch, documentation, and navigation.
 - After completing a roadmap item, re-audit both the implementation and current analysis evidence before reporting parity; update stale scope labels and distinguish organizer gaps from separate product epics.
+- When the user narrows an E2E request to one adapter, stop setting up the excluded adapter immediately and spend the remaining validation budget on the requested path.
 # Library structure editing
 
 - Treat post-setup AI Library edits as logical FolderSet CRUD only. Add, rename, description edit, delete, and Undo change immutable FolderSet revisions and bindings; they do not rename or delete physical directories or move existing files.
