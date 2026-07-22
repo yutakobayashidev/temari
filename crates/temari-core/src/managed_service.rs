@@ -123,6 +123,7 @@ impl ManagedService {
         let managed_folders = library_folder_set(raw_folders)?;
         let mut store = self.store()?;
         validate_state_outside_source(&self.state_path, Path::new(&plan.source))?;
+        reject_managed_area_root(Path::new(&plan.source))?;
         ensure_no_monitor_overlap(&store, Path::new(&plan.source))?;
 
         let workspace_id = new_id("workspace")?;
@@ -1623,6 +1624,41 @@ fn ensure_no_monitor_overlap(store: &StateStore, source: &Path) -> Result<(), Er
     Ok(())
 }
 
+fn reject_managed_area_root(source: &Path) -> Result<(), Error> {
+    let Some(name) = source.file_name().and_then(|value| value.to_str()) else {
+        return Ok(());
+    };
+    let is_area_name = matches!(
+        name,
+        "Kept" | "Inbox" | "Library" | "Manual Library" | "Recents" | "AI Library"
+    );
+    if !is_area_name {
+        return Ok(());
+    }
+    let Some(parent) = source.parent() else {
+        return Ok(());
+    };
+    let sibling_names = [
+        "Kept",
+        "Inbox",
+        "Library",
+        "Manual Library",
+        "Recents",
+        "AI Library",
+    ];
+    let sibling_area_count = sibling_names
+        .iter()
+        .filter(|candidate| parent.join(candidate).is_dir())
+        .count();
+    if sibling_area_count >= 2 {
+        return Err(Error::InvalidState(format!(
+            "managed area {:?} cannot be registered as a workspace root",
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_windows(retention_seconds: u64, settle_seconds: u64) -> Result<(), Error> {
     if retention_seconds == 0 || settle_seconds == 0 {
         return Err(Error::InvalidState(
@@ -1808,6 +1844,16 @@ mod tests {
         ContentPolicy, ExtractionConfig, FolderProposal, LocalRule, ModelConfig, PrivacyConfig,
         Proposal, ScanScope, build_managed_setup_plan,
     };
+
+    #[test]
+    fn rejects_a_managed_area_as_a_new_workspace_root() {
+        let root = tempdir().unwrap();
+        for name in ["Kept", "Inbox", "Library"] {
+            fs::create_dir(root.path().join(name)).unwrap();
+        }
+        assert!(reject_managed_area_root(&root.path().join("Inbox")).is_err());
+        assert!(reject_managed_area_root(&root.path().join("ordinary")).is_ok());
+    }
 
     fn config() -> Config {
         Config {
