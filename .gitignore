@@ -1,2 +1,12 @@
 /target/
 /.temari.toml
+/.agent/skills/
+/.agents/skills/
+/.claude/skills/
+/.codex/skills/
+/.cursor/skills/
+/.gemini/skills/
+/.github/skills/
+/.opencode/skills/
+/.pi/skills/
+/.windsurf/skills/
