@@ -1540,7 +1540,10 @@ fn deactivate_undone_setup(cli: &Cli, session: &Path) -> Result<()> {
     }) else {
         return Ok(());
     };
-    store.set_managed_workspace_enabled(&workspace.id, false, unix_ms()?)?;
+    let now = unix_ms()?;
+    store.set_managed_workspace_enabled(&workspace.id, false, now)?;
+    store.discard_planned_managed_runs(&workspace.id)?;
+    store.remove_managed_workspace_registration(&workspace.id, now + 1)?;
     Ok(())
 }
 

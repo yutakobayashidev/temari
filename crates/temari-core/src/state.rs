@@ -688,6 +688,14 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn discard_planned_managed_runs(&mut self, workspace_id: &str) -> Result<(), Error> {
+        self.connection.execute(
+            "DELETE FROM managed_runs WHERE workspace_id = ?1 AND state IN ('planning', 'planned')",
+            [workspace_id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_managed_workspace(&mut self, workspace: &ManagedWorkspace) -> Result<(), Error> {
         validate_managed_workspace(workspace)?;
         validate_workspace_monitor(&self.connection, workspace)?;
