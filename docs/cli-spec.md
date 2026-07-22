@@ -17,6 +17,10 @@ temari [global options] managed library plan <WORKSPACE_ID> --out <PLAN> add|ren
 temari [global options] managed library apply <PLAN> [--yes]
 temari [global options] managed library undo <WORKSPACE_ID> <RUN_ID> [--yes]
 temari [global options] managed library resume <WORKSPACE_ID> <RUN_ID>
+temari [global options] managed migrate plan <WORKSPACE_ID> --out <PLAN>
+temari [global options] managed migrate apply <PLAN> [--yes]
+temari [global options] managed migrate undo <WORKSPACE_ID> <RUN_ID> [--yes]
+temari [global options] managed migrate resume <WORKSPACE_ID> <RUN_ID> [--yes]
 temari [global options] managed undo-setup|resume-setup ...
 temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...
 temari [global options] propose <SOURCE> --out <PROPOSAL> [--include-subtree <PATH>]...
@@ -120,6 +124,8 @@ temari [global options] resume <APPLY_SESSION> [--yes]
 - `rule` manages case-insensitive basename globs for one workspace. Rules select reviewed opaque destination IDs, run before model classification, use descending priority and stable rule-ID ordering, and never store executable paths.
 - `library show` exports the current approved FolderSet. `library plan add|rename|describe|delete` is read-only and writes an immutable edit Plan; `library apply` separately confirms and applies that reviewed Plan. Library edits require a disabled workspace and update only logical FolderSet revisions and the workspace binding. They never move files or rename or delete physical directories.
 - Each completed Library Configure run owns its Apply and Undo journals. `library undo` accepts a workspace ID and run ID, derives the journal path from that run, and requires confirmation. `library resume` verifies workspace ownership and resumes Apply from an `applying` run or Undo from a `needs_resume` run; terminal runs remain immutable.
+- `migrate plan` is the read-only entry point for converting a legacy managed workspace to the current Manual Library, Recents, and AI Library layout. It writes an immutable migration Plan and does not change bindings or filesystem paths.
+- `migrate apply` requires separate confirmation and applies only the exact reviewed Plan. `migrate undo` derives its recovery journal from the completed migration run; callers cannot select a journal path. `migrate resume` also requires confirmation, verifies workspace ownership, and dispatches only an interrupted Apply or Undo. New workspaces do not require migration.
 - `undo-setup` and `resume-setup` operate only from their versioned setup journals. Setup Undo refuses a changed kept directory, occupied original path, or changed area identity.
 - SQLite stores mutable retention and history indexes only. Setup Plans, normal Plans, Apply sessions, and Undo sessions remain authoritative JSON artifacts outside the managed source.
 - SQLite binds each managed workspace to the canonical model configuration path selected at activation. The path is revalidated before model-backed runs and is reused in generated schedule arguments; credentials remain in the owner-only configuration file and never enter workflow artifacts.
@@ -175,6 +181,10 @@ $ temari managed library plan <WORKSPACE_ID> --out library-edit.plan.json add --
 $ temari managed library apply library-edit.plan.json --yes
 $ temari managed library undo <WORKSPACE_ID> <CONFIGURE_RUN_ID> --yes
 $ temari managed library resume <WORKSPACE_ID> <CONFIGURE_RUN_ID>
+$ temari managed migrate plan <WORKSPACE_ID> --out managed-area-migration.plan.json
+$ temari managed migrate apply managed-area-migration.plan.json --yes
+$ temari managed migrate undo <WORKSPACE_ID> <MIGRATION_RUN_ID> --yes
+$ temari managed migrate resume <WORKSPACE_ID> <MIGRATION_RUN_ID> --yes
 $ temari managed schedule install <WORKSPACE_ID> --every-seconds 300 --executable ~/.local/bin/temari --yes
 $ temari managed history <WORKSPACE_ID>
 $ temari managed rule add <WORKSPACE_ID> --name-glob 'invoice-*.pdf' --destination d000001

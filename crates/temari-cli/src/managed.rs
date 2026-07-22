@@ -13,18 +13,18 @@ use directories::ProjectDirs;
 use serde::Serialize;
 use temari_core::{
     ApplySession, Config, FolderSet, InboxReconcileSummary, InboxState, LocalRule,
-    ManagedLibraryEdit, ManagedLibraryEditPlan, ManagedReprocessArea, ManagedReprocessSelection,
-    ManagedRunKind, ManagedService, ManagedSetupPlan, ManagedSetupSession, ManagedSetupState,
-    ManagedSetupUndoSession, ManagedUndoMoveOutcome as ManagedSetupUndoMoveOutcome,
-    ManagedWorkspace, RuleSet, RunState, SourceLock, StateStore, UndoMoveOutcome, UndoSession,
-    UndoState, build_managed_setup_plan, canonical_source_identity, fingerprint_candidate,
-    inbox_file_candidates, resume_managed_setup, undo_managed_setup, undo_session_files_with_lock,
-    undo_session_with_lock,
+    ManagedAreaMigrationPlan, ManagedLibraryEdit, ManagedLibraryEditPlan, ManagedReprocessArea,
+    ManagedReprocessSelection, ManagedRunKind, ManagedService, ManagedSetupPlan,
+    ManagedSetupSession, ManagedSetupState, ManagedSetupUndoSession,
+    ManagedUndoMoveOutcome as ManagedSetupUndoMoveOutcome, ManagedWorkspace, RuleSet, RunState,
+    SourceLock, StateStore, UndoMoveOutcome, UndoSession, UndoState, build_managed_setup_plan,
+    canonical_source_identity, fingerprint_candidate, inbox_file_candidates, resume_managed_setup,
+    undo_managed_setup, undo_session_files_with_lock, undo_session_with_lock,
 };
 #[cfg(test)]
 use temari_core::{
-    ManagedLibraryEditState, ManagedLibraryEditUndoSession, apply_plan, build_stage_to_inbox_plan,
-    root_file_candidates,
+    ManagedAreaMigrationState, ManagedAreaMigrationUndoSession, ManagedLibraryEditState,
+    ManagedLibraryEditUndoSession, apply_plan, build_stage_to_inbox_plan, root_file_candidates,
 };
 
 use crate::{
@@ -185,6 +185,11 @@ pub enum ManagedCommand {
     Library {
         #[command(subcommand)]
         command: LibraryCommand,
+    },
+    /// Migrate a legacy workspace to the current managed-area layout.
+    Migrate {
+        #[command(subcommand)]
+        command: MigrateCommand,
     },
     /// Run one staging and classification cycle.
     Run {
@@ -404,6 +409,46 @@ pub enum LibraryPlanCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum MigrateCommand {
+    /// Build a read-only managed-area migration Plan.
+    Plan {
+        /// Managed workspace ID.
+        workspace_id: String,
+        /// Output path for the reviewed migration Plan JSON.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Apply a reviewed managed-area migration Plan.
+    Apply {
+        /// Reviewed managed-area migration Plan JSON.
+        plan: PathBuf,
+        /// Confirm the filesystem mutation without prompting.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Undo a completed managed-area migration using its run-owned journal.
+    Undo {
+        /// Managed workspace ID.
+        workspace_id: String,
+        /// Completed migration run ID.
+        run_id: String,
+        /// Confirm the filesystem mutation without prompting.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Resume an interrupted managed-area migration Apply or Undo.
+    Resume {
+        /// Managed workspace ID.
+        workspace_id: String,
+        /// Migration run ID requiring recovery.
+        run_id: String,
+        /// Confirm recovery without prompting.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum ScheduleCommand {
     /// Print the platform scheduler definition without installing it.
     Print {
@@ -477,6 +522,7 @@ pub fn run_managed(cli: &Cli, command: &ManagedCommand) -> Result<()> {
         ManagedCommand::Reconcile { id } => reconcile_workspace(cli, id),
         ManagedCommand::Rule { command } => run_rule(cli, command),
         ManagedCommand::Library { command } => run_library(cli, command),
+        ManagedCommand::Migrate { command } => run_migrate(cli, command),
         ManagedCommand::Run {
             id,
             out,
@@ -505,6 +551,121 @@ pub fn run_managed(cli: &Cli, command: &ManagedCommand) -> Result<()> {
         ManagedCommand::UndoSetup { session, out, yes } => undo_setup(cli, session, out, *yes),
         ManagedCommand::ResumeSetup { session, yes } => resume_setup(cli, session, *yes),
     }
+}
+
+fn run_migrate(cli: &Cli, command: &MigrateCommand) -> Result<()> {
+    match command {
+        MigrateCommand::Plan { workspace_id, out } => migration_plan(cli, workspace_id, out),
+        MigrateCommand::Apply { plan, yes } => migration_apply(cli, plan, *yes),
+        MigrateCommand::Undo {
+            workspace_id,
+            run_id,
+            yes,
+        } => migration_undo(cli, workspace_id, run_id, *yes),
+        MigrateCommand::Resume {
+            workspace_id,
+            run_id,
+            yes,
+        } => migration_resume(cli, workspace_id, run_id, *yes),
+    }
+}
+
+fn migration_plan(cli: &Cli, workspace_id: &str, out: &Path) -> Result<()> {
+    let context = ManagedContext::new(cli)?;
+    let store = context.store()?;
+    let workspace = require_workspace(&store, workspace_id)?;
+    let out = resolve_artifact_output(out, Path::new(&workspace.source), "area migration Plan")?;
+    drop(store);
+    let plan = ManagedService::new(&context.state).preview_area_migration(workspace_id)?;
+    write_artifact(&out, &plan)?;
+    print_output_result(cli, &out)
+}
+
+fn migration_apply(cli: &Cli, plan_path: &Path, yes: bool) -> Result<()> {
+    let plan_path = fs::canonicalize(plan_path)
+        .with_context(|| format!("failed to resolve {}", plan_path.display()))?;
+    let plan = ManagedAreaMigrationPlan::load(&plan_path)?;
+    ensure_outside(&plan_path, Path::new(&plan.source), "area migration Plan")?;
+    confirm(
+        cli,
+        yes,
+        "Apply this reviewed managed-area migration Plan? [y/N] ",
+    )?;
+    let context = ManagedContext::new(cli)?;
+    let result = ManagedService::new(&context.state).apply_area_migration(&plan)?;
+    print_value(cli, &result, &result.run.id)
+}
+
+fn migration_undo(cli: &Cli, workspace_id: &str, run_id: &str, yes: bool) -> Result<()> {
+    let context = ManagedContext::new(cli)?;
+    let store = context.store()?;
+    let run = require_migration_run(&store, workspace_id, run_id)?;
+    let apply_path = run
+        .apply_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("managed-area migration run has no Apply Session"))?;
+    let journal_path = Path::new(apply_path)
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("managed-area migration Session has no parent directory"))?
+        .join("area-migration-undo.json");
+    drop(store);
+    confirm(
+        cli,
+        yes,
+        "Undo this completed managed-area migration? [y/N] ",
+    )?;
+    let result = ManagedService::new(&context.state).undo_area_migration(run_id, &journal_path)?;
+    print_value(cli, &result, &result.run.id)
+}
+
+fn migration_resume(cli: &Cli, workspace_id: &str, run_id: &str, yes: bool) -> Result<()> {
+    let context = ManagedContext::new(cli)?;
+    let store = context.store()?;
+    let run = require_migration_run(&store, workspace_id, run_id)?;
+    let state = run.state;
+    let undo_pending = run.undo_path.is_some();
+    drop(store);
+    confirm(
+        cli,
+        yes,
+        "Resume this interrupted managed-area migration? [y/N] ",
+    )?;
+    let service = ManagedService::new(&context.state);
+    match (state, undo_pending) {
+        (RunState::Applying | RunState::NeedsResume, false) => {
+            let result = service.resume_area_migration(run_id)?;
+            print_value(cli, &result, &result.run.id)
+        }
+        (RunState::NeedsResume, true) => {
+            let result = service.resume_area_migration_undo(run_id)?;
+            print_value(cli, &result, &result.run.id)
+        }
+        _ => bail!(
+            "managed-area migration run {run_id:?} is {state:?} and does not require recovery"
+        ),
+    }
+}
+
+fn require_migration_run(
+    store: &StateStore,
+    workspace_id: &str,
+    run_id: &str,
+) -> Result<temari_core::ManagedRun> {
+    let run = store
+        .managed_run(run_id)?
+        .ok_or_else(|| anyhow::anyhow!("unknown managed run {run_id:?}"))?;
+    if run.workspace_id != workspace_id {
+        bail!("managed run {run_id:?} does not belong to workspace {workspace_id:?}");
+    }
+    if run.kind != ManagedRunKind::Configure {
+        bail!("managed run {run_id:?} is not a managed-area migration run");
+    }
+    let plan_path = run
+        .plan_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("managed-area migration run has no Plan"))?;
+    ManagedAreaMigrationPlan::load(Path::new(plan_path))?;
+    Ok(run)
 }
 
 fn run_library(cli: &Cli, command: &LibraryCommand) -> Result<()> {
@@ -1809,6 +1970,17 @@ mod tests {
             command.extend(arguments);
             assert!(Cli::try_parse_from(command).is_ok());
         }
+
+        for arguments in [
+            vec!["migrate", "plan", "workspace-1", "--out", "migration.json"],
+            vec!["migrate", "apply", "migration.json", "--yes"],
+            vec!["migrate", "undo", "workspace-1", "run-1", "--yes"],
+            vec!["migrate", "resume", "workspace-1", "run-1", "--yes"],
+        ] {
+            let mut command = vec!["temari", "managed"];
+            command.extend(arguments);
+            assert!(Cli::try_parse_from(command).is_ok());
+        }
     }
 
     #[test]
@@ -2024,6 +2196,132 @@ mod tests {
                 .iter()
                 .all(|folder| folder.path != "Library/Research")
         );
+    }
+
+    #[test]
+    fn migration_commands_plan_confirm_apply_undo_and_resume_run_owned_artifacts() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("baseline.txt"), b"baseline").unwrap();
+        fs::create_dir(source.join("ExistingDirectory")).unwrap();
+        let source = fs::canonicalize(source).unwrap();
+        let state_path = root.path().join("state.sqlite3");
+        let config_path = root.path().join("temari.toml");
+        fs::write(
+            &config_path,
+            include_str!("../../../examples/temari.example.toml"),
+        )
+        .unwrap();
+        let raw_folders = temari_core::Proposal {
+            version: 2,
+            source: source.display().to_string(),
+            scope: temari_core::ScanScope::default(),
+            files_considered: 1,
+            folders: vec![temari_core::FolderProposal {
+                path: "Documents".into(),
+                description: "Documents".into(),
+            }],
+        }
+        .approve()
+        .unwrap();
+        let setup = build_managed_setup_plan(&source).unwrap();
+        let service = ManagedService::new(&state_path);
+        let activation = service
+            .activate_workspace(&setup, &raw_folders, &config_path, 60, 1)
+            .unwrap();
+        let workspace_id = activation.workspace.id;
+        StateStore::open(&state_path)
+            .unwrap()
+            .set_managed_workspace_enabled(&workspace_id, false, unix_ms().unwrap())
+            .unwrap();
+        let cli = Cli {
+            config: config_path,
+            state: Some(state_path.clone()),
+            json: false,
+            no_input: true,
+            no_color: true,
+            verbose: 0,
+            command: crate::Command::Managed(ManagedCommand::List),
+        };
+
+        let plan_path = root.path().join("area-migration-plan.json");
+        migration_plan(&cli, &workspace_id, &plan_path).unwrap();
+        let plan = ManagedAreaMigrationPlan::load(&plan_path).unwrap();
+        assert_eq!(plan.workspace_id, workspace_id);
+        assert!(source.join("Kept").is_dir());
+        assert!(!source.join("Manual Library").exists());
+
+        assert!(migration_apply(&cli, &plan_path, false).is_err());
+        assert!(source.join("Kept").is_dir());
+        migration_apply(&cli, &plan_path, true).unwrap();
+        assert!(source.join("Manual Library").is_dir());
+        assert!(source.join("Recents").is_dir());
+        assert!(source.join("AI Library").is_dir());
+        assert!(!source.join("Kept").exists());
+
+        let mut run = StateStore::open(&state_path)
+            .unwrap()
+            .managed_runs(&workspace_id)
+            .unwrap()
+            .into_iter()
+            .find(|run| {
+                run.plan_path
+                    .as_deref()
+                    .is_some_and(|path| ManagedAreaMigrationPlan::load(Path::new(path)).is_ok())
+            })
+            .unwrap();
+        let run_id = run.id.clone();
+        run.state = RunState::Applying;
+        run.finished_unix_ms = None;
+        StateStore::open(&state_path)
+            .unwrap()
+            .update_managed_run(&run)
+            .unwrap();
+        migration_resume(&cli, &workspace_id, &run_id, true).unwrap();
+
+        let mut run = StateStore::open(&state_path)
+            .unwrap()
+            .managed_run(&run_id)
+            .unwrap()
+            .unwrap();
+        run.state = RunState::NeedsResume;
+        run.finished_unix_ms = Some(unix_ms().unwrap());
+        run.error = Some("managed area migration needs recovery".into());
+        StateStore::open(&state_path)
+            .unwrap()
+            .update_managed_run(&run)
+            .unwrap();
+        migration_resume(&cli, &workspace_id, &run_id, true).unwrap();
+
+        migration_undo(&cli, &workspace_id, &run_id, true).unwrap();
+        assert!(source.join("Kept").is_dir());
+        assert!(!source.join("Manual Library").exists());
+        let mut run = StateStore::open(&state_path)
+            .unwrap()
+            .managed_run(&run_id)
+            .unwrap()
+            .unwrap();
+        let undo_path = PathBuf::from(run.undo_path.as_deref().unwrap());
+        let mut undo = ManagedAreaMigrationUndoSession::load(&undo_path).unwrap();
+        undo.state = ManagedAreaMigrationState::Running;
+        undo.finished_unix_ms = None;
+        write_artifact(&undo_path, &undo).unwrap();
+        run.state = RunState::NeedsResume;
+        run.error = Some("managed area migration Undo is pending".into());
+        StateStore::open(&state_path)
+            .unwrap()
+            .update_managed_run(&run)
+            .unwrap();
+        migration_resume(&cli, &workspace_id, &run_id, true).unwrap();
+
+        let run = StateStore::open(&state_path)
+            .unwrap()
+            .managed_run(&run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.state, RunState::Completed);
+        assert_eq!(run.undo_path.as_deref(), undo_path.to_str());
     }
 
     #[test]

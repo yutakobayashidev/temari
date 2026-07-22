@@ -103,6 +103,9 @@ $ temari managed library show <WORKSPACE_ID> --out library.folders.json
 $ temari managed library plan <WORKSPACE_ID> --out library-edit.plan.json \
     add --path Research --description "Research material"
 $ temari managed library apply library-edit.plan.json --yes
+$ temari managed migrate plan <WORKSPACE_ID> \
+    --out managed-area-migration.plan.json
+$ temari managed migrate apply managed-area-migration.plan.json --yes
 $ temari managed schedule install <WORKSPACE_ID> \
     --every-seconds 300 --executable ~/.local/bin/temari --yes
 ```
@@ -114,6 +117,8 @@ Arrival time is the first local observation stored in SQLite, not file modificat
 `managed reprocess` creates a model-free reviewed Plan from explicitly selected `Kept` or `Library` files back to `Inbox`; normal retention and classification then apply. Library supports explicit `--all`, while Kept always requires `--path`. Workspace registration can be enabled, disabled, edited, reconciled, and removed without deleting the three physical areas or JSON recovery artifacts.
 
 `managed library` edits the approved Library structure while a workspace is disabled. `show` exports the current FolderSet, and `plan add|rename|describe|delete` writes a reviewable immutable Plan. `apply` changes the workspace's FolderSet binding only: it does not move files or rename or delete physical directories. Each completed Configure run owns its recovery artifacts, so `undo <WORKSPACE_ID> <RUN_ID>` does not accept a caller-selected journal path and `resume` dispatches interrupted Apply or Undo recovery from the recorded run state.
+
+Legacy managed workspaces use the explicit `managed migrate` workflow to adopt the current Manual Library, Recents, and AI Library layout. `plan` is read-only; `apply` requires confirmation; and `undo` and `resume` use only run-owned recovery artifacts. Newly created workspaces already use the current layout and do not require migration.
 
 The portable monitoring engine, processed signatures, local rules, and run reconciliation remain internal Core services used by `managed`. There is no separate public monitor workflow or resident Temari daemon. Explicit `managed schedule` commands render, install, inspect, or uninstall a systemd user timer on Linux or a per-user launchd agent on macOS. Scheduled definitions run the same finite `managed run --apply --yes` service with absolute paths and no shell; installation never happens during workspace setup.
 
