@@ -26,11 +26,11 @@ use crate::{
     MonitorRecord, MonitoringOptions, OpenAiCompatibleModel, Plan, RunState, SourceLock,
     StateStore, apply_managed_area_migration, apply_managed_setup, apply_monitoring_plan,
     apply_plan, build_reprocess_to_inbox_plan, build_stage_to_inbox_plan,
-    canonical_source_identity, filter_inbox_candidates, fingerprint_candidate,
-    inbox_file_candidates, library_folder_set, persist_monitoring_plan, plan_monitor_candidates,
-    reprocess_file_candidates, resume_apply_session, resume_managed_area_migration,
-    resume_managed_area_migration_undo, resume_managed_setup, root_file_candidates,
-    undo_managed_area_migration, undo_managed_directory_adoption,
+    canonical_source_identity, detect_managed_area_layout, filter_inbox_candidates,
+    fingerprint_candidate, inbox_file_candidates, library_folder_set, persist_monitoring_plan,
+    plan_monitor_candidates, reprocess_file_candidates, resume_apply_session,
+    resume_managed_area_migration, resume_managed_area_migration_undo, resume_managed_setup,
+    root_file_candidates, undo_managed_area_migration, undo_managed_directory_adoption,
 };
 
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -1093,7 +1093,7 @@ impl ManagedService {
                 "managed monitor no longer matches its workspace".into(),
             ));
         }
-        for area in ["Kept", "Inbox", "Library"] {
+        for area in detect_managed_area_layout(&source)?.areas() {
             let path = source.join(area);
             let metadata = fs::symlink_metadata(&path)
                 .map_err(|error| io_error("inspect managed area", &path, error))?;
@@ -2304,6 +2304,35 @@ mod tests {
         let disabled = store
             .set_managed_workspace_enabled(&activation.workspace.id, false, unix_ms().unwrap())
             .unwrap();
+
+        for (current, legacy) in [
+            ("Manual Library", "Kept"),
+            ("Recents", "Inbox"),
+            ("AI Library", "Library"),
+        ] {
+            fs::rename(source.join(current), source.join(legacy)).unwrap();
+        }
+        let current_folders = FolderSet::load(Path::new(&disabled.folder_set_path)).unwrap();
+        let mut legacy_folders = current_folders.clone();
+        for folder in &mut legacy_folders.folders {
+            let suffix = folder.path.strip_prefix("AI Library").unwrap();
+            folder.path = format!("Library{suffix}");
+        }
+        legacy_folders.validate().unwrap();
+        let legacy_path = root.path().join("legacy-folders.json");
+        write_json(&legacy_path, &legacy_folders).unwrap();
+        let disabled = store
+            .replace_managed_folder_set_binding(
+                &disabled.id,
+                "test-legacy-area-binding",
+                &disabled.folder_set_path,
+                &disabled.folder_set_sha256,
+                &path_text(&legacy_path).unwrap(),
+                &legacy_folders.sha256().unwrap(),
+                None,
+                unix_ms().unwrap(),
+            )
+            .unwrap();
         drop(store);
 
         let plan = service.preview_area_migration(&disabled.id).unwrap();
@@ -2394,12 +2423,12 @@ mod tests {
         service
             .run_workspace(&activation.workspace.id, true)
             .unwrap();
-        let classified = source.join("Library/Documents/baseline.txt");
+        let classified = source.join("AI Library/Documents/baseline.txt");
         assert!(classified.is_file());
 
         fs::rename(&classified, source.join("baseline.txt")).unwrap();
         fs::rename(
-            source.join("Kept/InitialManualDirectory"),
+            source.join("Manual Library/InitialManualDirectory"),
             source.join("InitialManualDirectory"),
         )
         .unwrap();
@@ -2415,11 +2444,15 @@ mod tests {
         assert_eq!(indexed.state, RunState::Completed);
         assert!(source.join("baseline.txt").is_file());
         assert!(source.join("InitialManualDirectory/note.txt").is_file());
-        assert!(source.join("Kept/NewManualDirectory/note.txt").is_file());
-        assert!(!source.join("Inbox/baseline.txt").exists());
+        assert!(
+            source
+                .join("Manual Library/NewManualDirectory/note.txt")
+                .is_file()
+        );
+        assert!(!source.join("Recents/baseline.txt").exists());
 
         fs::rename(
-            source.join("Kept/NewManualDirectory"),
+            source.join("Manual Library/NewManualDirectory"),
             source.join("NewManualDirectory"),
         )
         .unwrap();
@@ -2442,7 +2475,7 @@ mod tests {
         assert!(recreated.directory_adoption.is_some());
         assert!(
             source
-                .join("Kept/NewManualDirectory/recreated.txt")
+                .join("Manual Library/NewManualDirectory/recreated.txt")
                 .is_file()
         );
 
@@ -2461,7 +2494,7 @@ mod tests {
             .run_workspace(&activation.workspace.id, true)
             .unwrap();
         assert!(after_undo.directory_adoption.is_none());
-        for area in ["Kept", "Inbox", "Library"] {
+        for area in ["Manual Library", "Recents", "AI Library"] {
             assert!(source.join(area).is_dir());
         }
 
@@ -2473,7 +2506,11 @@ mod tests {
                 .is_err()
         );
         assert!(source.join("MustRemainAfterCorruption").is_dir());
-        assert!(!source.join("Kept/MustRemainAfterCorruption").exists());
+        assert!(
+            !source
+                .join("Manual Library/MustRemainAfterCorruption")
+                .exists()
+        );
     }
 
     #[test]
@@ -2532,7 +2569,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(source.join("Kept").is_dir());
+        assert!(source.join("Manual Library").is_dir());
     }
 
     #[test]
@@ -2570,7 +2607,7 @@ mod tests {
                 .is_err()
         );
         assert!(source.join("MustRemainAtRoot").is_dir());
-        assert!(!source.join("Kept/MustRemainAtRoot").exists());
+        assert!(!source.join("Manual Library/MustRemainAtRoot").exists());
     }
 
     #[test]
@@ -2612,18 +2649,18 @@ mod tests {
         let documents = original
             .folders
             .iter()
-            .find(|folder| folder.path == "Library/Documents")
+            .find(|folder| folder.path == "AI Library/Documents")
             .unwrap()
             .clone();
         let images_id = original
             .folders
             .iter()
-            .find(|folder| folder.path == "Library/Images")
+            .find(|folder| folder.path == "AI Library/Images")
             .unwrap()
             .id
             .clone();
-        fs::create_dir(source.join("Library/Documents")).unwrap();
-        fs::write(source.join("Library/Documents/existing.txt"), "existing").unwrap();
+        fs::create_dir(source.join("AI Library/Documents")).unwrap();
+        fs::write(source.join("AI Library/Documents/existing.txt"), "existing").unwrap();
         drop(store);
 
         let rename = service
@@ -2646,10 +2683,10 @@ mod tests {
                 .find(|folder| folder.id == documents.id)
                 .unwrap()
                 .path,
-            "Library/Archive"
+            "AI Library/Archive"
         );
-        assert!(source.join("Library/Documents/existing.txt").is_file());
-        assert!(!source.join("Library/Archive").exists());
+        assert!(source.join("AI Library/Documents/existing.txt").is_file());
+        assert!(!source.join("AI Library/Archive").exists());
         assert!(service.apply_library_edit(&rename).is_err());
 
         let session_path = Path::new(renamed.run.apply_path.as_deref().unwrap());
@@ -2683,7 +2720,7 @@ mod tests {
         let restored = FolderSet::load(Path::new(&undone.workspace.folder_set_path)).unwrap();
         assert_eq!(undone.workspace.folder_set_path, workspace.folder_set_path);
         assert_eq!(restored.sha256().unwrap(), original.sha256().unwrap());
-        assert!(source.join("Library/Documents/existing.txt").is_file());
+        assert!(source.join("AI Library/Documents/existing.txt").is_file());
 
         let add = service
             .preview_library_edit(
@@ -2708,7 +2745,7 @@ mod tests {
             .id
             .clone();
         let added = service.apply_library_edit(&add).unwrap();
-        assert!(!source.join("Library/Research").exists());
+        assert!(!source.join("AI Library/Research").exists());
 
         let mut store = StateStore::open(&state).unwrap();
         store

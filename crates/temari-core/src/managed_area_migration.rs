@@ -20,6 +20,52 @@ use crate::{
 pub const LEGACY_MANAGED_AREAS: [&str; 3] = ["Kept", "Inbox", "Library"];
 pub const CURRENT_MANAGED_AREAS: [&str; 3] = ["Manual Library", "Recents", "AI Library"];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedAreaLayout {
+    Legacy,
+    Current,
+}
+
+impl ManagedAreaLayout {
+    pub fn areas(self) -> [&'static str; 3] {
+        match self {
+            Self::Legacy => LEGACY_MANAGED_AREAS,
+            Self::Current => CURRENT_MANAGED_AREAS,
+        }
+    }
+
+    pub fn manual(self) -> &'static str {
+        self.areas()[0]
+    }
+
+    pub fn recents(self) -> &'static str {
+        self.areas()[1]
+    }
+
+    pub fn library(self) -> &'static str {
+        self.areas()[2]
+    }
+}
+
+pub fn detect_managed_area_layout(source: &Path) -> Result<ManagedAreaLayout, Error> {
+    let legacy = LEGACY_MANAGED_AREAS
+        .iter()
+        .filter(|area| source.join(area).is_dir())
+        .count();
+    let current = CURRENT_MANAGED_AREAS
+        .iter()
+        .filter(|area| source.join(area).is_dir())
+        .count();
+    match (legacy, current) {
+        (0, 0) => Ok(ManagedAreaLayout::Current),
+        (1..=3, 0) => Ok(ManagedAreaLayout::Legacy),
+        (0, 1..=3) => Ok(ManagedAreaLayout::Current),
+        _ => Err(Error::InvalidState(
+            "managed source does not contain exactly one complete area layout".into(),
+        )),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedAreaMigrationMove {
@@ -822,7 +868,12 @@ mod tests {
                 description: "Documents".into(),
             }],
         };
-        let folders = library_folder_set(&raw.approve().unwrap()).unwrap();
+        let mut folders = library_folder_set(&raw.approve().unwrap()).unwrap();
+        folders.scope = ScanScope::new(vec!["Inbox".into()]).unwrap();
+        for folder in &mut folders.folders {
+            folder.path = folder.path.replacen("AI Library/", "Library/", 1);
+        }
+        folders.validate().unwrap();
         let folders_path = artifacts.path().join("folders.json");
         fs::write(&folders_path, serde_json::to_vec_pretty(&folders).unwrap()).unwrap();
         (root, artifacts, folders, folders_path)

@@ -6,12 +6,12 @@ This roadmap records the remaining parity work identified through binary analysi
 
 ### P0 — make the current managed workflow complete
 
-- [ ] **Separate default roots from app-managed areas** (Core, CLI, Tauri)
+- [x] **Separate default roots from app-managed areas** (Core, CLI, Tauri)
   - Treat `Desktop`, `Downloads`, and optionally `Documents` as default onboarding suggestions, never as implicit registrations.
   - Preserve the physical three-area workflow, but use product terminology aligned with the analyzed behavior: Manual Library, Recents, and AI Library.
   - Reject registering a managed area or a nested root beneath an existing workspace; recognize existing app-managed areas by the setup journal, filesystem identity, and reserved-area metadata.
   - Keep journals, SQLite indexes, and immutable workflow artifacts in the application state directory; only the three user-visible workflow areas and approved destination folders belong under the selected root.
-  - Define an explicit migration and recovery path for current `Kept/Inbox/Library` names, including setup Undo and stale planned runs.
+  - Provide an explicit migration and recovery path for legacy `Kept/Inbox/Library` names, including immutable Plans, Apply, Undo, and Resume.
   - Acceptance: selecting `~/Downloads` does not make its three managed areas eligible as separate roots, and status remains healthy after setup Undo.
 - [ ] **Multi-operation Library edit plans** (`temari-core`, CLI, Tauri)
   - Allow one reviewed plan to contain an ordered set of add, rename, description, and delete operations.
@@ -34,7 +34,7 @@ This roadmap records the remaining parity work identified through binary analysi
 ### P1 — complete the organizer experience
 
 - [ ] **Folder detail view** (Tauri, Core read models)
-  - Add a detail screen for Kept, Inbox, and Library with bounded file previews, counts, last run, and recent moves.
+  - Add a detail screen for Manual Library, Recents, and AI Library with bounded file previews, counts, last run, and recent moves.
   - Keep content extraction opt-in and bounded; never expose raw file contents by default.
   - Acceptance: the view is read-only and uses the same identity and privacy rules as planning.
 - [ ] **Physical Library reorganization workflow** (Core, CLI, Tauri)

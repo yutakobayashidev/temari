@@ -22,4 +22,9 @@
 
 - Treat post-setup Library edits as logical FolderSet CRUD only. Add, rename, description edit, delete, and Undo change immutable FolderSet revisions and bindings; they do not rename or delete physical directories or move existing files.
 - Keep existing-file movement in the explicit reprocessing/reorganization workflow. Do not infer filesystem movement from a logical destination rename.
-- Use the product term "Library" consistently; do not introduce "AI Library" in Temari CLI help or documentation.
+- Keep physical area names consistent across Core, CLI, desktop, help, and documentation: new workspaces use `Manual Library`, `Recents`, and `AI Library`; old names appear only in explicit legacy migration and compatibility paths.
+
+# Execution discipline
+
+- When the user authorizes a concrete implementation, do not repeatedly stop at plans or partial status reports. Continue through code, verification, documentation, and commit unless a genuine external blocker requires user input.
+- Browser demo state must preserve the selected workspace identity across preview and Apply, and should model the resulting recovery metadata; otherwise UI E2E can pass against a different workspace or cannot exercise Undo.

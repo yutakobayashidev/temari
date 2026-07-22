@@ -14,13 +14,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
+use crate::managed_area_migration::{
+    CURRENT_MANAGED_AREAS, LEGACY_MANAGED_AREAS, detect_managed_area_layout,
+};
 use crate::{
     Error, FileFingerprint, FsIdentity, SourceLock,
     artifact::normalize_relative_path,
     filesystem::{canonical_directory, fingerprint, identity, io_error, path_exists},
 };
 
-pub const MANAGED_AREAS: [&str; 3] = ["Kept", "Inbox", "Library"];
+pub const MANAGED_AREAS: [&str; 3] = CURRENT_MANAGED_AREAS;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -183,9 +186,10 @@ impl ManagedSetupPlan {
 
     pub fn validate(&self) -> Result<(), Error> {
         validate_source_header(self.version, &self.source)?;
-        if self.areas != MANAGED_AREAS {
+        if self.areas != MANAGED_AREAS && self.areas != LEGACY_MANAGED_AREAS {
             return Err(Error::InvalidArtifact(
-                "managed setup areas must be Kept, Inbox, and Library in that order".into(),
+                "managed setup areas must use the current or legacy three-area layout in order"
+                    .into(),
             ));
         }
         let mut sources = HashSet::new();
@@ -232,6 +236,12 @@ impl ManagedSetupSession {
             .map(|area| area.path.as_str())
             .collect::<Vec<_>>()
             != MANAGED_AREAS
+            && self
+                .areas
+                .iter()
+                .map(|area| area.path.as_str())
+                .collect::<Vec<_>>()
+                != LEGACY_MANAGED_AREAS
         {
             return Err(Error::InvalidArtifact(
                 "managed setup session contains invalid areas".into(),
@@ -368,7 +378,13 @@ impl ManagedSetupUndoSession {
             .iter()
             .map(|area| area.path.as_str())
             .collect::<Vec<_>>()
-            != ["Library", "Inbox", "Kept"]
+            != ["AI Library", "Recents", "Manual Library"]
+            && self
+                .areas
+                .iter()
+                .map(|area| area.path.as_str())
+                .collect::<Vec<_>>()
+                != ["Library", "Inbox", "Kept"]
         {
             return Err(Error::InvalidArtifact(
                 "managed setup undo contains invalid areas".into(),
@@ -449,7 +465,7 @@ impl ManagedSetupUndoSession {
 
 pub fn build_managed_setup_plan(source: &Path) -> Result<ManagedSetupPlan, Error> {
     let (source, source_identity) = canonical_directory(source)?;
-    for area in MANAGED_AREAS {
+    for area in MANAGED_AREAS.into_iter().chain(LEGACY_MANAGED_AREAS) {
         if path_exists(&source.join(area))? {
             return Err(Error::InvalidArtifact(format!(
                 "managed area already exists: {area:?}"
@@ -465,7 +481,7 @@ pub fn build_managed_setup_plan(source: &Path) -> Result<ManagedSetupPlan, Error
         let (area, value) = if metadata.file_type().is_file() && !metadata.file_type().is_symlink()
         {
             (
-                "Inbox",
+                MANAGED_AREAS[1],
                 ManagedEntryFingerprint::File {
                     fingerprint: fingerprint(&path)?,
                 },
@@ -477,7 +493,7 @@ pub fn build_managed_setup_plan(source: &Path) -> Result<ManagedSetupPlan, Error
                 )));
             }
             (
-                "Kept",
+                MANAGED_AREAS[0],
                 ManagedEntryFingerprint::Directory {
                     fingerprint: fingerprint_directory(&path)?,
                 },
@@ -533,7 +549,8 @@ pub(crate) fn build_managed_directory_adoption_plan_excluding(
     excluded_identities: &HashSet<(u64, u64)>,
 ) -> Result<ManagedSetupPlan, Error> {
     let (source, source_identity) = canonical_directory(source)?;
-    for area in MANAGED_AREAS {
+    let managed_areas = detect_managed_area_layout(&source)?.areas();
+    for area in managed_areas {
         let path = source.join(area);
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| io_error("inspect managed area", &path, error))?;
@@ -549,7 +566,7 @@ pub(crate) fn build_managed_directory_adoption_plan_excluding(
 
     let mut moves = Vec::new();
     for (name, path) in read_directory_sorted(&source)? {
-        if MANAGED_AREAS.contains(&name.as_str()) {
+        if managed_areas.contains(&name.as_str()) {
             continue;
         }
         let metadata =
@@ -565,16 +582,16 @@ pub(crate) fn build_managed_directory_adoption_plan_excluding(
         if excluded_identities.contains(&(metadata.dev(), metadata.ino())) {
             continue;
         }
-        let destination = source.join("Kept").join(&name);
+        let destination = source.join(managed_areas[0]).join(&name);
         if path_exists(&destination)? {
             return Err(Error::InvalidArtifact(format!(
                 "managed directory adoption destination is occupied: {:?}",
-                format!("Kept/{name}")
+                format!("{}/{name}", managed_areas[0])
             )));
         }
         moves.push(ManagedSetupMove {
             source_path: name.clone(),
-            destination_path: format!("Kept/{name}"),
+            destination_path: format!("{}/{name}", managed_areas[0]),
             fingerprint: ManagedEntryFingerprint::Directory {
                 fingerprint: fingerprint_directory(&path)?,
             },
@@ -589,7 +606,7 @@ pub(crate) fn build_managed_directory_adoption_plan_excluding(
         version: 1,
         source: path_text(&source)?,
         source_identity,
-        areas: MANAGED_AREAS
+        areas: managed_areas
             .iter()
             .map(|value| (*value).to_owned())
             .collect(),
@@ -637,12 +654,12 @@ pub(crate) fn apply_managed_directory_adoption_excluding(
     }
     validate_new_journal(journal_path, Path::new(&plan.source))?;
     let root = Path::new(&plan.source);
-    let mut areas = Vec::with_capacity(MANAGED_AREAS.len());
-    for area in MANAGED_AREAS {
+    let mut areas = Vec::with_capacity(plan.areas.len());
+    for area in &plan.areas {
         let metadata = fs::symlink_metadata(root.join(area))
             .map_err(|error| io_error("inspect managed area", &root.join(area), error))?;
         areas.push(ManagedAreaRecord {
-            path: area.into(),
+            path: area.clone(),
             outcome: ManagedAreaOutcome::Created {
                 identity: identity(&metadata),
             },
@@ -1431,11 +1448,14 @@ fn validate_move(movement: &ManagedSetupMove) -> Result<(), Error> {
             "managed setup sources must be root entries".into(),
         ));
     }
-    let expected_area = match movement.fingerprint {
-        ManagedEntryFingerprint::File { .. } => "Inbox",
-        ManagedEntryFingerprint::Directory { .. } => "Kept",
+    let expected_areas = match movement.fingerprint {
+        ManagedEntryFingerprint::File { .. } => [MANAGED_AREAS[1], LEGACY_MANAGED_AREAS[1]],
+        ManagedEntryFingerprint::Directory { .. } => [MANAGED_AREAS[0], LEGACY_MANAGED_AREAS[0]],
     };
-    if movement.destination_path != format!("{expected_area}/{}", movement.source_path) {
+    if !expected_areas
+        .iter()
+        .any(|area| movement.destination_path == format!("{area}/{}", movement.source_path))
+    {
         return Err(Error::InvalidArtifact(
             "managed setup destination does not match its entry type".into(),
         ));
@@ -1715,10 +1735,10 @@ mod tests {
                 .iter()
                 .map(|value| value.destination_path.as_str())
                 .collect::<Vec<_>>(),
-            ["Kept/Zed", "Inbox/a.txt"]
+            ["Manual Library/Zed", "Recents/a.txt"]
         );
         assert!(source.path().join("a.txt").is_file());
-        assert!(!source.path().join("Inbox").exists());
+        assert!(!source.path().join("Recents").exists());
         assert_eq!(plan.sha256().unwrap().len(), 64);
         let artifacts = tempdir().unwrap();
         let artifact = artifacts.path().join("plan.json");
@@ -1770,7 +1790,7 @@ mod tests {
         let plan = build_managed_directory_adoption_plan(source.path()).unwrap();
         assert_eq!(plan.moves.len(), 1);
         assert_eq!(plan.moves[0].source_path, "Project");
-        assert_eq!(plan.moves[0].destination_path, "Kept/Project");
+        assert_eq!(plan.moves[0].destination_path, "Manual Library/Project");
 
         let session = apply_managed_directory_adoption(
             &plan,
@@ -1778,10 +1798,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(session.state, ManagedSetupState::Completed);
-        assert!(source.path().join("Kept/Project/readme.md").is_file());
+        assert!(
+            source
+                .path()
+                .join("Manual Library/Project/readme.md")
+                .is_file()
+        );
         assert!(source.path().join("loose.txt").is_file());
-        assert!(source.path().join("Inbox").is_dir());
-        assert!(source.path().join("Library").is_dir());
+        assert!(source.path().join("Recents").is_dir());
+        assert!(source.path().join("AI Library").is_dir());
     }
 
     #[test]
@@ -1808,7 +1833,7 @@ mod tests {
 
         assert_eq!(undo.state, ManagedSetupUndoState::Completed);
         assert!(source.path().join("Project/readme.md").is_file());
-        assert!(!source.path().join("Kept/Project").exists());
+        assert!(!source.path().join("Manual Library/Project").exists());
         for area in MANAGED_AREAS {
             assert!(source.path().join(area).is_dir());
         }
@@ -1836,7 +1861,7 @@ mod tests {
                 .contains("changed after directory adoption planning")
         );
         assert!(source.path().join("Project/new.txt").is_file());
-        assert!(!source.path().join("Kept/Project").exists());
+        assert!(!source.path().join("Manual Library/Project").exists());
     }
 
     #[test]
@@ -1851,9 +1876,14 @@ mod tests {
 
         let setup = apply_managed_setup(&plan, &apply_path).unwrap();
         assert_eq!(setup.state, ManagedSetupState::Completed);
-        assert!(source.path().join("Inbox/loose.txt").is_file());
-        assert!(source.path().join("Kept/Projects/readme.md").is_file());
-        assert!(source.path().join("Library").is_dir());
+        assert!(source.path().join("Recents/loose.txt").is_file());
+        assert!(
+            source
+                .path()
+                .join("Manual Library/Projects/readme.md")
+                .is_file()
+        );
+        assert!(source.path().join("AI Library").is_dir());
         assert_eq!(
             fs::metadata(&apply_path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -1913,7 +1943,7 @@ mod tests {
         create_journal(&journal, &session, source.path()).unwrap();
         fs::rename(
             source.path().join("loose.txt"),
-            source.path().join("Inbox/loose.txt"),
+            source.path().join("Recents/loose.txt"),
         )
         .unwrap();
 
@@ -1979,12 +2009,12 @@ mod tests {
         )
         .unwrap();
         fs::rename(
-            source.path().join("Inbox"),
+            source.path().join("Recents"),
             journals.path().join("original-inbox"),
         )
         .unwrap();
         fs::write(outside.path().join("loose.txt"), b"outside").unwrap();
-        symlink(outside.path(), source.path().join("Inbox")).unwrap();
+        symlink(outside.path(), source.path().join("Recents")).unwrap();
 
         let undo = undo_managed_setup(&setup, &journals.path().join("undo.json")).unwrap();
 
@@ -2008,18 +2038,27 @@ mod tests {
             &journals.path().join("setup.json"),
         )
         .unwrap();
-        fs::write(source.path().join("Kept/Projects/new.txt"), b"new").unwrap();
+        fs::write(
+            source.path().join("Manual Library/Projects/new.txt"),
+            b"new",
+        )
+        .unwrap();
         fs::write(source.path().join("loose.txt"), b"occupied").unwrap();
 
         let undo = undo_managed_setup(&setup, &journals.path().join("undo.json")).unwrap();
 
         assert_eq!(undo.state, ManagedSetupUndoState::PartialFailure);
-        assert!(source.path().join("Kept/Projects/new.txt").is_file());
+        assert!(
+            source
+                .path()
+                .join("Manual Library/Projects/new.txt")
+                .is_file()
+        );
         assert_eq!(
             fs::read(source.path().join("loose.txt")).unwrap(),
             b"occupied"
         );
-        assert!(source.path().join("Inbox/loose.txt").is_file());
+        assert!(source.path().join("Recents/loose.txt").is_file());
     }
 
     #[test]

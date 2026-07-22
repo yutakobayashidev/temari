@@ -18,8 +18,9 @@ use temari_core::{
     ManagedSetupSession, ManagedSetupState, ManagedSetupUndoSession,
     ManagedUndoMoveOutcome as ManagedSetupUndoMoveOutcome, ManagedWorkspace, RuleSet, RunState,
     SourceLock, StateStore, UndoMoveOutcome, UndoSession, UndoState, build_managed_setup_plan,
-    canonical_source_identity, fingerprint_candidate, inbox_file_candidates, resume_managed_setup,
-    undo_managed_setup, undo_session_files_with_lock, undo_session_with_lock,
+    canonical_source_identity, detect_managed_area_layout, fingerprint_candidate,
+    inbox_file_candidates, resume_managed_setup, undo_managed_setup, undo_session_files_with_lock,
+    undo_session_with_lock,
 };
 #[cfg(test)]
 use temari_core::{
@@ -139,7 +140,7 @@ pub enum ManagedCommand {
         /// New directory for setup artifacts and the recovery journal.
         #[arg(long)]
         out: PathBuf,
-        /// Minimum Inbox age before classification.
+        /// Minimum Recents age before classification.
         #[arg(long, default_value_t = 86_400)]
         retention_seconds: u64,
         /// Minimum unchanged time before classification.
@@ -151,7 +152,7 @@ pub enum ManagedCommand {
     },
     /// List managed workspaces.
     List,
-    /// Show one workspace, its Inbox state, and indexed runs.
+    /// Show one workspace, its Recents state, and indexed runs.
     Status {
         /// Managed workspace ID.
         id: String,
@@ -160,7 +161,7 @@ pub enum ManagedCommand {
     Enable { id: String },
     /// Disable new managed runs without changing files or recovery artifacts.
     Disable { id: String },
-    /// Change Inbox retention and stability windows.
+    /// Change Recents retention and stability windows.
     Edit {
         id: String,
         #[arg(long)]
@@ -174,14 +175,14 @@ pub enum ManagedCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Reconcile the Inbox filesystem with its mutable SQLite index.
+    /// Reconcile the Recents filesystem with its mutable SQLite index.
     Reconcile { id: String },
     /// Configure deterministic local routing rules for managed workspaces.
     Rule {
         #[command(subcommand)]
         command: RuleCommand,
     },
-    /// Inspect and edit the approved Library structure.
+    /// Inspect and edit the approved AI Library structure.
     Library {
         #[command(subcommand)]
         command: LibraryCommand,
@@ -205,7 +206,7 @@ pub enum ManagedCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Move selected protected or classified files back through Inbox.
+    /// Move selected protected or classified files back through Recents.
     Reprocess {
         /// Managed workspace ID.
         id: String,
@@ -215,7 +216,7 @@ pub enum ManagedCommand {
         /// Area-relative file or directory to include; repeat for multiple paths.
         #[arg(long = "path", conflicts_with = "all")]
         paths: Vec<String>,
-        /// Reprocess every file in Library. Not allowed for Kept.
+        /// Reprocess every file in AI Library. Not allowed for Manual Library.
         #[arg(long, conflicts_with = "paths")]
         all: bool,
         /// New directory for the reviewed Plan and optional Apply journal.
@@ -346,7 +347,7 @@ pub enum LibraryCommand {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Build a read-only Library edit Plan.
+    /// Build a read-only AI Library edit Plan.
     Plan {
         /// Managed workspace ID.
         workspace_id: String,
@@ -356,15 +357,15 @@ pub enum LibraryCommand {
         #[command(subcommand)]
         operation: LibraryPlanCommand,
     },
-    /// Apply a reviewed Library edit Plan.
+    /// Apply a reviewed AI Library edit Plan.
     Apply {
-        /// Reviewed Library edit Plan JSON.
+        /// Reviewed AI Library edit Plan JSON.
         plan: PathBuf,
         /// Confirm the binding change without prompting.
         #[arg(long)]
         yes: bool,
     },
-    /// Undo a completed Library edit using a run-owned journal.
+    /// Undo a completed AI Library edit using a run-owned journal.
     Undo {
         /// Managed workspace ID.
         workspace_id: String,
@@ -374,7 +375,7 @@ pub enum LibraryCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Resume an interrupted Library edit Apply or Undo.
+    /// Resume an interrupted AI Library edit Apply or Undo.
     Resume {
         /// Managed workspace ID.
         workspace_id: String,
@@ -385,7 +386,7 @@ pub enum LibraryCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum LibraryPlanCommand {
-    /// Add a model-visible Library destination.
+    /// Add a model-visible AI Library destination.
     Add {
         #[arg(long)]
         path: String,
@@ -1038,7 +1039,7 @@ fn status(cli: &Cli, id: &str) -> Result<()> {
     let physical_inbox_files = match inbox_file_candidates(Path::new(&workspace.source)) {
         Ok(files) => files.len(),
         Err(error) => {
-            issues.push(format!("Inbox scan failed: {error}"));
+            issues.push(format!("Recents scan failed: {error}"));
             0
         }
     };
@@ -1095,7 +1096,7 @@ fn status(cli: &Cli, id: &str) -> Result<()> {
         println!("Workspace: {}", workspace.id);
         println!("Source: {}", workspace.source);
         println!(
-            "Inbox: {physical_inbox_files} files, {} pending, {} planned, {} eligible now",
+            "Recents: {physical_inbox_files} files, {} pending, {} planned, {} eligible now",
             count_state(InboxState::Pending),
             count_state(InboxState::Planned),
             eligible_now
@@ -1667,7 +1668,7 @@ fn validate_workspace_binding(
     {
         bail!("managed monitor no longer matches its workspace");
     }
-    for area in ["Kept", "Inbox", "Library"] {
+    for area in detect_managed_area_layout(&source)?.areas() {
         let path = source.join(area);
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("failed to inspect managed area {}", path.display()))?;
@@ -2143,7 +2144,7 @@ mod tests {
             plan.after_folders
                 .folders
                 .iter()
-                .any(|folder| folder.path == "Library/Research")
+                .any(|folder| folder.path == "AI Library/Research")
         );
 
         library_apply(&cli, &plan_path, true).unwrap();
@@ -2194,7 +2195,7 @@ mod tests {
             restored
                 .folders
                 .iter()
-                .all(|folder| folder.path != "Library/Research")
+                .all(|folder| folder.path != "AI Library/Research")
         );
     }
 
@@ -2231,10 +2232,38 @@ mod tests {
             .activate_workspace(&setup, &raw_folders, &config_path, 60, 1)
             .unwrap();
         let workspace_id = activation.workspace.id;
-        StateStore::open(&state_path)
-            .unwrap()
+        let mut store = StateStore::open(&state_path).unwrap();
+        let disabled = store
             .set_managed_workspace_enabled(&workspace_id, false, unix_ms().unwrap())
             .unwrap();
+        for (current, legacy) in [
+            ("Manual Library", "Kept"),
+            ("Recents", "Inbox"),
+            ("AI Library", "Library"),
+        ] {
+            fs::rename(source.join(current), source.join(legacy)).unwrap();
+        }
+        let mut legacy_folders = FolderSet::load(Path::new(&disabled.folder_set_path)).unwrap();
+        for folder in &mut legacy_folders.folders {
+            let suffix = folder.path.strip_prefix("AI Library").unwrap();
+            folder.path = format!("Library{suffix}");
+        }
+        legacy_folders.validate().unwrap();
+        let legacy_path = root.path().join("legacy-folders.json");
+        write_artifact(&legacy_path, &legacy_folders).unwrap();
+        store
+            .replace_managed_folder_set_binding(
+                &workspace_id,
+                "test-legacy-area-binding",
+                &disabled.folder_set_path,
+                &disabled.folder_set_sha256,
+                &legacy_path.display().to_string(),
+                &legacy_folders.sha256().unwrap(),
+                None,
+                unix_ms().unwrap(),
+            )
+            .unwrap();
+        drop(store);
         let cli = Cli {
             config: config_path,
             state: Some(state_path.clone()),
@@ -2378,8 +2407,12 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(source.join("Inbox/baseline.txt").is_file());
-        assert!(source.join("Kept/ExistingDirectory/kept.txt").is_file());
+        assert!(source.join("Recents/baseline.txt").is_file());
+        assert!(
+            source
+                .join("Manual Library/ExistingDirectory/kept.txt")
+                .is_file()
+        );
 
         let store = StateStore::open(&state_path).unwrap();
         let workspace = store.managed_workspaces().unwrap().pop().unwrap();
@@ -2400,12 +2433,12 @@ mod tests {
             managed_folders
                 .folders
                 .iter()
-                .all(|folder| folder.path.starts_with("Library/"))
+                .all(|folder| folder.path.starts_with("AI Library/"))
         );
         let destination_id = managed_folders
             .folders
             .iter()
-            .find(|folder| folder.path == "Library/Documents")
+            .find(|folder| folder.path == "AI Library/Documents")
             .unwrap()
             .id
             .clone();
@@ -2436,8 +2469,8 @@ mod tests {
         fs::write(source.join("other.txt"), b"other").unwrap();
         let cycle_root = root.path().join("cycle");
         run_cycle(&cli, &workspace.id, Some(&cycle_root), true, true).unwrap();
-        assert!(source.join("Inbox/fresh.txt").is_file());
-        assert!(source.join("Inbox/other.txt").is_file());
+        assert!(source.join("Recents/fresh.txt").is_file());
+        assert!(source.join("Recents/other.txt").is_file());
         let mut store = StateStore::open(&state_path).unwrap();
         let mut stage = store
             .managed_runs(&workspace.id)
@@ -2462,7 +2495,7 @@ mod tests {
             .iter()
             .find(|movement| movement.source_path == "fresh.txt")
             .unwrap();
-        assert_eq!(fresh_move.destination_path, "Inbox/fresh.txt");
+        assert_eq!(fresh_move.destination_path, "Recents/fresh.txt");
         assert!(!fresh_move.undone);
         let other_file_id = moves
             .iter()
@@ -2481,7 +2514,7 @@ mod tests {
                 .inbox_items(&workspace.id)
                 .unwrap()
                 .iter()
-                .all(|item| item.relative_path != "Inbox/fresh.txt")
+                .all(|item| item.relative_path != "Recents/fresh.txt")
         );
         let moves = managed_move_history(&store, &workspace.id, 20).unwrap();
         assert_eq!(moves.len(), 2);
@@ -2518,7 +2551,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1_100));
         let classify_root = root.path().join("classify-cycle");
         run_cycle(&cli, &workspace.id, Some(&classify_root), true, true).unwrap();
-        assert!(source.join("Library/Documents/baseline.txt").is_file());
+        assert!(source.join("AI Library/Documents/baseline.txt").is_file());
         let store = StateStore::open(&state_path).unwrap();
         let classify = store
             .managed_runs(&workspace.id)
@@ -2534,14 +2567,14 @@ mod tests {
 
         let classify_undo_path = root.path().join("classify-undo.json");
         undo_run(&cli, &classify.id, &classify_undo_path, &[], true).unwrap();
-        assert!(source.join("Inbox/baseline.txt").is_file());
+        assert!(source.join("Recents/baseline.txt").is_file());
         let store = StateStore::open(&state_path).unwrap();
         assert_eq!(
             store
                 .inbox_items(&workspace.id)
                 .unwrap()
                 .into_iter()
-                .find(|item| item.relative_path == "Inbox/baseline.txt")
+                .find(|item| item.relative_path == "Recents/baseline.txt")
                 .unwrap()
                 .state,
             InboxState::Pending
@@ -2550,10 +2583,10 @@ mod tests {
 
         let reclassify_root = root.path().join("reclassify-cycle");
         run_cycle(&cli, &workspace.id, Some(&reclassify_root), true, true).unwrap();
-        assert!(source.join("Library/Documents/baseline.txt").is_file());
+        assert!(source.join("AI Library/Documents/baseline.txt").is_file());
 
         fs::rename(
-            source.join("Library/Documents/baseline.txt"),
+            source.join("AI Library/Documents/baseline.txt"),
             source.join("baseline.txt"),
         )
         .unwrap();
@@ -2562,7 +2595,11 @@ mod tests {
         let intent_cycle_root = root.path().join("intent-cycle");
         run_cycle(&cli, &workspace.id, Some(&intent_cycle_root), true, true).unwrap();
         assert!(source.join("baseline.txt").is_file());
-        assert!(source.join("Kept/NewManualDirectory/note.txt").is_file());
+        assert!(
+            source
+                .join("Manual Library/NewManualDirectory/note.txt")
+                .is_file()
+        );
         assert!(
             intent_cycle_root
                 .join("directory-adoption-plan.json")
@@ -2575,7 +2612,7 @@ mod tests {
         );
         fs::rename(
             source.join("baseline.txt"),
-            source.join("Library/Documents/baseline.txt"),
+            source.join("AI Library/Documents/baseline.txt"),
         )
         .unwrap();
 
@@ -2591,7 +2628,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(source.join("Inbox/baseline.txt").is_file());
+        assert!(source.join("Recents/baseline.txt").is_file());
         let store = StateStore::open(&state_path).unwrap();
         let reprocess_run = store
             .managed_runs(&workspace.id)
@@ -2612,7 +2649,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(source.join("Library/Documents/baseline.txt").is_file());
+        assert!(source.join("AI Library/Documents/baseline.txt").is_file());
 
         set_workspace_enabled(&cli, &workspace.id, false).unwrap();
         assert!(run_cycle(&cli, &workspace.id, None, false, false).is_err());
@@ -2665,6 +2702,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(source.join("Library/Documents/baseline.txt").is_file());
+        assert!(source.join("AI Library/Documents/baseline.txt").is_file());
     }
 }

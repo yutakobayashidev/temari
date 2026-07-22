@@ -49,11 +49,12 @@ pub use managed::{
     undo_managed_directory_adoption, undo_managed_setup, undo_managed_setup_with_lock,
 };
 pub use managed_area_migration::{
-    CURRENT_MANAGED_AREAS, LEGACY_MANAGED_AREAS, ManagedAreaMigrationMove,
+    CURRENT_MANAGED_AREAS, LEGACY_MANAGED_AREAS, ManagedAreaLayout, ManagedAreaMigrationMove,
     ManagedAreaMigrationOutcome, ManagedAreaMigrationPlan, ManagedAreaMigrationRecord,
     ManagedAreaMigrationSession, ManagedAreaMigrationState, ManagedAreaMigrationUndoSession,
     apply_managed_area_migration, apply_managed_area_migration_with_lock,
-    resume_managed_area_migration, resume_managed_area_migration_undo, undo_managed_area_migration,
+    detect_managed_area_layout, resume_managed_area_migration, resume_managed_area_migration_undo,
+    undo_managed_area_migration,
 };
 pub use managed_cycle::{
     INBOX_DIRECTORY, KEPT_DIRECTORY, LIBRARY_DIRECTORY, ManagedReprocessArea,

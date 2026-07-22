@@ -63,7 +63,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Normal workflow: manage a long-lived Kept, Inbox, and Library workspace.
+    /// Normal workflow: manage a long-lived Manual Library, Recents, and AI Library workspace.
     #[command(subcommand)]
     Managed(ManagedCommand),
 

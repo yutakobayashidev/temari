@@ -238,6 +238,7 @@ fn apply_edit(
     operation: &ManagedLibraryEdit,
     added_id: Option<String>,
 ) -> Result<(), Error> {
+    let library_root = managed_library_root(folders)?;
     match operation {
         ManagedLibraryEdit::Add { path, description } => {
             let id = added_id.ok_or_else(|| {
@@ -250,7 +251,7 @@ fn apply_edit(
             }
             folders.folders.push(ApprovedFolder {
                 id,
-                path: library_path(path)?,
+                path: library_path(library_root, path)?,
                 description: description.trim().to_owned(),
                 model_visible: true,
                 fallback: None,
@@ -259,7 +260,7 @@ fn apply_edit(
         ManagedLibraryEdit::Rename { id, path } => {
             let old_path = editable_folder(folders, id)?.path.clone();
             reject_approved_descendant(folders, id, &old_path)?;
-            editable_folder_mut(folders, id)?.path = library_path(path)?;
+            editable_folder_mut(folders, id)?.path = library_path(library_root, path)?;
         }
         ManagedLibraryEdit::EditDescription { id, description } => {
             editable_folder_mut(folders, id)?.description = description.trim().to_owned();
@@ -328,13 +329,34 @@ fn reject_approved_descendant(folders: &FolderSet, id: &str, parent: &str) -> Re
     Ok(())
 }
 
-fn library_path(path: &str) -> Result<String, Error> {
-    if path.starts_with("Library/") || path == "Library" {
+fn managed_library_root(folders: &FolderSet) -> Result<&'static str, Error> {
+    let has_current = folders
+        .folders
+        .iter()
+        .all(|folder| folder.path.starts_with("AI Library/"));
+    let has_legacy = folders
+        .folders
+        .iter()
+        .all(|folder| folder.path.starts_with("Library/"));
+    match (has_current, has_legacy) {
+        (true, false) => Ok("AI Library"),
+        (false, true) => Ok("Library"),
+        _ => Err(Error::InvalidArtifact(
+            "managed FolderSet does not use one recognized Library root".into(),
+        )),
+    }
+}
+
+fn library_path(library_root: &str, path: &str) -> Result<String, Error> {
+    if ["Library", "AI Library"]
+        .iter()
+        .any(|root| path == *root || path.starts_with(&format!("{root}/")))
+    {
         return Err(Error::InvalidArtifact(
             "Library destination paths are relative to Library".into(),
         ));
     }
-    Ok(format!("Library/{path}"))
+    Ok(format!("{library_root}/{path}"))
 }
 
 fn validate_digest(value: &str) -> Result<(), Error> {
@@ -410,7 +432,7 @@ mod tests {
             .iter()
             .find(|folder| folder.id == original.id)
             .unwrap();
-        assert_eq!(folder.path, "Library/Archive");
+        assert_eq!(folder.path, "AI Library/Archive");
         assert_eq!(folder.description, original.description);
 
         let described = plan(
@@ -439,11 +461,9 @@ mod tests {
             },
             Some("destination-new"),
         );
-        assert!(
-            added.after_folders.folders.iter().any(|folder| {
-                folder.id == "destination-new" && folder.path == "Library/Research"
-            })
-        );
+        assert!(added.after_folders.folders.iter().any(|folder| {
+            folder.id == "destination-new" && folder.path == "AI Library/Research"
+        }));
 
         let fallback = folders()
             .folders

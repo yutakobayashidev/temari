@@ -19,8 +19,9 @@ use temari_core::{
     ManagedReprocessSelection, ManagedRun, ManagedRunKind, ManagedService, ManagedSetupPlan,
     ManagedSetupSession, ManagedSetupUndoSession, ManagedSetupUndoState, ManagedUndoMoveOutcome,
     ManagedWorkspace, OpenAiCompatibleModel, Proposal, RunState, ScanScope, SourceLock, StateStore,
-    UndoMoveOutcome, UndoSession, build_managed_setup_plan, inbox_file_candidates, scan_directory,
-    select_representative_files, undo_session_files_with_lock, undo_session_with_lock,
+    UndoMoveOutcome, UndoSession, build_managed_setup_plan, detect_managed_area_layout,
+    inbox_file_candidates, scan_directory, select_representative_files,
+    undo_session_files_with_lock, undo_session_with_lock,
 };
 use temari_schedule::{
     ScheduleSpec, ScheduleStatus as CoreScheduleStatus, SchedulerPlatform, install_schedule,
@@ -888,34 +889,39 @@ fn workspace_status(
             editable_library_folders(&folders)
         }
         Ok(_) => {
-            issues.push("Library FolderSet binding does not match the workspace".into());
+            issues.push("AI Library FolderSet binding does not match the workspace".into());
             Vec::new()
         }
         Err(error) => {
-            issues.push(format!("Library FolderSet could not be loaded: {error}"));
+            issues.push(format!("AI Library FolderSet could not be loaded: {error}"));
             Vec::new()
         }
     };
     let physical_files = match inbox_file_candidates(Path::new(&workspace.source)) {
         Ok(files) => files.len(),
         Err(error) => {
-            issues.push(format!("Inbox scan failed: {error}"));
+            issues.push(format!("Recents scan failed: {error}"));
             0
         }
     };
-    for area in ["Kept", "Inbox", "Library"] {
-        let path = Path::new(&workspace.source).join(area);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => issues.push(format!(
-                "managed area is not a real directory: {}",
-                path.display()
-            )),
-            Err(error) => issues.push(format!(
-                "could not inspect managed area {}: {error}",
-                path.display()
-            )),
+    match detect_managed_area_layout(Path::new(&workspace.source)) {
+        Ok(layout) => {
+            for area in layout.areas() {
+                let path = Path::new(&workspace.source).join(area);
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                    Ok(_) => issues.push(format!(
+                        "managed area is not a real directory: {}",
+                        path.display()
+                    )),
+                    Err(error) => issues.push(format!(
+                        "could not inspect managed area {}: {error}",
+                        path.display()
+                    )),
+                }
+            }
         }
+        Err(error) => issues.push(format!("managed area layout is invalid: {error}")),
     }
     let actionable = runs
         .iter()
@@ -987,7 +993,8 @@ fn editable_library_folders(folders: &FolderSet) -> Vec<LibraryFolderView> {
             id: folder.id.clone(),
             path: folder
                 .path
-                .strip_prefix("Library/")
+                .strip_prefix("AI Library/")
+                .or_else(|| folder.path.strip_prefix("Library/"))
                 .unwrap_or(&folder.path)
                 .into(),
             description: folder.description.clone(),
@@ -1087,13 +1094,23 @@ fn preview_workspace(
 }
 
 fn preview_view(preview: &PreviewDraft) -> Result<SetupPreviewView, String> {
-    let mut directories = vec!["Kept".into(), "Inbox".into(), "Library".into()];
+    let manual_area = preview
+        .plan
+        .areas
+        .first()
+        .ok_or_else(|| "setup preview has no Manual Library area".to_owned())?;
+    let library_area = preview
+        .plan
+        .areas
+        .get(2)
+        .ok_or_else(|| "setup preview has no AI Library area".to_owned())?;
+    let mut directories = preview.plan.areas.clone();
     directories.extend(
         preview
             .folders
             .folders
             .iter()
-            .map(|folder| format!("Library/{}", folder.path)),
+            .map(|folder| format!("{library_area}/{}", folder.path)),
     );
     let moves = preview
         .plan
@@ -1102,7 +1119,10 @@ fn preview_view(preview: &PreviewDraft) -> Result<SetupPreviewView, String> {
         .map(|movement| SetupMoveView {
             source_path: movement.source_path.clone(),
             destination_path: movement.destination_path.clone(),
-            area: if movement.destination_path.starts_with("Kept/") {
+            area: if movement
+                .destination_path
+                .starts_with(&format!("{manual_area}/"))
+            {
                 "kept".into()
             } else {
                 "inbox".into()
@@ -1831,7 +1851,11 @@ timeout_seconds = 2
         assert_eq!(history[0].session_id, adoption.run_id);
         assert_eq!(history[0].kind, ManagedRunKind::Adopt);
         assert!(!history[0].undone);
-        assert!(source.join("Kept/NewManualDirectory/note.txt").is_file());
+        assert!(
+            source
+                .join("Manual Library/NewManualDirectory/note.txt")
+                .is_file()
+        );
         assert!(
             undo_managed_at(
                 &state,
@@ -1850,7 +1874,7 @@ timeout_seconds = 2
         assert_eq!(result.restored_files, 1);
         assert_eq!(result.conflicts, 0);
         assert!(source.join("NewManualDirectory/note.txt").is_file());
-        assert!(!source.join("Kept/NewManualDirectory").exists());
+        assert!(!source.join("Manual Library/NewManualDirectory").exists());
         let history = history_at(&state, &activation.workspace.id, 20).unwrap();
         assert_eq!(history.len(), 1);
         assert!(history[0].undone);

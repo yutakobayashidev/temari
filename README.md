@@ -4,7 +4,7 @@
 
 Proposal, approval, and planning are read-only. Filesystem changes require a separate confirmed `apply` command and produce a durable JSON journal that can be inspected or passed to `undo`. The default `ask` privacy policy requests per-run consent only when names are ambiguous; only bounded extracted text is eligible to be sent. The application does not send telemetry.
 
-For a long-lived folder, the managed workflow creates three physical areas: `Kept` protects existing directories, `Inbox` holds new files through a configurable retention and stability window, and `Library` contains AI-classified files under the reviewed folder hierarchy. Initial setup and every later move remain separately planned, journaled, and undoable.
+For a long-lived folder, the managed workflow creates three physical areas: `Manual Library` protects existing directories, `Recents` holds new files through a configurable retention and stability window, and `AI Library` contains classified files under the reviewed folder hierarchy. Initial setup and every later move remain separately planned, journaled, and undoable.
 
 ## Trust boundaries
 
@@ -42,7 +42,7 @@ $ cargo run -p temari-cli -- managed apply downloads.setup-plan.json \
     --out ~/.local/state/temari/downloads-setup
 ```
 
-This creates `Kept`, `Inbox`, and `Library`. Run one reviewed cycle with `temari managed run <WORKSPACE_ID>`; Temari allocates a private artifact directory below its state directory. Add `--apply --yes` when the generated Plans should be applied, or keep `--out <RUN_DIR>` when a caller needs an explicit location.
+This creates `Manual Library`, `Recents`, and `AI Library`. Run one reviewed cycle with `temari managed run <WORKSPACE_ID>`; Temari allocates a private artifact directory below its state directory. Add `--apply --yes` when the generated Plans should be applied, or keep `--out <RUN_DIR>` when a caller needs an explicit location.
 
 For a one-time folder cleanup instead of ongoing management, use the TTY-only `organize` command:
 
@@ -71,7 +71,7 @@ $ cargo run -p temari-cli -- resume downloads.apply.json
 
 ## Desktop proof of concept
 
-`apps/temari-desktop` contains a Tauri 2 proof of concept for Linux and macOS. Its primary surface is the same managed three-area workflow as the CLI: propose a Library hierarchy, review the exact setup preview, apply the backend-held preview, run finite organization cycles, inspect status and move history, reprocess selected files through Inbox, and undo either a complete run or one move. The CLI and desktop both call the shared `ManagedService` in `temari-core`; neither shells out to the other. OS schedule rendering and installation are shared through the separate `temari-schedule` crate.
+`apps/temari-desktop` contains a Tauri 2 proof of concept for Linux and macOS. Its primary surface is the same managed three-area workflow as the CLI: propose an AI Library hierarchy, review the exact setup preview, apply the backend-held preview, run finite organization cycles, inspect status and move history, reprocess selected files through Recents, and undo either a complete run or one move. The CLI and desktop both call the shared `ManagedService` in `temari-core`; neither shells out to the other. OS schedule rendering and installation are shared through the separate `temari-schedule` crate.
 
 ```console
 $ nix develop
@@ -83,7 +83,7 @@ Desktop automatically loads `config.toml` from the platform application-config d
 
 ## Managed workspaces
 
-Managed setup is deliberately split into read-only planning and confirmed apply. Existing directories move to `Kept`, existing loose files move to `Inbox`, and the reviewed folder set is namespaced below `Library` without changing its opaque destination IDs.
+Managed setup is deliberately split into read-only planning and confirmed apply. Existing directories move to `Manual Library`, existing loose files move to `Recents`, and the reviewed folder set is namespaced below `AI Library` without changing its opaque destination IDs.
 
 ```console
 $ temari managed init ~/Downloads --out downloads.setup-plan.json
@@ -110,15 +110,15 @@ $ temari managed schedule install <WORKSPACE_ID> \
     --every-seconds 300 --executable ~/.local/bin/temari --yes
 ```
 
-The first `managed run` is read-only unless `--apply --yes` is supplied. A run adopts newly created root directories into `Kept`, stages new root files into `Inbox`, then considers only direct Inbox files whose retention and stability deadlines have passed. A file manually returned from `Library` to the root keeps its processed identity and is not staged again; explicit `managed reprocess` remains the way to request reclassification. A directory manually returned from `Kept`, including by Undo, is likewise left at the root; Temari derives this intent from its authoritative setup and adoption journals, while a newly created directory with the same name but a different filesystem identity is still adopted. Classification writes a normal Plan before Apply. `managed history` lists file moves and root-directory adoptions with their Undo state. `managed undo` accepts a displayed file ID or original source-relative path for file runs; directory adoption is undone as one complete session without removing the managed areas. Every Undo remains an authoritative JSON journal.
+The first `managed run` is read-only unless `--apply --yes` is supplied. A run adopts newly created root directories into `Manual Library`, stages new root files into `Recents`, then considers only direct Recents files whose retention and stability deadlines have passed. A file manually returned from `AI Library` to the root keeps its processed identity and is not staged again; explicit `managed reprocess` remains the way to request reclassification. A directory manually returned from `Manual Library`, including by Undo, is likewise left at the root; Temari derives this intent from its authoritative setup and adoption journals, while a newly created directory with the same name but a different filesystem identity is still adopted. Classification writes a normal Plan before Apply. `managed history` lists file moves and root-directory adoptions with their Undo state. `managed undo` accepts a displayed file ID or original source-relative path for file runs; directory adoption is undone as one complete session without removing the managed areas. Every Undo remains an authoritative JSON journal.
 
-Arrival time is the first local observation stored in SQLite, not file modification time. Editing or replacing a pending file resets its stability deadline. `Kept` is never recursively scanned, and `Library` is always excluded as an approved destination subtree.
+Arrival time is the first local observation stored in SQLite, not file modification time. Editing or replacing a pending file resets its stability deadline. `Manual Library` is never recursively scanned, and `AI Library` is always excluded as an approved destination subtree.
 
-`managed reprocess` creates a model-free reviewed Plan from explicitly selected `Kept` or `Library` files back to `Inbox`; normal retention and classification then apply. Library supports explicit `--all`, while Kept always requires `--path`. Workspace registration can be enabled, disabled, edited, reconciled, and removed without deleting the three physical areas or JSON recovery artifacts.
+`managed reprocess` creates a model-free reviewed Plan from explicitly selected `Manual Library` or `AI Library` files back to `Recents`; normal retention and classification then apply. AI Library supports explicit `--all`, while Manual Library always requires `--path`. Workspace registration can be enabled, disabled, edited, reconciled, and removed without deleting the three physical areas or JSON recovery artifacts.
 
-`managed library` edits the approved Library structure while a workspace is disabled. `show` exports the current FolderSet, and `plan add|rename|describe|delete` writes a reviewable immutable Plan. `apply` changes the workspace's FolderSet binding only: it does not move files or rename or delete physical directories. Each completed Configure run owns its recovery artifacts, so `undo <WORKSPACE_ID> <RUN_ID>` does not accept a caller-selected journal path and `resume` dispatches interrupted Apply or Undo recovery from the recorded run state.
+`managed library` edits the approved AI Library structure while a workspace is disabled. `show` exports the current FolderSet, and `plan add|rename|describe|delete` writes a reviewable immutable Plan. `apply` changes the workspace's FolderSet binding only: it does not move files or rename or delete physical directories. Each completed Configure run owns its recovery artifacts, so `undo <WORKSPACE_ID> <RUN_ID>` does not accept a caller-selected journal path and `resume` dispatches interrupted Apply or Undo recovery from the recorded run state.
 
-Legacy managed workspaces use the explicit `managed migrate` workflow to adopt the current Manual Library, Recents, and AI Library layout. `plan` is read-only; `apply` requires confirmation; and `undo` and `resume` use only run-owned recovery artifacts. Newly created workspaces already use the current layout and do not require migration.
+Legacy workspaces using `Kept`, `Inbox`, and `Library` continue to run without an implicit mutation. The explicit `managed migrate` workflow adopts the current `Manual Library`, `Recents`, and `AI Library` layout. `plan` is read-only; `apply` requires confirmation; and `undo` and `resume` use only run-owned recovery artifacts. Newly created workspaces already use the current layout and do not require migration.
 
 The portable monitoring engine, processed signatures, local rules, and run reconciliation remain internal Core services used by `managed`. There is no separate public monitor workflow or resident Temari daemon. Explicit `managed schedule` commands render, install, inspect, or uninstall a systemd user timer on Linux or a per-user launchd agent on macOS. Scheduled definitions run the same finite `managed run --apply --yes` service with absolute paths and no shell; installation never happens during workspace setup.
 

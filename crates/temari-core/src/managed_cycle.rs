@@ -4,14 +4,17 @@ use std::{
     path::Path,
 };
 
+use crate::managed_area_migration::{
+    CURRENT_MANAGED_AREAS, LEGACY_MANAGED_AREAS, ManagedAreaLayout, detect_managed_area_layout,
+};
 use crate::{
     Classification, ClassificationBasis, Error, FileCandidate, FolderProposal, FolderSet, Plan,
     Proposal, ScanScope, build_plan, canonical_source_identity, scan_directory,
 };
 
-pub const KEPT_DIRECTORY: &str = "Kept";
-pub const INBOX_DIRECTORY: &str = "Inbox";
-pub const LIBRARY_DIRECTORY: &str = "Library";
+pub const KEPT_DIRECTORY: &str = CURRENT_MANAGED_AREAS[0];
+pub const INBOX_DIRECTORY: &str = CURRENT_MANAGED_AREAS[1];
+pub const LIBRARY_DIRECTORY: &str = CURRENT_MANAGED_AREAS[2];
 pub const STAGE_TO_INBOX_RULE_ID: &str = "managed-stage-to-inbox";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,10 +30,10 @@ pub enum ManagedReprocessSelection {
 }
 
 impl ManagedReprocessArea {
-    fn directory(self) -> &'static str {
+    fn directory(self, layout: ManagedAreaLayout) -> &'static str {
         match self {
-            Self::Kept => KEPT_DIRECTORY,
-            Self::Library => LIBRARY_DIRECTORY,
+            Self::Kept => layout.manual(),
+            Self::Library => layout.library(),
         }
     }
 }
@@ -65,6 +68,9 @@ pub fn root_file_candidates(source: &Path) -> Result<Vec<FileCandidate>, Error> 
             KEPT_DIRECTORY.into(),
             INBOX_DIRECTORY.into(),
             LIBRARY_DIRECTORY.into(),
+            LEGACY_MANAGED_AREAS[0].into(),
+            LEGACY_MANAGED_AREAS[1].into(),
+            LEGACY_MANAGED_AREAS[2].into(),
         ],
     )
 }
@@ -73,7 +79,9 @@ pub fn root_file_candidates(source: &Path) -> Result<Vec<FileCandidate>, Error> 
 /// paths remain relative to the managed root, not to Inbox itself.
 pub fn inbox_file_candidates(source: &Path) -> Result<Vec<FileCandidate>, Error> {
     let (source, _) = canonical_source_identity(source)?;
-    let inbox = source.join(INBOX_DIRECTORY);
+    let layout = detect_managed_area_layout(&source)?;
+    let inbox_name = layout.recents();
+    let inbox = source.join(inbox_name);
     let (resolved_inbox, inbox_identity) = canonical_source_identity(&inbox)?;
     if resolved_inbox != inbox {
         return Err(Error::InvalidArtifact(
@@ -89,7 +97,7 @@ pub fn inbox_file_candidates(source: &Path) -> Result<Vec<FileCandidate>, Error>
         ));
     }
     for candidate in &mut candidates {
-        candidate.source_path = format!("{INBOX_DIRECTORY}/{}", candidate.source_path);
+        candidate.source_path = format!("{inbox_name}/{}", candidate.source_path);
     }
     Ok(candidates)
 }
@@ -117,7 +125,8 @@ pub fn reprocess_file_candidates(
     }
 
     let (source, _) = canonical_source_identity(source)?;
-    let area_name = area.directory();
+    let layout = detect_managed_area_layout(&source)?;
+    let area_name = area.directory(layout);
     let area_path = source.join(area_name);
     let (resolved_area, area_identity) = canonical_source_identity(&area_path)?;
     if resolved_area != area_path {
@@ -169,11 +178,17 @@ pub fn build_stage_to_inbox_plan(
         validate_root_candidate(candidate)?;
     }
     let (source, _) = canonical_source_identity(source)?;
+    let layout = detect_managed_area_layout(&source)?;
     let source_text = source
         .to_str()
         .ok_or_else(|| Error::InvalidArtifact("managed source path must be valid UTF-8".into()))?;
-    let folders = stage_folder_set(source_text, ScanScope::default(), candidates.len())?;
-    build_to_inbox_plan(&source, candidates, &folders)
+    let folders = stage_folder_set(
+        source_text,
+        ScanScope::default(),
+        candidates.len(),
+        layout.recents(),
+    )?;
+    build_to_inbox_plan(&source, candidates, &folders, layout.recents())
 }
 
 /// Build an exact, model-free Plan that returns selected Kept or Library files
@@ -184,30 +199,33 @@ pub fn build_reprocess_to_inbox_plan(
     area: ManagedReprocessArea,
     candidates: &[FileCandidate],
 ) -> Result<Plan, Error> {
-    for candidate in candidates {
-        validate_reprocess_candidate(area, candidate)?;
-    }
     let (source, _) = canonical_source_identity(source)?;
+    let layout = detect_managed_area_layout(&source)?;
+    for candidate in candidates {
+        validate_reprocess_candidate(area, layout, candidate)?;
+    }
     let source_text = source
         .to_str()
         .ok_or_else(|| Error::InvalidArtifact("managed source path must be valid UTF-8".into()))?;
     let folders = stage_folder_set(
         source_text,
-        ScanScope::new(vec![area.directory().into()])?,
+        ScanScope::new(vec![area.directory(layout).into()])?,
         candidates.len(),
+        layout.recents(),
     )?;
-    build_to_inbox_plan(&source, candidates, &folders)
+    build_to_inbox_plan(&source, candidates, &folders, layout.recents())
 }
 
 fn build_to_inbox_plan(
     source: &Path,
     candidates: &[FileCandidate],
     folders: &FolderSet,
+    inbox_name: &str,
 ) -> Result<Plan, Error> {
     let inbox_id = folders
         .folders
         .iter()
-        .find(|folder| folder.path == INBOX_DIRECTORY)
+        .find(|folder| folder.path == inbox_name)
         .map(|folder| folder.id.clone())
         .ok_or_else(|| Error::InvalidState("stage folder set has no Inbox destination".into()))?;
     let classifications = candidates
@@ -274,6 +292,7 @@ fn stage_folder_set(
     source: &str,
     scope: ScanScope,
     files_considered: usize,
+    inbox_name: &str,
 ) -> Result<FolderSet, Error> {
     let folders = Proposal {
         version: 2,
@@ -281,7 +300,7 @@ fn stage_folder_set(
         scope,
         files_considered,
         folders: vec![FolderProposal {
-            path: INBOX_DIRECTORY.into(),
+            path: inbox_name.into(),
             description: "Files waiting in the managed Inbox".into(),
         }],
     }
@@ -376,17 +395,18 @@ fn validate_root_candidate(candidate: &FileCandidate) -> Result<(), Error> {
 
 fn validate_reprocess_candidate(
     area: ManagedReprocessArea,
+    layout: ManagedAreaLayout,
     candidate: &FileCandidate,
 ) -> Result<(), Error> {
     validate_candidate_id(candidate)?;
     crate::artifact::normalize_relative_path(&candidate.source_path)?;
     let relative = candidate
         .source_path
-        .strip_prefix(&format!("{}/", area.directory()))
+        .strip_prefix(&format!("{}/", area.directory(layout)))
         .ok_or_else(|| {
             Error::InvalidArtifact(format!(
                 "managed reprocessing candidate is outside {}: {:?}",
-                area.directory(),
+                area.directory(layout),
                 candidate.source_path
             ))
         })?;
@@ -414,11 +434,12 @@ fn validate_candidate_id(candidate: &FileCandidate) -> Result<(), Error> {
 
 fn validate_inbox_path(path: &str) -> Result<(), Error> {
     crate::artifact::normalize_relative_path(path)?;
-    let file_name = path
-        .strip_prefix(&format!("{INBOX_DIRECTORY}/"))
+    let file_name = [INBOX_DIRECTORY, LEGACY_MANAGED_AREAS[1]]
+        .iter()
+        .find_map(|area| path.strip_prefix(&format!("{area}/")))
         .ok_or_else(|| {
             Error::InvalidArtifact(format!(
-                "Inbox candidate must start with {INBOX_DIRECTORY}/: {path:?}"
+                "Recents candidate must start with a recognized managed waiting area: {path:?}"
             ))
         })?;
     if file_name.is_empty() || file_name.contains('/') {
@@ -434,9 +455,16 @@ fn first_component(path: &str) -> &str {
 }
 
 fn is_managed_area(path: &str) -> bool {
-    [KEPT_DIRECTORY, INBOX_DIRECTORY, LIBRARY_DIRECTORY]
-        .iter()
-        .any(|area| path.eq_ignore_ascii_case(area))
+    [
+        KEPT_DIRECTORY,
+        INBOX_DIRECTORY,
+        LIBRARY_DIRECTORY,
+        LEGACY_MANAGED_AREAS[0],
+        LEGACY_MANAGED_AREAS[1],
+        LEGACY_MANAGED_AREAS[2],
+    ]
+    .iter()
+    .any(|area| path.eq_ignore_ascii_case(area))
 }
 
 #[cfg(test)]
@@ -502,7 +530,7 @@ mod tests {
         let root = tempdir().unwrap();
         let once = library_folder_set(&approved(root.path())).unwrap();
         let error = library_folder_set(&once).unwrap_err();
-        assert!(error.to_string().contains("already inside Library"));
+        assert!(error.to_string().contains("already inside AI Library"));
     }
 
     #[test]
@@ -529,17 +557,17 @@ mod tests {
     fn scans_only_direct_inbox_regular_files_and_rejects_a_symlinked_inbox() {
         let root = tempdir().unwrap();
         fs::create_dir(root.path().join(INBOX_DIRECTORY)).unwrap();
-        fs::write(root.path().join("Inbox/a.txt"), b"a").unwrap();
-        fs::create_dir(root.path().join("Inbox/nested")).unwrap();
-        fs::write(root.path().join("Inbox/nested/b.txt"), b"b").unwrap();
+        fs::write(root.path().join("Recents/a.txt"), b"a").unwrap();
+        fs::create_dir(root.path().join("Recents/nested")).unwrap();
+        fs::write(root.path().join("Recents/nested/b.txt"), b"b").unwrap();
         symlink(
-            root.path().join("Inbox/a.txt"),
-            root.path().join("Inbox/linked"),
+            root.path().join("Recents/a.txt"),
+            root.path().join("Recents/linked"),
         )
         .unwrap();
 
         let candidates = inbox_file_candidates(root.path()).unwrap();
-        assert_eq!(candidates, [candidate("f000001", "Inbox/a.txt")]);
+        assert_eq!(candidates, [candidate("f000001", "Recents/a.txt")]);
 
         let other = tempdir().unwrap();
         let linked_root = tempdir().unwrap();
@@ -552,14 +580,22 @@ mod tests {
         let root = tempdir().unwrap();
         fs::create_dir(root.path().join(KEPT_DIRECTORY)).unwrap();
         fs::create_dir(root.path().join(LIBRARY_DIRECTORY)).unwrap();
-        fs::create_dir_all(root.path().join("Kept/Project/Nested")).unwrap();
-        fs::write(root.path().join("Kept/manual.txt"), b"manual").unwrap();
-        fs::write(root.path().join("Kept/Project/a.txt"), b"a").unwrap();
-        fs::write(root.path().join("Kept/Project/Nested/z.PDF"), b"z").unwrap();
-        fs::write(root.path().join("Kept/not-selected.txt"), b"ignored").unwrap();
+        fs::create_dir_all(root.path().join("Manual Library/Project/Nested")).unwrap();
+        fs::write(root.path().join("Manual Library/manual.txt"), b"manual").unwrap();
+        fs::write(root.path().join("Manual Library/Project/a.txt"), b"a").unwrap();
+        fs::write(
+            root.path().join("Manual Library/Project/Nested/z.PDF"),
+            b"z",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("Manual Library/not-selected.txt"),
+            b"ignored",
+        )
+        .unwrap();
         symlink(
-            root.path().join("Kept/not-selected.txt"),
-            root.path().join("Kept/Project/linked.txt"),
+            root.path().join("Manual Library/not-selected.txt"),
+            root.path().join("Manual Library/Project/linked.txt"),
         )
         .unwrap();
 
@@ -581,9 +617,9 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             [
-                ("f000001", "Kept/Project/Nested/z.PDF", "pdf"),
-                ("f000002", "Kept/Project/a.txt", "txt"),
-                ("f000003", "Kept/manual.txt", "txt"),
+                ("f000001", "Manual Library/Project/Nested/z.PDF", "pdf"),
+                ("f000002", "Manual Library/Project/a.txt", "txt"),
+                ("f000003", "Manual Library/manual.txt", "txt"),
             ]
         );
         assert_eq!(
@@ -597,10 +633,10 @@ mod tests {
     fn allows_full_library_selection_but_rejects_full_kept_selection() {
         let root = tempdir().unwrap();
         fs::create_dir(root.path().join(KEPT_DIRECTORY)).unwrap();
-        fs::create_dir_all(root.path().join("Library/Reports/2026")).unwrap();
-        fs::write(root.path().join("Library/root.txt"), b"root").unwrap();
+        fs::create_dir_all(root.path().join("AI Library/Reports/2026")).unwrap();
+        fs::write(root.path().join("AI Library/root.txt"), b"root").unwrap();
         fs::write(
-            root.path().join("Library/Reports/2026/report.pdf"),
+            root.path().join("AI Library/Reports/2026/report.pdf"),
             b"report",
         )
         .unwrap();
@@ -616,7 +652,7 @@ mod tests {
                 .iter()
                 .map(|file| file.source_path.as_str())
                 .collect::<Vec<_>>(),
-            ["Library/Reports/2026/report.pdf", "Library/root.txt"]
+            ["AI Library/Reports/2026/report.pdf", "AI Library/root.txt"]
         );
 
         let error = reprocess_file_candidates(
@@ -636,7 +672,7 @@ mod tests {
         fs::write(root.path().join("outside.txt"), b"outside").unwrap();
         symlink(
             root.path().join("outside.txt"),
-            root.path().join("Kept/linked.txt"),
+            root.path().join("Manual Library/linked.txt"),
         )
         .unwrap();
 
@@ -658,10 +694,10 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("must not be a symlink"));
 
-        fs::create_dir(root.path().join("Kept/InvalidName")).unwrap();
+        fs::create_dir(root.path().join("Manual Library/InvalidName")).unwrap();
         File::create(
             root.path()
-                .join("Kept/InvalidName")
+                .join("Manual Library/InvalidName")
                 .join(OsString::from_vec(vec![0xff])),
         )
         .unwrap();
@@ -706,7 +742,7 @@ mod tests {
         let plan = build_stage_to_inbox_plan(root.path(), &candidates).unwrap();
         plan.validate().unwrap();
         assert_eq!(plan.version, 4);
-        assert_eq!(plan.entries[0].destination_path, "Inbox/report.txt");
+        assert_eq!(plan.entries[0].destination_path, "Recents/report.txt");
         assert_eq!(
             plan.entries[0].classification_basis,
             ClassificationBasis::Rule
@@ -729,10 +765,10 @@ mod tests {
         let root = tempdir().unwrap();
         fs::create_dir(root.path().join(KEPT_DIRECTORY)).unwrap();
         fs::create_dir(root.path().join(INBOX_DIRECTORY)).unwrap();
-        fs::create_dir_all(root.path().join("Library/Alpha")).unwrap();
-        fs::create_dir_all(root.path().join("Library/Beta")).unwrap();
-        fs::write(root.path().join("Library/Alpha/report.txt"), b"alpha").unwrap();
-        fs::write(root.path().join("Library/Beta/report.txt"), b"beta").unwrap();
+        fs::create_dir_all(root.path().join("AI Library/Alpha")).unwrap();
+        fs::create_dir_all(root.path().join("AI Library/Beta")).unwrap();
+        fs::write(root.path().join("AI Library/Alpha/report.txt"), b"alpha").unwrap();
+        fs::write(root.path().join("AI Library/Beta/report.txt"), b"beta").unwrap();
 
         let candidates = reprocess_file_candidates(
             root.path(),
@@ -758,14 +794,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 (
-                    "Library/Alpha/report.txt",
-                    "Inbox/report.txt",
+                    "AI Library/Alpha/report.txt",
+                    "Recents/report.txt",
                     ClassificationBasis::Rule,
                     Some(STAGE_TO_INBOX_RULE_ID),
                 ),
                 (
-                    "Library/Beta/report.txt",
-                    "Inbox/report 1.txt",
+                    "AI Library/Beta/report.txt",
+                    "Recents/report 1.txt",
                     ClassificationBasis::Rule,
                     Some(STAGE_TO_INBOX_RULE_ID),
                 ),
@@ -784,11 +820,11 @@ mod tests {
         fs::create_dir(root.path().join(KEPT_DIRECTORY)).unwrap();
         fs::create_dir(root.path().join(INBOX_DIRECTORY)).unwrap();
         fs::create_dir(root.path().join(LIBRARY_DIRECTORY)).unwrap();
-        fs::write(root.path().join("Kept/manual.txt"), b"manual").unwrap();
-        fs::write(root.path().join("Library/target.txt"), b"target").unwrap();
+        fs::write(root.path().join("Manual Library/manual.txt"), b"manual").unwrap();
+        fs::write(root.path().join("AI Library/target.txt"), b"target").unwrap();
         symlink(
-            root.path().join("Library/target.txt"),
-            root.path().join("Library/linked.txt"),
+            root.path().join("AI Library/target.txt"),
+            root.path().join("AI Library/linked.txt"),
         )
         .unwrap();
 
@@ -796,7 +832,7 @@ mod tests {
             build_reprocess_to_inbox_plan(
                 root.path(),
                 ManagedReprocessArea::Library,
-                &[candidate("f1", "Kept/manual.txt")],
+                &[candidate("f1", "Manual Library/manual.txt")],
             )
             .is_err()
         );
@@ -804,7 +840,7 @@ mod tests {
             build_reprocess_to_inbox_plan(
                 root.path(),
                 ManagedReprocessArea::Library,
-                &[candidate("f1", "Library/linked.txt")],
+                &[candidate("f1", "AI Library/linked.txt")],
             )
             .is_err()
         );
@@ -817,7 +853,7 @@ mod tests {
         fs::create_dir(root.path().join(KEPT_DIRECTORY)).unwrap();
         fs::create_dir(root.path().join(INBOX_DIRECTORY)).unwrap();
         fs::create_dir(root.path().join(LIBRARY_DIRECTORY)).unwrap();
-        fs::write(root.path().join("Kept/manual.txt"), b"manual").unwrap();
+        fs::write(root.path().join("Manual Library/manual.txt"), b"manual").unwrap();
 
         let candidates = reprocess_file_candidates(
             root.path(),
@@ -830,28 +866,29 @@ mod tests {
                 .unwrap();
         let applied = crate::apply_plan(&plan, &journals.path().join("apply.json")).unwrap();
 
-        assert!(!root.path().join("Kept/manual.txt").exists());
+        assert!(!root.path().join("Manual Library/manual.txt").exists());
         assert_eq!(
-            fs::read(root.path().join("Inbox/manual.txt")).unwrap(),
+            fs::read(root.path().join("Recents/manual.txt")).unwrap(),
             b"manual"
         );
 
         let undone = crate::undo_session(&applied, &journals.path().join("undo.json")).unwrap();
         assert_eq!(undone.state, crate::UndoState::Completed);
         assert_eq!(
-            fs::read(root.path().join("Kept/manual.txt")).unwrap(),
+            fs::read(root.path().join("Manual Library/manual.txt")).unwrap(),
             b"manual"
         );
-        assert!(!root.path().join("Inbox/manual.txt").exists());
+        assert!(!root.path().join("Recents/manual.txt").exists());
     }
 
     #[test]
     fn stage_plan_rejects_nested_reserved_and_symlink_sources() {
         let root = tempdir().unwrap();
         fs::create_dir(root.path().join(INBOX_DIRECTORY)).unwrap();
-        fs::write(root.path().join("Inbox/nested.txt"), b"nested").unwrap();
+        fs::write(root.path().join("Recents/nested.txt"), b"nested").unwrap();
         assert!(
-            build_stage_to_inbox_plan(root.path(), &[candidate("f1", "Inbox/nested.txt")]).is_err()
+            build_stage_to_inbox_plan(root.path(), &[candidate("f1", "Recents/nested.txt")])
+                .is_err()
         );
 
         fs::write(root.path().join("target.txt"), b"target").unwrap();
@@ -866,11 +903,11 @@ mod tests {
     #[test]
     fn filters_by_ids_paths_or_their_intersection_and_rejects_escapes() {
         let candidates = [
-            candidate("f000001", "Inbox/a.txt"),
-            candidate("f000002", "Inbox/b.txt"),
+            candidate("f000001", "Recents/a.txt"),
+            candidate("f000002", "Recents/b.txt"),
         ];
         let ids = HashSet::from(["f000001".to_owned()]);
-        let paths = HashSet::from(["Inbox/a.txt".to_owned(), "Inbox/b.txt".to_owned()]);
+        let paths = HashSet::from(["Recents/a.txt".to_owned(), "Recents/b.txt".to_owned()]);
         assert_eq!(
             filter_inbox_candidates(&candidates, &ids, &HashSet::new()).unwrap(),
             [candidates[0].clone()]
@@ -890,7 +927,7 @@ mod tests {
         );
         assert!(
             filter_inbox_candidates(
-                &[candidate("f3", "Inbox/nested/c.txt")],
+                &[candidate("f3", "Recents/nested/c.txt")],
                 &HashSet::new(),
                 &HashSet::new()
             )
