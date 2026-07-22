@@ -124,20 +124,20 @@ impl ManagedLibraryEditPlan {
     pub fn validate(&self) -> Result<(), Error> {
         if self.version != 1 {
             return Err(Error::InvalidArtifact(format!(
-                "unsupported managed Library edit Plan version {}; expected 1",
+                "unsupported managed AI Library edit Plan version {}; expected 1",
                 self.version
             )));
         }
         if self.id.trim().is_empty() || self.workspace_id.trim().is_empty() {
             return Err(Error::InvalidArtifact(
-                "managed Library edit IDs must not be empty".into(),
+                "managed AI Library edit IDs must not be empty".into(),
             ));
         }
         if !Path::new(&self.source).is_absolute()
             || !Path::new(&self.before_folder_set_path).is_absolute()
         {
             return Err(Error::InvalidArtifact(
-                "managed Library edit paths must be absolute".into(),
+                "managed AI Library edit paths must be absolute".into(),
             ));
         }
         self.before_folders.validate()?;
@@ -148,7 +148,7 @@ impl ManagedLibraryEditPlan {
             || self.after_folders.sha256()? != self.after_folder_set_sha256
         {
             return Err(Error::InvalidArtifact(
-                "managed Library edit after FolderSet binding does not match".into(),
+                "managed AI Library edit after FolderSet binding does not match".into(),
             ));
         }
         validate_digest(&self.before_folder_set_sha256)?;
@@ -170,7 +170,7 @@ impl ManagedLibraryEditPlan {
                     .collect::<Vec<_>>();
                 if added.len() != 1 {
                     return Err(Error::InvalidArtifact(
-                        "managed Library Add must introduce exactly one opaque ID".into(),
+                        "managed AI Library Add must introduce exactly one opaque ID".into(),
                     ));
                 }
                 added.into_iter().next()
@@ -182,7 +182,7 @@ impl ManagedLibraryEditPlan {
         expected.validate()?;
         if expected != self.after_folders {
             return Err(Error::InvalidArtifact(
-                "managed Library edit operation does not produce its after FolderSet".into(),
+                "managed AI Library edit operation does not produce its after FolderSet".into(),
             ));
         }
         Ok(())
@@ -226,7 +226,7 @@ impl ManagedLibraryEditSession {
             })?)?;
         if value.version != 1 {
             return Err(Error::InvalidArtifact(
-                "unsupported managed Library edit Session version".into(),
+                "unsupported managed AI Library edit Session version".into(),
             ));
         }
         Ok(value)
@@ -238,7 +238,7 @@ fn apply_edit(
     operation: &ManagedLibraryEdit,
     added_id: Option<String>,
 ) -> Result<(), Error> {
-    let library_root = managed_library_root(folders)?;
+    validate_managed_library(folders)?;
     match operation {
         ManagedLibraryEdit::Add { path, description } => {
             let id = added_id.ok_or_else(|| {
@@ -251,7 +251,7 @@ fn apply_edit(
             }
             folders.folders.push(ApprovedFolder {
                 id,
-                path: library_path(library_root, path)?,
+                path: library_path(path)?,
                 description: description.trim().to_owned(),
                 model_visible: true,
                 fallback: None,
@@ -260,7 +260,7 @@ fn apply_edit(
         ManagedLibraryEdit::Rename { id, path } => {
             let old_path = editable_folder(folders, id)?.path.clone();
             reject_approved_descendant(folders, id, &old_path)?;
-            editable_folder_mut(folders, id)?.path = library_path(library_root, path)?;
+            editable_folder_mut(folders, id)?.path = library_path(path)?;
         }
         ManagedLibraryEdit::EditDescription { id, description } => {
             editable_folder_mut(folders, id)?.description = description.trim().to_owned();
@@ -329,34 +329,27 @@ fn reject_approved_descendant(folders: &FolderSet, id: &str, parent: &str) -> Re
     Ok(())
 }
 
-fn managed_library_root(folders: &FolderSet) -> Result<&'static str, Error> {
-    let has_current = folders
+fn validate_managed_library(folders: &FolderSet) -> Result<(), Error> {
+    if folders
         .folders
         .iter()
-        .all(|folder| folder.path.starts_with("AI Library/"));
-    let has_legacy = folders
-        .folders
-        .iter()
-        .all(|folder| folder.path.starts_with("Library/"));
-    match (has_current, has_legacy) {
-        (true, false) => Ok("AI Library"),
-        (false, true) => Ok("Library"),
-        _ => Err(Error::InvalidArtifact(
-            "managed FolderSet does not use one recognized Library root".into(),
-        )),
+        .all(|folder| folder.path.starts_with("AI Library/"))
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidArtifact(
+            "managed FolderSet destinations must be inside AI Library".into(),
+        ))
     }
 }
 
-fn library_path(library_root: &str, path: &str) -> Result<String, Error> {
-    if ["Library", "AI Library"]
-        .iter()
-        .any(|root| path == *root || path.starts_with(&format!("{root}/")))
-    {
+fn library_path(path: &str) -> Result<String, Error> {
+    if path == "AI Library" || path.starts_with("AI Library/") {
         return Err(Error::InvalidArtifact(
-            "Library destination paths are relative to Library".into(),
+            "AI Library destination paths are relative to AI Library".into(),
         ));
     }
-    Ok(format!("{library_root}/{path}"))
+    Ok(format!("AI Library/{path}"))
 }
 
 fn validate_digest(value: &str) -> Result<(), Error> {
@@ -397,7 +390,7 @@ mod tests {
         }
         .approve()
         .unwrap();
-        crate::library_folder_set(&approved).unwrap()
+        crate::ai_library_folder_set(&approved).unwrap()
     }
 
     fn plan(operation: ManagedLibraryEdit, added_id: Option<&str>) -> ManagedLibraryEditPlan {

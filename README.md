@@ -95,7 +95,7 @@ $ temari managed status <WORKSPACE_ID>
 $ temari managed run <WORKSPACE_ID>
 $ temari managed run <WORKSPACE_ID> --apply --yes
 $ temari managed reprocess <WORKSPACE_ID> \
-    --from library --path Documents/old-report.pdf
+    --from ai-library --path Documents/old-report.pdf
 $ temari managed rule add <WORKSPACE_ID> \
     --name-glob 'invoice-*.pdf' --destination d000001 --priority 100
 $ temari managed disable <WORKSPACE_ID>
@@ -103,9 +103,6 @@ $ temari managed library show <WORKSPACE_ID> --out library.folders.json
 $ temari managed library plan <WORKSPACE_ID> --out library-edit.plan.json \
     add --path Research --description "Research material"
 $ temari managed library apply library-edit.plan.json --yes
-$ temari managed migrate plan <WORKSPACE_ID> \
-    --out managed-area-migration.plan.json
-$ temari managed migrate apply managed-area-migration.plan.json --yes
 $ temari managed schedule install <WORKSPACE_ID> \
     --every-seconds 300 --executable ~/.local/bin/temari --yes
 ```
@@ -118,7 +115,7 @@ Arrival time is the first local observation stored in SQLite, not file modificat
 
 `managed library` edits the approved AI Library structure while a workspace is disabled. `show` exports the current FolderSet, and `plan add|rename|describe|delete` writes a reviewable immutable Plan. `apply` changes the workspace's FolderSet binding only: it does not move files or rename or delete physical directories. Each completed Configure run owns its recovery artifacts, so `undo <WORKSPACE_ID> <RUN_ID>` does not accept a caller-selected journal path and `resume` dispatches interrupted Apply or Undo recovery from the recorded run state.
 
-Legacy workspaces using `Kept`, `Inbox`, and `Library` continue to run without an implicit mutation. The explicit `managed migrate` workflow adopts the current `Manual Library`, `Recents`, and `AI Library` layout. `plan` is read-only; `apply` requires confirmation; and `undo` and `resume` use only run-owned recovery artifacts. Newly created workspaces already use the current layout and do not require migration.
+Temari supports only the current `Manual Library`, `Recents`, and `AI Library` layout. Experimental artifacts and state databases from earlier layouts are rejected instead of being upgraded or interpreted through compatibility paths. After an incompatible schema change, preserve the old database if recovery is still needed, restore or move the existing managed contents manually, then create a fresh database and initialize the workspace again. Temari never deletes or rewrites those physical files automatically.
 
 The portable monitoring engine, processed signatures, local rules, and run reconciliation remain internal Core services used by `managed`. There is no separate public monitor workflow or resident Temari daemon. Explicit `managed schedule` commands render, install, inspect, or uninstall a systemd user timer on Linux or a per-user launchd agent on macOS. Scheduled definitions run the same finite `managed run --apply --yes` service with absolute paths and no shell; installation never happens during workspace setup.
 
@@ -179,7 +176,7 @@ The workflow follows five explicit trust boundaries:
 4. `apply`: after confirmation, local code creates only required approved directories and performs validated moves while atomically updating an audit journal.
 5. `undo`: local code conservatively reverses recorded moves and removes only unchanged, empty directories created by that apply session.
 
-The managed workflow is the primary product surface. `organize` remains a one-time convenience, and the six primitive commands remain available for agents and recovery. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for artifact persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits, [ADR 0008](docs/adr/0008-use-sqlite-for-monitoring-state.md) for internal monitoring state, [ADR 0009](docs/adr/0009-request-per-run-content-consent.md) for consent, [ADR 0010](docs/adr/0010-load-desktop-config-from-platform-directory.md) for desktop configuration and private credentials, [ADR 0011](docs/adr/0011-apply-backend-held-desktop-plans.md) for confirmed desktop Apply and Undo, [ADR 0012](docs/adr/0012-adopt-managed-three-area-workspaces.md) for protected, staged, and classified areas, [ADR 0013](docs/adr/0013-make-managed-the-primary-cli.md) for the public CLI boundary, [ADR 0014](docs/adr/0014-schedule-finite-managed-runs.md) for explicit OS scheduling, [ADR 0015](docs/adr/0015-reprocess-managed-files-through-inbox.md) for protected and classified file reprocessing, and [ADR 0016](docs/adr/0016-share-managed-services-across-cli-and-desktop.md) for shared CLI and desktop orchestration.
+The managed workflow is the primary product surface. `organize` remains a one-time convenience, and the six primitive commands remain available for agents and recovery. See [ADR 0002](docs/adr/0002-propose-and-create-approved-folders.md) for the filesystem safety policy, [ADR 0004](docs/adr/0004-use-json-journals-before-a-state-database.md) for artifact persistence, [ADR 0005](docs/adr/0005-adopt-on-demand-content-classification-and-local-fallbacks.md) for two-pass classification, [ADR 0006](docs/adr/0006-bind-explicit-recursive-scope-to-workflow-artifacts.md) for recursive scope, [ADR 0007](docs/adr/0007-adopt-bounded-document-and-ocr-extraction.md) for extraction limits, [ADR 0008](docs/adr/0008-use-sqlite-for-monitoring-state.md) for internal monitoring state, [ADR 0009](docs/adr/0009-request-per-run-content-consent.md) for consent, [ADR 0010](docs/adr/0010-load-desktop-config-from-platform-directory.md) for desktop configuration and private credentials, [ADR 0011](docs/adr/0011-apply-backend-held-desktop-plans.md) for confirmed desktop Apply and Undo, [ADR 0012](docs/adr/0012-adopt-managed-three-area-workspaces.md) for protected, staged, and classified areas, [ADR 0013](docs/adr/0013-make-managed-the-primary-cli.md) for the public CLI boundary, [ADR 0014](docs/adr/0014-schedule-finite-managed-runs.md) for explicit OS scheduling, [ADR 0015](docs/adr/0015-reprocess-managed-files-through-recents.md) for protected and classified file reprocessing, and [ADR 0016](docs/adr/0016-share-managed-services-across-cli-and-desktop.md) for shared CLI and desktop orchestration.
 
 The detailed parity backlog is maintained in [the product roadmap](docs/roadmap.md). It separates current workflow completion from optional cleanup capabilities and records evidence confidence for behavior inferred from binary analysis.
 

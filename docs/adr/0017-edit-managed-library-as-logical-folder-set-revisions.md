@@ -1,4 +1,4 @@
-# ADR 0017: Edit managed Library structure as logical FolderSet revisions
+# ADR 0017: Edit managed AI Library structure as logical FolderSet revisions
 
 ## Status
 
@@ -8,7 +8,7 @@
 
 - A managed workspace binds both its monitor and workspace row to one immutable `FolderSet` path and SHA-256 digest.
 - Destination IDs are opaque capabilities used by model output and local rules. Renaming a destination must not change its ID.
-- Post-setup structure editing changes the approved classification vocabulary. It is separate from moving files that are already in `Library`.
+- Post-setup structure editing changes the approved classification vocabulary. It is separate from moving files that are already in `AI Library`.
 
 ## Decision
 

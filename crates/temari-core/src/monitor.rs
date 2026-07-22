@@ -111,7 +111,7 @@ pub fn plan_monitor_cycle<C: Classifier, E: ContentExtractor>(
 /// Builds a monitoring Plan from an already bounded set of source candidates.
 ///
 /// Managed workspaces use this entry point after their local retention index has
-/// selected stable Inbox files. The supplied candidates are still validated by
+/// selected stable Recents files. The supplied candidates are still validated by
 /// `build_plan`; this function does not grant additional path authority.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_monitor_candidates<C: Classifier, E: ContentExtractor>(

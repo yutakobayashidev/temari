@@ -20,9 +20,9 @@
 - When the user narrows a parity phase, implement the named workflow gaps completely and keep explicitly deferred product areas out of the patch, documentation, and navigation.
 # Library structure editing
 
-- Treat post-setup Library edits as logical FolderSet CRUD only. Add, rename, description edit, delete, and Undo change immutable FolderSet revisions and bindings; they do not rename or delete physical directories or move existing files.
+- Treat post-setup AI Library edits as logical FolderSet CRUD only. Add, rename, description edit, delete, and Undo change immutable FolderSet revisions and bindings; they do not rename or delete physical directories or move existing files.
 - Keep existing-file movement in the explicit reprocessing/reorganization workflow. Do not infer filesystem movement from a logical destination rename.
-- Keep physical area names consistent across Core, CLI, desktop, help, and documentation: new workspaces use `Manual Library`, `Recents`, and `AI Library`; old names appear only in explicit legacy migration and compatibility paths.
+- Keep physical area names consistent across Core, CLI, desktop, help, and documentation: support only `Manual Library`, `Recents`, and `AI Library`. In an unreleased private project, remove obsolete layouts and reject their artifacts instead of carrying migration or compatibility paths.
 
 # Execution discipline
 

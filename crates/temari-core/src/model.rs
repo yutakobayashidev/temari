@@ -590,7 +590,7 @@ mod tests {
 
         let approved = crate::Proposal {
             version: 2,
-            source: "/tmp/inbox".into(),
+            source: "/tmp/recents".into(),
             scope: crate::ScanScope::default(),
             files_considered: 1,
             folders,

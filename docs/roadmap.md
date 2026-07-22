@@ -11,18 +11,18 @@ This roadmap records the remaining parity work identified through binary analysi
   - Preserve the physical three-area workflow, but use product terminology aligned with the analyzed behavior: Manual Library, Recents, and AI Library.
   - Reject registering a managed area or a nested root beneath an existing workspace; recognize existing app-managed areas by the setup journal, filesystem identity, and reserved-area metadata.
   - Keep journals, SQLite indexes, and immutable workflow artifacts in the application state directory; only the three user-visible workflow areas and approved destination folders belong under the selected root.
-  - Provide an explicit migration and recovery path for legacy `Kept/Inbox/Library` names, including immutable Plans, Apply, Undo, and Resume.
+  - Reject obsolete artifacts and state schemas instead of maintaining compatibility or migration paths. Treat obsolete area names as ordinary user directories rather than hidden reserved names.
   - Acceptance: selecting `~/Downloads` does not make its three managed areas eligible as separate roots, and status remains healthy after setup Undo.
-- [ ] **Multi-operation Library edit plans** (`temari-core`, CLI, Tauri)
+- [ ] **Multi-operation AI Library edit plans** (`temari-core`, CLI, Tauri)
   - Allow one reviewed plan to contain an ordered set of add, rename, description, and delete operations.
   - Validate the complete before/after FolderSet delta and preserve stable IDs across every operation.
   - Keep one atomic binding switch and one Configure Apply/Undo journal for the batch.
   - Acceptance: a stale or partially edited batch is rejected; no physical directory or existing file is changed.
-- [ ] **Nested Library editing and subtree policy** (`temari-core`, CLI, Tauri)
+- [ ] **Nested AI Library editing and subtree policy** (`temari-core`, CLI, Tauri)
   - Add an explicit policy for renaming or deleting a parent with approved descendants: cascade, reparent, or reject.
   - Display the affected subtree in the preview and require exact confirmation.
   - Acceptance: no orphaned destination IDs, duplicate paths, or implicit physical moves.
-- [ ] **Library edit Redo** (`temari-core`, CLI, Tauri)
+- [ ] **AI Library edit Redo** (`temari-core`, CLI, Tauri)
   - Add a journal-backed Redo transition for a completed Configure Undo.
   - Reject Redo after a newer configuration revision or conflicting workspace change.
   - Acceptance: Undo/Redo remains deterministic across restart and does not accept caller-supplied journal paths.
@@ -86,5 +86,5 @@ This roadmap records the remaining parity work identified through binary analysi
 ## Non-goals
 
 - Do not copy third-party branding, prompts, schemas, identifiers, or UI assets.
-- Do not make logical Library editing mutate physical directories implicitly.
+- Do not make logical AI Library editing mutate physical directories implicitly.
 - Do not add a background daemon or telemetry by default.

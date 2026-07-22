@@ -191,11 +191,11 @@ function dashboard(): string {
     </main>`;
   }
 
-  const { workspace, inbox } = state.status;
+  const { workspace, recents } = state.status;
   const classified = state.history.filter((move) => move.kind === "classify" && !move.undone).length;
-  const keptNote = "Folders and files you choose to leave alone";
-  const inboxNote = inbox.nextEligibleUnixMs
-    ? `Next review ${formatTime(inbox.nextEligibleUnixMs)}`
+  const manualNote = "Folders and files you choose to leave alone";
+  const recentsNote = recents.nextEligibleUnixMs
+    ? `Next review ${formatTime(recents.nextEligibleUnixMs)}`
     : "Nothing is waiting for review";
   const scheduleOn = state.schedule?.installed && state.schedule.enabled;
   const latestRuns = [...new Set(state.history.filter((move) => !move.undone).map((move) => move.sessionId))].slice(0, 3);
@@ -219,23 +219,23 @@ function dashboard(): string {
     <section class="areas" aria-labelledby="areas-title">
       <div class="section-heading"><div><p class="eyebrow">Workspace flow</p><h2 id="areas-title">Three places, one clear boundary</h2></div><span>Root → Recents → AI Library</span></div>
       <div class="area-flow">
-        <article class="area-card area-kept">
-          <div class="area-index">K</div>
-          <div><p>Leave alone</p><h3>Manual Library</h3><span>${keptNote}</span></div>
+        <article class="area-card area-manual-library">
+          <div class="area-index">M</div>
+          <div><p>Leave alone</p><h3>Manual Library</h3><span>${manualNote}</span></div>
           <strong class="area-value">Protected</strong>
         </article>
         <span class="flow-thread" aria-hidden="true"></span>
-        <article class="area-card area-inbox">
-          <div class="area-index">I</div>
-          <div><p>Wait here</p><h3>Recents</h3><span>${escapeHtml(inboxNote)}</span></div>
-          <strong class="area-value">${inbox.physicalFiles}</strong>
-          <small class="area-detail">${inbox.eligibleNow} ready now</small>
+        <article class="area-card area-recents">
+          <div class="area-index">R</div>
+          <div><p>Wait here</p><h3>Recents</h3><span>${escapeHtml(recentsNote)}</span></div>
+          <strong class="area-value">${recents.physicalFiles}</strong>
+          <small class="area-detail">${recents.eligibleNow} ready now</small>
         </article>
         <span class="flow-thread" aria-hidden="true"></span>
-        <article class="area-card area-library">
-          <div class="area-index">L</div>
+        <article class="area-card area-ai-library">
+          <div class="area-index">A</div>
           <div><p>Organized by meaning</p><h3>AI Library</h3><span>Approved destinations only</span></div>
-          <strong class="area-value">${classified || inbox.indexedMoved}</strong>
+          <strong class="area-value">${classified || recents.indexedMoved}</strong>
           <small class="area-detail">recently indexed</small>
         </article>
       </div>
@@ -336,7 +336,7 @@ function reprocessDialog(): string {
     <form id="reprocess-form">
       <button class="dialog-close" data-close-reprocess aria-label="Close" type="button">×</button>
       <p class="eyebrow">Reviewed return to Recents</p><h2 id="reprocess-title">Reprocess files</h2>
-      <label class="field"><span>Current area</span><select id="reprocess-area"><option value="library">AI Library</option><option value="kept">Manual Library</option></select></label>
+      <label class="field"><span>Current area</span><select id="reprocess-area"><option value="ai_library">AI Library</option><option value="manual_library">Manual Library</option></select></label>
       <label class="field"><span>Area-relative paths</span><textarea id="reprocess-paths" placeholder="Work/old-report.pdf&#10;Images/reference.png" required></textarea><small>One file or directory per line. Manual Library requires explicit paths.</small></label>
       <button class="primary-button full" type="submit">Review reprocessing</button>
     </form>
@@ -622,7 +622,7 @@ function bindEvents(): void {
     askForConfirmation({
       title: `Run ${basename(workspace.source)} now?`,
       copy: "Loose root files will move to Recents. Eligible files will move only to approved AI Library destinations.",
-      details: [["Folder", workspace.source], ["Ready now", String(state.status!.inbox.eligibleNow)], ["Collision policy", "Rename safely"]],
+      details: [["Folder", workspace.source], ["Ready now", String(state.status!.recents.eligibleNow)], ["Collision policy", "Rename safely"]],
       confirmLabel: "Run and apply moves",
       action: async () => {
         const result = await runManagedWorkspace(workspace.id);
@@ -686,7 +686,7 @@ function bindEvents(): void {
     askForConfirmation({
       title: `Return ${paths.length} selection${paths.length === 1 ? "" : "s"} to Recents?`,
       copy: "This reviewed step does not classify directly from Manual Library or AI Library. A later run handles eligible Recents files.",
-      details: [["From", area === "kept" ? "Manual Library" : "AI Library"], ["Selections", paths.join(", ")]],
+      details: [["From", area === "manual_library" ? "Manual Library" : "AI Library"], ["Selections", paths.join(", ")]],
       confirmLabel: "Apply return to Recents",
       action: async () => {
         const result = await reprocessManagedFiles(workspaceId, area, paths);

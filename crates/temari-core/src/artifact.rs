@@ -355,7 +355,7 @@ mod tests {
     fn proposal(paths: &[&str]) -> Proposal {
         Proposal {
             version: 2,
-            source: "/tmp/inbox".into(),
+            source: "/tmp/recents".into(),
             scope: ScanScope::default(),
             files_considered: 3,
             folders: paths

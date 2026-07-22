@@ -1094,7 +1094,7 @@ mod tests {
     fn proposal_review_may_change_folders_but_not_source_context() {
         let raw = Proposal {
             version: 2,
-            source: "/tmp/inbox".into(),
+            source: "/tmp/recents".into(),
             scope: ScanScope::default(),
             files_considered: 2,
             folders: vec![temari_core::FolderProposal {

@@ -6,7 +6,6 @@ mod extraction;
 mod filesystem;
 mod lock;
 mod managed;
-mod managed_area_migration;
 mod managed_cycle;
 mod managed_library;
 mod managed_service;
@@ -47,29 +46,21 @@ pub use managed::{
     fingerprint_directory, preflight_managed_resume, preflight_managed_setup,
     preflight_managed_undo, resume_managed_setup, resume_managed_setup_with_lock,
     undo_managed_directory_adoption, undo_managed_setup, undo_managed_setup_with_lock,
-};
-pub use managed_area_migration::{
-    CURRENT_MANAGED_AREAS, LEGACY_MANAGED_AREAS, ManagedAreaLayout, ManagedAreaMigrationMove,
-    ManagedAreaMigrationOutcome, ManagedAreaMigrationPlan, ManagedAreaMigrationRecord,
-    ManagedAreaMigrationSession, ManagedAreaMigrationState, ManagedAreaMigrationUndoSession,
-    apply_managed_area_migration, apply_managed_area_migration_with_lock,
-    detect_managed_area_layout, resume_managed_area_migration, resume_managed_area_migration_undo,
-    undo_managed_area_migration,
+    validate_managed_workspace_root_candidate,
 };
 pub use managed_cycle::{
-    INBOX_DIRECTORY, KEPT_DIRECTORY, LIBRARY_DIRECTORY, ManagedReprocessArea,
-    ManagedReprocessSelection, STAGE_TO_INBOX_RULE_ID, build_reprocess_to_inbox_plan,
-    build_stage_to_inbox_plan, filter_inbox_candidates, inbox_file_candidates, library_folder_set,
-    reprocess_file_candidates, root_file_candidates,
+    AI_LIBRARY_DIRECTORY, MANUAL_LIBRARY_DIRECTORY, ManagedReprocessArea,
+    ManagedReprocessSelection, RECENTS_DIRECTORY, STAGE_TO_RECENTS_RULE_ID, ai_library_folder_set,
+    build_reprocess_to_recents_plan, build_stage_to_recents_plan, filter_recents_candidates,
+    recents_file_candidates, reprocess_file_candidates, root_file_candidates,
 };
 pub use managed_library::{
     ManagedLibraryEdit, ManagedLibraryEditPlan, ManagedLibraryEditSession, ManagedLibraryEditState,
     ManagedLibraryEditUndoSession,
 };
 pub use managed_service::{
-    ManagedActivationResult, ManagedAreaMigrationResult, ManagedAreaMigrationUndoResult,
-    ManagedCycleResult, ManagedDirectoryAdoption, ManagedLibraryEditResult,
-    ManagedLibraryEditUndoResult, ManagedService,
+    ManagedActivationResult, ManagedCycleResult, ManagedDirectoryAdoption,
+    ManagedLibraryEditResult, ManagedLibraryEditUndoResult, ManagedService,
 };
 pub use model::{
     Classification, ClassificationBasis, Classifier, ContentCandidate, FolderProposer,
@@ -83,9 +74,9 @@ pub use plan::{Plan, PlanEntry, build_plan};
 pub use rules::{LocalRule, RuleMatch, RuleSet};
 pub use scan::{FileCandidate, scan_directory, select_representative_files};
 pub use state::{
-    InboxItem, InboxReconcileSummary, InboxState, ManagedRun, ManagedRunKind, ManagedWorkspace,
-    MonitorRecord, MonitoringRun, ProcessedFileRecord, ReconcileSummary, RunState,
-    StagedFileRecord, StateStore,
+    ManagedRun, ManagedRunKind, ManagedWorkspace, MonitorRecord, MonitoringRun,
+    ProcessedFileRecord, RecentsItem, RecentsReconcileSummary, RecentsState, ReconcileSummary,
+    RunState, StagedFileRecord, StateStore,
 };
 
 use thiserror::Error;

@@ -16,7 +16,7 @@ export type ManagedWorkspace = {
   updatedUnixMs: number;
 };
 
-export type InboxSummary = {
+export type RecentsSummary = {
   physicalFiles: number;
   indexedPending: number;
   indexedPlanned: number;
@@ -39,7 +39,7 @@ export type ManagedWorkspaceStatus = {
   health: WorkspaceHealth;
   issues: string[];
   workspace: ManagedWorkspace;
-  inbox: InboxSummary;
+  recents: RecentsSummary;
   runs: {
     total: number;
     actionable: ManagedRun[];
@@ -101,7 +101,7 @@ export type SetupPreview = {
   moves: Array<{
     sourcePath: string;
     destinationPath: string;
-    area: "kept" | "inbox";
+    area: "manual_library" | "recents";
   }>;
 };
 
@@ -124,4 +124,4 @@ export type UndoResult = {
   journalPath: string;
 };
 
-export type ReprocessArea = "kept" | "library";
+export type ReprocessArea = "manual_library" | "ai_library";

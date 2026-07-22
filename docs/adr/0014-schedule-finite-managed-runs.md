@@ -6,7 +6,7 @@
 
 ## Decision Drivers
 
-- Managed workspaces need unattended Inbox observation and classification.
+- Managed workspaces need unattended Recents observation and classification.
 - Filesystem mutation must retain the same Plan, Apply, journal, lock, and recovery boundaries as an interactive run.
 - Linux and macOS already provide reliable per-user schedulers.
 - Installing a hidden daemon during workspace setup would make mutation authority difficult to discover and revoke.
@@ -29,7 +29,7 @@
 - Require a separate explicit scheduler install action with mutation confirmation. Workspace setup, enable, and normal run commands never install scheduling implicitly.
 - Keep scheduler definitions free of secret values. Configuration may reference an environment variable only when the selected scheduler environment can provide it; otherwise installation must fail with an actionable error.
 - Preserve every failed or non-empty run directory for diagnosis and recovery. Automatic cleanup may remove only a newly allocated directory that produced no artifacts.
-- Treat a completed filesystem Apply with pending SQLite finalization as resumable. Complete Inbox and history indexes before marking the managed run completed.
+- Treat a completed filesystem Apply with pending SQLite finalization as resumable. Complete Recents and history indexes before marking the managed run completed.
 
 ## Consequences
 

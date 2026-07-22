@@ -17,10 +17,6 @@ temari [global options] managed library plan <WORKSPACE_ID> --out <PLAN> add|ren
 temari [global options] managed library apply <PLAN> [--yes]
 temari [global options] managed library undo <WORKSPACE_ID> <RUN_ID> [--yes]
 temari [global options] managed library resume <WORKSPACE_ID> <RUN_ID>
-temari [global options] managed migrate plan <WORKSPACE_ID> --out <PLAN>
-temari [global options] managed migrate apply <PLAN> [--yes]
-temari [global options] managed migrate undo <WORKSPACE_ID> <RUN_ID> [--yes]
-temari [global options] managed migrate resume <WORKSPACE_ID> <RUN_ID> [--yes]
 temari [global options] managed undo-setup|resume-setup ...
 temari [global options] organize <SOURCE> --out <RUN_DIR> [--include-subtree <PATH>]...
 temari [global options] propose <SOURCE> --out <PROPOSAL> [--include-subtree <PATH>]...
@@ -124,10 +120,9 @@ temari [global options] resume <APPLY_SESSION> [--yes]
 - `rule` manages case-insensitive basename globs for one workspace. Rules select reviewed opaque destination IDs, run before model classification, use descending priority and stable rule-ID ordering, and never store executable paths.
 - `library show` exports the current approved FolderSet. `library plan add|rename|describe|delete` is read-only and writes an immutable edit Plan; `library apply` separately confirms and applies that reviewed Plan. AI Library edits require a disabled workspace and update only logical FolderSet revisions and the workspace binding. They never move files or rename or delete physical directories.
 - Each completed AI Library Configure run owns its Apply and Undo journals. `library undo` accepts a workspace ID and run ID, derives the journal path from that run, and requires confirmation. `library resume` verifies workspace ownership and resumes Apply from an `applying` run or Undo from a `needs_resume` run; terminal runs remain immutable.
-- `migrate plan` is the read-only entry point for converting a legacy `Kept`/`Inbox`/`Library` workspace to the current Manual Library, Recents, and AI Library layout. It writes an immutable migration Plan and does not change bindings or filesystem paths.
-- `migrate apply` requires separate confirmation and applies only the exact reviewed Plan. `migrate undo` derives its recovery journal from the completed migration run; callers cannot select a journal path. `migrate resume` also requires confirmation, verifies workspace ownership, and dispatches only an interrupted Apply or Undo. New workspaces do not require migration.
-- `undo-setup` and `resume-setup` operate only from their versioned setup journals. Setup Undo refuses a changed kept directory, occupied original path, or changed area identity.
+- `undo-setup` and `resume-setup` operate only from their versioned setup journals. Setup Undo refuses a changed Manual Library directory, occupied original path, or changed area identity.
 - SQLite stores mutable retention and history indexes only. Setup Plans, normal Plans, Apply sessions, and Undo sessions remain authoritative JSON artifacts outside the managed source.
+- Only the current area layout and SQLite schema are supported. Earlier experimental artifacts and databases are rejected; no public migration command or automatic upgrade path exists.
 - SQLite binds each managed workspace to the canonical model configuration path selected at activation. The path is revalidated before model-backed runs and is reused in generated schedule arguments; credentials remain in the owner-only configuration file and never enter workflow artifacts.
 - Internal monitoring records, processed signatures, and reconciliation services are implementation details. They do not create a second public workflow, expose internal monitor IDs, or install a daemon.
 
@@ -174,17 +169,13 @@ $ temari managed init ~/Downloads --out downloads.setup-plan.json
 $ temari managed apply downloads.setup-plan.json --folders downloads.folders.json --out downloads-setup
 $ temari managed run <WORKSPACE_ID> --out downloads-cycle
 $ temari managed run <WORKSPACE_ID> --apply --yes
-$ temari managed reprocess <WORKSPACE_ID> --from kept --path Projects --apply --yes
+$ temari managed reprocess <WORKSPACE_ID> --from manual-library --path Projects --apply --yes
 $ temari managed disable <WORKSPACE_ID>
 $ temari managed library show <WORKSPACE_ID> --out library.folders.json
 $ temari managed library plan <WORKSPACE_ID> --out library-edit.plan.json add --path Research --description "Research material"
 $ temari managed library apply library-edit.plan.json --yes
 $ temari managed library undo <WORKSPACE_ID> <CONFIGURE_RUN_ID> --yes
 $ temari managed library resume <WORKSPACE_ID> <CONFIGURE_RUN_ID>
-$ temari managed migrate plan <WORKSPACE_ID> --out managed-area-migration.plan.json
-$ temari managed migrate apply managed-area-migration.plan.json --yes
-$ temari managed migrate undo <WORKSPACE_ID> <MIGRATION_RUN_ID> --yes
-$ temari managed migrate resume <WORKSPACE_ID> <MIGRATION_RUN_ID> --yes
 $ temari managed schedule install <WORKSPACE_ID> --every-seconds 300 --executable ~/.local/bin/temari --yes
 $ temari managed history <WORKSPACE_ID>
 $ temari managed rule add <WORKSPACE_ID> --name-glob 'invoice-*.pdf' --destination d000001
@@ -200,7 +191,7 @@ $ temari approve downloads.proposal.json --accept-all --no-input --out downloads
 
 1. Split model configuration from `FolderSet` and introduce artifact schemas.
 2. Implement read-only `propose` and `approve`.
-3. Migrate `plan` to consume a `FolderSet` and emit a durable plan.
+3. Change `plan` to consume a `FolderSet` and emit a durable plan.
 4. Implement apply with audit sessions, then undo. Completed.
 5. Add interactive `organize` orchestration and explicit crash resume. Completed.
 6. Reuse the same services internally for rules, processed-file tracking, reconciliation, and run history. Completed.
@@ -209,4 +200,4 @@ $ temari approve downloads.proposal.json --accept-all --no-input --out downloads
 9. Add ambiguity-aware per-run content consent without making primitive commands interactive. Completed.
 10. Make managed workspaces the only public recurring workflow. Completed.
 11. Add a GUI adapter over the same managed application service. Completed as a proof of concept.
-12. Add explicit finite-run scheduling, workspace lifecycle management, detailed move history, and reprocessing through Inbox. Completed.
+12. Add explicit finite-run scheduling, workspace lifecycle management, detailed move history, and reprocessing through Recents. Completed.

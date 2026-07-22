@@ -158,7 +158,7 @@ export async function getManagedWorkspace(workspaceId: string): Promise<ManagedW
       health: workspace.enabled ? "healthy" : "disabled",
       issues: [],
       workspace,
-      inbox: {
+      recents: {
         physicalFiles: workspaceId === "workspace-downloads" ? 7 : 1,
         indexedPending: workspaceId === "workspace-downloads" ? 7 : 1,
         indexedPlanned: 0,
@@ -206,8 +206,8 @@ export async function previewManagedWorkspace(
       source: proposal.source,
       directories: ["Manual Library", "Recents", "AI Library", ...proposal.folders.map((folder) => `AI Library/${folder.path}`)],
       moves: [
-        { sourcePath: "Existing folder", destinationPath: "Manual Library/Existing folder", area: "kept" },
-        { sourcePath: "notes.pdf", destinationPath: "Recents/notes.pdf", area: "inbox" },
+        { sourcePath: "Existing folder", destinationPath: "Manual Library/Existing folder", area: "manual_library" },
+        { sourcePath: "notes.pdf", destinationPath: "Recents/notes.pdf", area: "recents" },
       ],
     };
   }
@@ -260,7 +260,7 @@ export async function previewLibraryEdit(
 
 export async function applyLibraryEdit(previewToken: string): Promise<ManagedWorkspaceStatus> {
   if (!isTauri()) {
-    if (!demoLibraryPreview || !demoLibraryPreviewWorkspaceId || demoLibraryPreview.token !== previewToken) throw new Error("Library edit preview expired.");
+    if (!demoLibraryPreview || !demoLibraryPreviewWorkspaceId || demoLibraryPreview.token !== previewToken) throw new Error("AI Library edit preview expired.");
     const workspaceId = demoLibraryPreviewWorkspaceId;
     demoLibraryUndoSnapshot = structuredClone(demoLibraryPreview.beforeFolders);
     demoLibraryFolders = structuredClone(demoLibraryPreview.afterFolders);
@@ -280,7 +280,7 @@ export async function applyLibraryEdit(previewToken: string): Promise<ManagedWor
 export async function undoLibraryEdit(workspaceId: string, runId: string): Promise<ManagedWorkspaceStatus> {
   if (!isTauri()) {
     if (!demoLatestConfiguration || demoLatestConfiguration.runId !== runId || !demoLibraryUndoSnapshot) {
-      throw new Error("Library edit can no longer be undone.");
+      throw new Error("AI Library edit can no longer be undone.");
     }
     demoLibraryFolders = structuredClone(demoLibraryUndoSnapshot);
     demoLibraryUndoSnapshot = null;

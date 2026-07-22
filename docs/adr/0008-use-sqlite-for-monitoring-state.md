@@ -36,14 +36,14 @@ Monitoring adds mutable definitions, due-time queries, local classification rule
 - Identify already processed files by a signature derived from the local file fingerprint, approved folder-set digest, and enabled-rule digest. Record a file as processed only after its apply journal proves completion. Do not store extracted content, raw model responses, credentials, or API keys in SQLite.
 - Acquire an exclusive source-root lock for apply, resume, undo, and each monitoring mutation cycle. A competing operation fails without mutating the source. Locks must be released automatically when their process exits.
 - Reconcile interrupted database rows from JSON artifacts only. A completed apply journal may finalize the SQLite index; a running journal requires the existing explicit resume flow; a missing, invalid, failed, or ambiguous journal must never be inferred as successful from filesystem shape or database status.
-- Use transactional schema migrations, foreign-key enforcement, a bounded busy timeout, owner-only database permissions, and durable SQLite settings. Soft-delete monitor and rule definitions so history remains explainable.
+- Store one explicit schema version, reject any different or malformed existing database, and initialize a fresh schema transactionally. Enforce foreign keys, a bounded busy timeout, owner-only database permissions, and durable SQLite settings. Soft-delete monitor and rule definitions so history remains explainable.
 
 ## Consequences
 
 - Positive: monitoring gains efficient scheduling, rule lookup, deduplication, and history queries without weakening inspectable recovery artifacts.
 - Positive: polling and the same core services behave consistently on Linux and macOS.
 - Positive: a database loss affects monitoring configuration and indexes but does not erase the authoritative record of completed filesystem operations.
-- Negative: the application must maintain schema migrations and reconcile the database after a crash between journal completion and index update.
+- Negative: incompatible releases require recreating mutable SQLite state, and the application must reconcile the database after a crash between journal completion and index update.
 - Negative: polling trades immediate event delivery for simpler and more predictable cross-platform behavior.
 - Follow-up: service-manager integration and content-based local rules require separate decisions; neither is part of this ADR.
 

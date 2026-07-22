@@ -112,9 +112,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .area-card div > span { display: block; color: var(--muted); font-size: 9px; line-height: 1.45; }
 .area-value { align-self: center; color: var(--sumi); font: 600 22px/1 "Iowan Old Style", serif; }
 .area-detail { position: absolute; right: 18px; bottom: 17px; color: var(--muted); font-size: 8px; }
-.area-kept { color: var(--moss); }
-.area-inbox { color: var(--gold); }
-.area-library { color: var(--indigo); }
+.area-manual-library { color: var(--moss); }
+.area-recents { color: var(--gold); }
+.area-ai-library { color: var(--indigo); }
 .flow-thread { position: relative; height: 1px; background: #bfc9c4; }
 .flow-thread::after { content: ""; position: absolute; right: 0; top: -3px; width: 6px; height: 6px; border-top: 1px solid #98a69f; border-right: 1px solid #98a69f; transform: rotate(45deg); }
 

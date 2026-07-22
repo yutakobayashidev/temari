@@ -14,16 +14,38 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
-use crate::managed_area_migration::{
-    CURRENT_MANAGED_AREAS, LEGACY_MANAGED_AREAS, detect_managed_area_layout,
-};
 use crate::{
     Error, FileFingerprint, FsIdentity, SourceLock,
     artifact::normalize_relative_path,
     filesystem::{canonical_directory, fingerprint, identity, io_error, path_exists},
 };
 
-pub const MANAGED_AREAS: [&str; 3] = CURRENT_MANAGED_AREAS;
+pub const MANAGED_AREAS: [&str; 3] = ["Manual Library", "Recents", "AI Library"];
+
+pub fn validate_managed_workspace_root_candidate(source: &Path) -> Result<(), Error> {
+    for ancestor in source.ancestors() {
+        let Some(name) = ancestor.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !MANAGED_AREAS.contains(&name) {
+            continue;
+        }
+        let Some(parent) = ancestor.parent() else {
+            continue;
+        };
+        let sibling_count = MANAGED_AREAS
+            .iter()
+            .filter(|candidate| parent.join(candidate).is_dir())
+            .count();
+        if sibling_count >= 2 {
+            return Err(Error::InvalidState(format!(
+                "managed area descendant {:?} cannot be registered as a workspace root",
+                source.display()
+            )));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -186,9 +208,9 @@ impl ManagedSetupPlan {
 
     pub fn validate(&self) -> Result<(), Error> {
         validate_source_header(self.version, &self.source)?;
-        if self.areas != MANAGED_AREAS && self.areas != LEGACY_MANAGED_AREAS {
+        if self.areas != MANAGED_AREAS {
             return Err(Error::InvalidArtifact(
-                "managed setup areas must use the current or legacy three-area layout in order"
+                "managed setup areas must be Manual Library, Recents, and AI Library in order"
                     .into(),
             ));
         }
@@ -236,12 +258,6 @@ impl ManagedSetupSession {
             .map(|area| area.path.as_str())
             .collect::<Vec<_>>()
             != MANAGED_AREAS
-            && self
-                .areas
-                .iter()
-                .map(|area| area.path.as_str())
-                .collect::<Vec<_>>()
-                != LEGACY_MANAGED_AREAS
         {
             return Err(Error::InvalidArtifact(
                 "managed setup session contains invalid areas".into(),
@@ -379,12 +395,6 @@ impl ManagedSetupUndoSession {
             .map(|area| area.path.as_str())
             .collect::<Vec<_>>()
             != ["AI Library", "Recents", "Manual Library"]
-            && self
-                .areas
-                .iter()
-                .map(|area| area.path.as_str())
-                .collect::<Vec<_>>()
-                != ["Library", "Inbox", "Kept"]
         {
             return Err(Error::InvalidArtifact(
                 "managed setup undo contains invalid areas".into(),
@@ -465,7 +475,7 @@ impl ManagedSetupUndoSession {
 
 pub fn build_managed_setup_plan(source: &Path) -> Result<ManagedSetupPlan, Error> {
     let (source, source_identity) = canonical_directory(source)?;
-    for area in MANAGED_AREAS.into_iter().chain(LEGACY_MANAGED_AREAS) {
+    for area in MANAGED_AREAS {
         if path_exists(&source.join(area))? {
             return Err(Error::InvalidArtifact(format!(
                 "managed area already exists: {area:?}"
@@ -539,7 +549,7 @@ pub fn build_managed_setup_plan(source: &Path) -> Result<ManagedSetupPlan, Error
 }
 
 /// Build a read-only plan that adopts newly created root directories into
-/// Kept after managed workspace setup has completed.
+/// Manual Library after managed workspace setup has completed.
 pub fn build_managed_directory_adoption_plan(source: &Path) -> Result<ManagedSetupPlan, Error> {
     build_managed_directory_adoption_plan_excluding(source, &HashSet::new())
 }
@@ -549,8 +559,7 @@ pub(crate) fn build_managed_directory_adoption_plan_excluding(
     excluded_identities: &HashSet<(u64, u64)>,
 ) -> Result<ManagedSetupPlan, Error> {
     let (source, source_identity) = canonical_directory(source)?;
-    let managed_areas = detect_managed_area_layout(&source)?.areas();
-    for area in managed_areas {
+    for area in MANAGED_AREAS {
         let path = source.join(area);
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| io_error("inspect managed area", &path, error))?;
@@ -566,7 +575,7 @@ pub(crate) fn build_managed_directory_adoption_plan_excluding(
 
     let mut moves = Vec::new();
     for (name, path) in read_directory_sorted(&source)? {
-        if managed_areas.contains(&name.as_str()) {
+        if MANAGED_AREAS.contains(&name.as_str()) {
             continue;
         }
         let metadata =
@@ -582,16 +591,16 @@ pub(crate) fn build_managed_directory_adoption_plan_excluding(
         if excluded_identities.contains(&(metadata.dev(), metadata.ino())) {
             continue;
         }
-        let destination = source.join(managed_areas[0]).join(&name);
+        let destination = source.join(MANAGED_AREAS[0]).join(&name);
         if path_exists(&destination)? {
             return Err(Error::InvalidArtifact(format!(
                 "managed directory adoption destination is occupied: {:?}",
-                format!("{}/{name}", managed_areas[0])
+                format!("{}/{name}", MANAGED_AREAS[0])
             )));
         }
         moves.push(ManagedSetupMove {
             source_path: name.clone(),
-            destination_path: format!("{}/{name}", managed_areas[0]),
+            destination_path: format!("{}/{name}", MANAGED_AREAS[0]),
             fingerprint: ManagedEntryFingerprint::Directory {
                 fingerprint: fingerprint_directory(&path)?,
             },
@@ -606,7 +615,7 @@ pub(crate) fn build_managed_directory_adoption_plan_excluding(
         version: 1,
         source: path_text(&source)?,
         source_identity,
-        areas: managed_areas
+        areas: MANAGED_AREAS
             .iter()
             .map(|value| (*value).to_owned())
             .collect(),
@@ -1448,14 +1457,11 @@ fn validate_move(movement: &ManagedSetupMove) -> Result<(), Error> {
             "managed setup sources must be root entries".into(),
         ));
     }
-    let expected_areas = match movement.fingerprint {
-        ManagedEntryFingerprint::File { .. } => [MANAGED_AREAS[1], LEGACY_MANAGED_AREAS[1]],
-        ManagedEntryFingerprint::Directory { .. } => [MANAGED_AREAS[0], LEGACY_MANAGED_AREAS[0]],
+    let expected_area = match movement.fingerprint {
+        ManagedEntryFingerprint::File { .. } => MANAGED_AREAS[1],
+        ManagedEntryFingerprint::Directory { .. } => MANAGED_AREAS[0],
     };
-    if !expected_areas
-        .iter()
-        .any(|area| movement.destination_path == format!("{area}/{}", movement.source_path))
-    {
+    if movement.destination_path != format!("{expected_area}/{}", movement.source_path) {
         return Err(Error::InvalidArtifact(
             "managed setup destination does not match its entry type".into(),
         ));
@@ -1484,7 +1490,8 @@ fn validate_move_order<'a>(
             ManagedEntryFingerprint::File { .. } => saw_file = true,
             ManagedEntryFingerprint::Directory { .. } if saw_file => {
                 return Err(Error::InvalidArtifact(
-                    "managed setup must move every directory to Kept before staging files".into(),
+                    "managed setup must move every directory to Manual Library before staging files"
+                        .into(),
                 ));
             }
             ManagedEntryFingerprint::Directory { .. } => {}
@@ -1753,8 +1760,13 @@ mod tests {
     #[test]
     fn rejects_existing_areas_and_special_entries() {
         let source = tempdir().unwrap();
-        fs::create_dir(source.path().join("Kept")).unwrap();
+        fs::create_dir(source.path().join("Manual Library")).unwrap();
         assert!(build_managed_setup_plan(source.path()).is_err());
+
+        let source = tempdir().unwrap();
+        fs::create_dir(source.path().join("Kept")).unwrap();
+        let plan = build_managed_setup_plan(source.path()).unwrap();
+        assert_eq!(plan.moves[0].destination_path, "Manual Library/Kept");
 
         let source = tempdir().unwrap();
         let _socket = UnixDatagram::bind(source.path().join("socket")).unwrap();
@@ -1777,13 +1789,13 @@ mod tests {
     }
 
     #[test]
-    fn adopts_only_new_root_directories_into_existing_kept_area() {
+    fn adopts_only_new_root_directories_into_existing_manual_library_area() {
         let source = tempdir().unwrap();
         for area in MANAGED_AREAS {
             fs::create_dir(source.path().join(area)).unwrap();
         }
         fs::create_dir(source.path().join("Project")).unwrap();
-        fs::write(source.path().join("Project/readme.md"), b"kept").unwrap();
+        fs::write(source.path().join("Project/readme.md"), b"manual").unwrap();
         fs::write(source.path().join("loose.txt"), b"staged separately").unwrap();
         let artifacts = tempdir().unwrap();
 
@@ -1816,7 +1828,7 @@ mod tests {
             fs::create_dir(source.path().join(area)).unwrap();
         }
         fs::create_dir(source.path().join("Project")).unwrap();
-        fs::write(source.path().join("Project/readme.md"), b"kept").unwrap();
+        fs::write(source.path().join("Project/readme.md"), b"manual").unwrap();
         let artifacts = tempdir().unwrap();
         let plan = build_managed_directory_adoption_plan(source.path()).unwrap();
         let session = apply_managed_directory_adoption(
@@ -2010,7 +2022,7 @@ mod tests {
         .unwrap();
         fs::rename(
             source.path().join("Recents"),
-            journals.path().join("original-inbox"),
+            journals.path().join("original-recents"),
         )
         .unwrap();
         fs::write(outside.path().join("loose.txt"), b"outside").unwrap();

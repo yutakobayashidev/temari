@@ -14,14 +14,15 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use temari_core::{
-    ApplySession, Config, FolderProposal, FolderProposer, FolderSet, InboxState,
+    ApplySession, Config, FolderProposal, FolderProposer, FolderSet, RecentsState,
     ManagedCycleResult, ManagedLibraryEdit, ManagedLibraryEditPlan, ManagedReprocessArea,
     ManagedReprocessSelection, ManagedRun, ManagedRunKind, ManagedService, ManagedSetupPlan,
     ManagedSetupSession, ManagedSetupUndoSession, ManagedSetupUndoState, ManagedUndoMoveOutcome,
     ManagedWorkspace, OpenAiCompatibleModel, Proposal, RunState, ScanScope, SourceLock, StateStore,
-    UndoMoveOutcome, UndoSession, build_managed_setup_plan, detect_managed_area_layout,
-    inbox_file_candidates, scan_directory, select_representative_files,
+    UndoMoveOutcome, UndoSession, MANAGED_AREAS, build_managed_setup_plan,
+    recents_file_candidates, scan_directory, select_representative_files,
     undo_session_files_with_lock, undo_session_with_lock,
+    validate_managed_workspace_root_candidate,
 };
 use temari_schedule::{
     ScheduleSpec, ScheduleStatus as CoreScheduleStatus, SchedulerPlatform, install_schedule,
@@ -107,13 +108,13 @@ impl ManagedDrafts {
             .as_ref()
             .is_none_or(|draft| draft.token != token)
         {
-            return Err("the reviewed Library edit is no longer active".into());
+            return Err("the reviewed AI Library edit is no longer active".into());
         }
         self.revision = self.revision.wrapping_add(1);
         Ok(self
             .library_edit
             .take()
-            .expect("Library edit token was checked"))
+            .expect("AI Library edit token was checked"))
     }
 }
 
@@ -275,7 +276,7 @@ impl From<ManagedRun> for ManagedRunView {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct InboxSummaryView {
+pub(crate) struct RecentsSummaryView {
     pub physical_files: usize,
     pub indexed_pending: usize,
     pub indexed_planned: usize,
@@ -314,7 +315,7 @@ pub(crate) struct ManagedWorkspaceStatus {
     pub health: String,
     pub issues: Vec<String>,
     pub workspace: ManagedWorkspaceView,
-    pub inbox: InboxSummaryView,
+    pub recents: RecentsSummaryView,
     pub runs: ManagedRunsView,
     pub library_folders: Vec<LibraryFolderView>,
     pub latest_configuration: Option<LibraryConfigurationView>,
@@ -649,7 +650,7 @@ pub(crate) async fn managed_preview_library_edit(
             .map_err(error_text)
     })
     .await
-    .map_err(|error| format!("Library edit preview task failed: {error}"))??;
+    .map_err(|error| format!("AI Library edit preview task failed: {error}"))??;
     let view = LibraryEditPreviewView {
         token: token.clone(),
         operation,
@@ -661,7 +662,7 @@ pub(crate) async fn managed_preview_library_edit(
         .lock()
         .map_err(|_| "managed setup state is unavailable".to_owned())?;
     if drafts.revision != revision {
-        return Err("a newer Library edit preview replaced this result".into());
+        return Err("a newer AI Library edit preview replaced this result".into());
     }
     drafts.library_edit = Some(LibraryEditDraft { token, plan });
     Ok(view)
@@ -686,7 +687,7 @@ pub(crate) async fn managed_apply_library_edit(
             .map_err(error_text)
     })
     .await
-    .map_err(|error| format!("Library edit Apply task failed: {error}"))??;
+    .map_err(|error| format!("AI Library edit Apply task failed: {error}"))??;
     with_store(|store| workspace_status(store, &workspace_id))
 }
 
@@ -702,7 +703,7 @@ pub(crate) async fn managed_undo_library_edit(
             .map_err(error_text)
     })
     .await
-    .map_err(|error| format!("Library edit Undo task failed: {error}"))??;
+    .map_err(|error| format!("AI Library edit Undo task failed: {error}"))??;
     with_store(|store| workspace_status(store, &workspace_id))
 }
 
@@ -738,7 +739,7 @@ pub(crate) async fn managed_resume_library_edit(
         }
     })
     .await
-    .map_err(|error| format!("Library edit Resume task failed: {error}"))??;
+    .map_err(|error| format!("AI Library edit Resume task failed: {error}"))??;
     with_store(|store| workspace_status(store, &status_workspace_id))
 }
 
@@ -766,9 +767,9 @@ pub(crate) async fn managed_reprocess(
         return Err("desktop reprocessing requires explicit Apply confirmation".into());
     }
     let area = match request.area.as_str() {
-        "kept" => ManagedReprocessArea::Kept,
-        "library" => ManagedReprocessArea::Library,
-        _ => return Err("reprocess area must be kept or library".into()),
+        "manual_library" => ManagedReprocessArea::ManualLibrary,
+        "ai_library" => ManagedReprocessArea::AiLibrary,
+        _ => return Err("reprocess area must be manual_library or ai_library".into()),
     };
     if request.paths.is_empty() {
         return Err("choose at least one file or directory to reprocess".into());
@@ -877,7 +878,7 @@ fn workspace_status(
     workspace_id: &str,
 ) -> Result<ManagedWorkspaceStatus, String> {
     let workspace = require_workspace(store, workspace_id)?;
-    let inbox = store.inbox_items(workspace_id).map_err(error_text)?;
+    let recents = store.recents_items(workspace_id).map_err(error_text)?;
     let runs = store.managed_runs(workspace_id).map_err(error_text)?;
     let now = unix_ms()?;
     let mut issues = Vec::new();
@@ -897,31 +898,26 @@ fn workspace_status(
             Vec::new()
         }
     };
-    let physical_files = match inbox_file_candidates(Path::new(&workspace.source)) {
+    let physical_files = match recents_file_candidates(Path::new(&workspace.source)) {
         Ok(files) => files.len(),
         Err(error) => {
             issues.push(format!("Recents scan failed: {error}"));
             0
         }
     };
-    match detect_managed_area_layout(Path::new(&workspace.source)) {
-        Ok(layout) => {
-            for area in layout.areas() {
-                let path = Path::new(&workspace.source).join(area);
-                match fs::symlink_metadata(&path) {
-                    Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-                    Ok(_) => issues.push(format!(
-                        "managed area is not a real directory: {}",
-                        path.display()
-                    )),
-                    Err(error) => issues.push(format!(
-                        "could not inspect managed area {}: {error}",
-                        path.display()
-                    )),
-                }
-            }
+    for area in MANAGED_AREAS {
+        let path = Path::new(&workspace.source).join(area);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => issues.push(format!(
+                "managed area is not a real directory: {}",
+                path.display()
+            )),
+            Err(error) => issues.push(format!(
+                "could not inspect managed area {}: {error}",
+                path.display()
+            )),
         }
-        Err(error) => issues.push(format!("managed area layout is invalid: {error}")),
     }
     let actionable = runs
         .iter()
@@ -937,14 +933,14 @@ fn workspace_status(
     if !actionable.is_empty() {
         issues.push(format!("{} run(s) need attention", actionable.len()));
     }
-    let count_state = |state| inbox.iter().filter(|item| item.state == state).count();
-    let eligible_now = inbox
+    let count_state = |state| recents.iter().filter(|item| item.state == state).count();
+    let eligible_now = recents
         .iter()
-        .filter(|item| item.state == InboxState::Pending && item.eligible_unix_ms <= now)
+        .filter(|item| item.state == RecentsState::Pending && item.eligible_unix_ms <= now)
         .count();
-    let next_eligible_unix_ms = inbox
+    let next_eligible_unix_ms = recents
         .iter()
-        .filter(|item| item.state == InboxState::Pending && item.eligible_unix_ms > now)
+        .filter(|item| item.state == RecentsState::Pending && item.eligible_unix_ms > now)
         .map(|item| item.eligible_unix_ms)
         .min();
     let latest_configuration = runs
@@ -967,11 +963,11 @@ fn workspace_status(
         health: health.into(),
         issues,
         workspace: ManagedWorkspaceView::from(workspace),
-        inbox: InboxSummaryView {
+        recents: RecentsSummaryView {
             physical_files,
-            indexed_pending: count_state(InboxState::Pending),
-            indexed_planned: count_state(InboxState::Planned),
-            indexed_moved: count_state(InboxState::Moved),
+            indexed_pending: count_state(RecentsState::Pending),
+            indexed_planned: count_state(RecentsState::Planned),
+            indexed_moved: count_state(RecentsState::Moved),
             eligible_now,
             next_eligible_unix_ms,
         },
@@ -994,7 +990,6 @@ fn editable_library_folders(folders: &FolderSet) -> Vec<LibraryFolderView> {
             path: folder
                 .path
                 .strip_prefix("AI Library/")
-                .or_else(|| folder.path.strip_prefix("Library/"))
                 .unwrap_or(&folder.path)
                 .into(),
             description: folder.description.clone(),
@@ -1041,34 +1036,7 @@ fn propose_workspace(
 }
 
 pub(crate) fn reject_managed_area_source(source: &Path) -> Result<(), String> {
-    const AREA_FAMILIES: [[&str; 3]; 2] = [
-        ["Kept", "Inbox", "Library"],
-        ["Manual Library", "Recents", "AI Library"],
-    ];
-
-    for ancestor in source.ancestors() {
-        let Some(name) = ancestor.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        let Some(family) = AREA_FAMILIES.iter().find(|family| family.contains(&name)) else {
-            continue;
-        };
-        let Some(parent) = ancestor.parent() else {
-            continue;
-        };
-        if family
-            .iter()
-            .filter(|candidate| parent.join(candidate).is_dir())
-            .count()
-            >= 2
-        {
-            return Err(format!(
-                "choose the workspace root instead of its managed area: {}",
-                ancestor.display()
-            ));
-        }
-    }
-    Ok(())
+    validate_managed_workspace_root_candidate(source).map_err(error_text)
 }
 
 fn preview_workspace(
@@ -1123,9 +1091,9 @@ fn preview_view(preview: &PreviewDraft) -> Result<SetupPreviewView, String> {
                 .destination_path
                 .starts_with(&format!("{manual_area}/"))
             {
-                "kept".into()
+                "manual_library".into()
             } else {
-                "inbox".into()
+                "recents".into()
             },
         })
         .collect();
@@ -1541,11 +1509,14 @@ fn error_text(error: temari_core::Error) -> String {
 mod tests {
     use super::*;
     use temari_core::{
-        FsIdentity, MonitorRecord, apply_plan, build_stage_to_inbox_plan, root_file_candidates,
+        FsIdentity, MonitorRecord, apply_plan, build_stage_to_recents_plan, root_file_candidates,
     };
     use tempfile::tempdir;
 
     fn insert_workspace(path: &Path, source: &Path) -> ManagedWorkspace {
+        for area in MANAGED_AREAS {
+            fs::create_dir_all(source.join(area)).unwrap();
+        }
         let mut store = StateStore::open(path).unwrap();
         let source = source.canonicalize().unwrap();
         let identity = temari_core::canonical_source_identity(&source).unwrap().1;
@@ -1726,7 +1697,7 @@ timeout_seconds = 2
         assert_eq!(listed[0].id, "workspace-1");
 
         let status = get_workspace_at(&state, "workspace-1").unwrap();
-        assert_eq!(status.inbox.physical_files, 0);
+        assert_eq!(status.recents.physical_files, 0);
         assert_eq!(status.runs.total, 0);
 
         let disabled = set_workspace_enabled_at(&state, "workspace-1", false).unwrap();
@@ -1772,13 +1743,12 @@ timeout_seconds = 2
         let directory = tempdir().unwrap();
         let source = directory.path().join("source");
         fs::create_dir(&source).unwrap();
-        fs::create_dir(source.join("Inbox")).unwrap();
         fs::write(source.join("report.txt"), "report").unwrap();
         let state = directory.path().join("state.sqlite3");
         insert_workspace(&state, &source);
 
         let candidates = root_file_candidates(&source).unwrap();
-        let plan = build_stage_to_inbox_plan(&source, &candidates).unwrap();
+        let plan = build_stage_to_recents_plan(&source, &candidates).unwrap();
         let apply_path = directory.path().join("apply.json");
         let apply = apply_plan(&plan, &apply_path).unwrap();
         let move_id = apply.moves[0].file_id.clone();
@@ -1806,7 +1776,7 @@ timeout_seconds = 2
         assert_eq!(result.state, "completed");
         assert_eq!(result.restored_files, 1);
         assert!(source.join("report.txt").is_file());
-        assert!(!source.join("Inbox/report.txt").exists());
+        assert!(!source.join("Recents/report.txt").exists());
         let history = history_at(&state, "workspace-1", 20).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].move_id, move_id);

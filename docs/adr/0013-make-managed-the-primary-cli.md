@@ -14,7 +14,7 @@
 
 ## Context
 
-Temari temporarily exposed two recurring workflows: a generic monitor command family and the newer managed workspace. Both used the same classification, rule, Plan, Apply, SQLite, and reconciliation services, but only managed represented the intended `Kept`, `Inbox`, and `Library` experience. Keeping both public made users choose an implementation mechanism instead of a product outcome.
+Temari temporarily exposed two recurring workflows: a generic monitor command family and the newer managed workspace. Both used the same classification, rule, Plan, Apply, SQLite, and reconciliation services, but only managed represented the intended `Manual Library`, `Recents`, and `AI Library` experience. Keeping both public made users choose an implementation mechanism instead of a product outcome.
 
 The CLI has not been released and the repository explicitly avoids compatibility shims for experimental contracts.
 

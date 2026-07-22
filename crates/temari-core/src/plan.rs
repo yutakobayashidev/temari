@@ -511,7 +511,7 @@ mod tests {
     fn folders() -> Vec<ApprovedFolder> {
         crate::Proposal {
             version: 2,
-            source: "/tmp/inbox".into(),
+            source: "/tmp/recents".into(),
             scope: ScanScope::default(),
             files_considered: 1,
             folders: vec![crate::FolderProposal {

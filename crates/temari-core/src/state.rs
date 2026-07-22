@@ -14,7 +14,7 @@ use crate::{
     Plan, artifact::normalize_relative_path,
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -114,7 +114,7 @@ pub struct ManagedWorkspace {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum InboxState {
+pub enum RecentsState {
     Pending,
     Planned,
     Moved,
@@ -122,7 +122,7 @@ pub enum InboxState {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct InboxItem {
+pub struct RecentsItem {
     pub workspace_id: String,
     pub file_identity: FsIdentity,
     pub relative_path: String,
@@ -131,7 +131,7 @@ pub struct InboxItem {
     pub first_seen_unix_ms: i64,
     pub stable_since_unix_ms: i64,
     pub eligible_unix_ms: i64,
-    pub state: InboxState,
+    pub state: RecentsState,
     pub last_run_id: Option<String>,
 }
 
@@ -170,7 +170,7 @@ pub struct ReconcileSummary {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct InboxReconcileSummary {
+pub struct RecentsReconcileSummary {
     pub deleted_stale_pending: usize,
     pub reset_returned: usize,
 }
@@ -224,7 +224,7 @@ impl StateStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
-        migrate(&mut connection)?;
+        initialize_schema(&mut connection)?;
         Ok(Self { connection, path })
     }
 
@@ -234,7 +234,7 @@ impl StateStore {
 
     pub fn schema_version(&self) -> Result<i64, Error> {
         Ok(self.connection.query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            "SELECT version FROM schema_metadata WHERE id = 1",
             [],
             |row| row.get(0),
         )?)
@@ -512,7 +512,7 @@ impl StateStore {
             )?;
             if configuration_pending {
                 return Err(Error::InvalidState(
-                    "managed workspace cannot be enabled while a Library edit needs recovery"
+                    "managed workspace cannot be enabled while a AI Library edit needs recovery"
                         .into(),
                 ));
             }
@@ -549,7 +549,7 @@ impl StateStore {
         updated_unix_ms: i64,
     ) -> Result<ManagedWorkspace, Error> {
         let retention_ms = duration_millis(retention_seconds, "workspace retention")?;
-        let settle_ms = duration_millis(settle_seconds, "inbox settle window")?;
+        let settle_ms = duration_millis(settle_seconds, "recents settle window")?;
         if retention_seconds == 0 || settle_seconds == 0 {
             return Err(Error::InvalidState(
                 "workspace retention and settle windows must be greater than zero".into(),
@@ -561,7 +561,7 @@ impl StateStore {
         let pending = {
             let mut statement = transaction.prepare(
                 "SELECT file_device, file_inode, first_seen_unix_ms, stable_since_unix_ms
-                 FROM inbox_items WHERE workspace_id = ?1 AND state = 'pending'",
+                 FROM recents_items WHERE workspace_id = ?1 AND state = 'pending'",
             )?;
             let rows = statement.query_map([id], |row| {
                 Ok((
@@ -583,7 +583,7 @@ impl StateStore {
                         .map(|settle_deadline| retention_deadline.max(settle_deadline))
                 })
                 .ok_or_else(|| {
-                    Error::InvalidState("inbox eligibility timestamp overflow".into())
+                    Error::InvalidState("recents eligibility timestamp overflow".into())
                 })?;
             deadlines.push((device, inode, eligible));
         }
@@ -595,7 +595,7 @@ impl StateStore {
                 params![
                     id,
                     to_i64(retention_seconds, "workspace retention")?,
-                    to_i64(settle_seconds, "inbox settle window")?,
+                    to_i64(settle_seconds, "recents settle window")?,
                     updated_unix_ms,
                 ],
             )?,
@@ -604,7 +604,7 @@ impl StateStore {
         )?;
         for (device, inode, eligible) in deadlines {
             transaction.execute(
-                "UPDATE inbox_items SET eligible_unix_ms = ?4
+                "UPDATE recents_items SET eligible_unix_ms = ?4
                  WHERE workspace_id = ?1 AND file_device = ?2 AND file_inode = ?3
                    AND state = 'pending'",
                 params![id, device, inode, eligible],
@@ -780,7 +780,7 @@ impl StateStore {
         )?;
         if unfinished_managed || unfinished_monitoring {
             return Err(Error::InvalidState(
-                "Library editing requires every managed run to be finished".into(),
+                "AI Library editing requires every managed run to be finished".into(),
             ));
         }
         if let Some(destination_id) = removed_destination_id {
@@ -858,14 +858,14 @@ impl StateStore {
         fingerprint: &FileFingerprint,
         relative_path: &str,
         now_unix_ms: i64,
-    ) -> Result<InboxItem, Error> {
+    ) -> Result<RecentsItem, Error> {
         validate_identifier("workspace ID", workspace_id)?;
         normalize_relative_path(relative_path)?;
-        validate_digest("inbox content digest", &fingerprint.sha256)?;
+        validate_digest("recents content digest", &fingerprint.sha256)?;
         let workspace = self.managed_workspace(workspace_id)?.ok_or_else(|| {
             Error::InvalidState(format!("unknown managed workspace {workspace_id:?}"))
         })?;
-        let existing = self.inbox_item(workspace_id, fingerprint.identity.clone())?;
+        let existing = self.recents_item(workspace_id, fingerprint.identity.clone())?;
         let changed = existing.as_ref().is_some_and(|item| {
             item.relative_path != relative_path
                 || item.content_sha256 != fingerprint.sha256
@@ -882,7 +882,7 @@ impl StateStore {
                 .map_or(now_unix_ms, |item| item.stable_since_unix_ms)
         };
         let retention_ms = duration_millis(workspace.retention_seconds, "workspace retention")?;
-        let settle_ms = duration_millis(workspace.settle_seconds, "inbox settle window")?;
+        let settle_ms = duration_millis(workspace.settle_seconds, "recents settle window")?;
         let eligible_unix_ms = first_seen_unix_ms
             .checked_add(retention_ms)
             .and_then(|retention_deadline| {
@@ -890,15 +890,15 @@ impl StateStore {
                     .checked_add(settle_ms)
                     .map(|settle_deadline| retention_deadline.max(settle_deadline))
             })
-            .ok_or_else(|| Error::InvalidState("inbox eligibility timestamp overflow".into()))?;
+            .ok_or_else(|| Error::InvalidState("recents eligibility timestamp overflow".into()))?;
         let (state, last_run_id) = if changed {
-            (InboxState::Pending, None)
+            (RecentsState::Pending, None)
         } else {
             existing
                 .map(|item| (item.state, item.last_run_id))
-                .unwrap_or((InboxState::Pending, None))
+                .unwrap_or((RecentsState::Pending, None))
         };
-        let item = InboxItem {
+        let item = RecentsItem {
             workspace_id: workspace_id.into(),
             file_identity: fingerprint.identity.clone(),
             relative_path: relative_path.into(),
@@ -910,10 +910,10 @@ impl StateStore {
             state,
             last_run_id,
         };
-        validate_inbox_item(&item)?;
+        validate_recents_item(&item)?;
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            "DELETE FROM inbox_items
+            "DELETE FROM recents_items
              WHERE workspace_id = ?1 AND relative_path = ?2
                AND (file_device != ?3 OR file_inode != ?4)",
             params![
@@ -924,7 +924,7 @@ impl StateStore {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO inbox_items (
+            "INSERT INTO recents_items (
                 workspace_id, file_device, file_inode, relative_path, content_sha256,
                 size_bytes, first_seen_unix_ms, stable_since_unix_ms, eligible_unix_ms,
                 state, last_run_id
@@ -944,7 +944,7 @@ impl StateStore {
                 item.file_identity.inode.to_string(),
                 item.relative_path,
                 item.content_sha256,
-                to_i64(item.size_bytes, "inbox file size")?,
+                to_i64(item.size_bytes, "recents file size")?,
                 item.first_seen_unix_ms,
                 item.stable_since_unix_ms,
                 item.eligible_unix_ms,
@@ -956,38 +956,38 @@ impl StateStore {
         Ok(item)
     }
 
-    pub fn inbox_item(
+    pub fn recents_item(
         &self,
         workspace_id: &str,
         file_identity: FsIdentity,
-    ) -> Result<Option<InboxItem>, Error> {
+    ) -> Result<Option<RecentsItem>, Error> {
         Ok(self
             .connection
             .query_row(
                 "SELECT workspace_id, file_device, file_inode, relative_path,
                         content_sha256, size_bytes, first_seen_unix_ms,
                         stable_since_unix_ms, eligible_unix_ms, state, last_run_id
-                 FROM inbox_items
+                 FROM recents_items
                  WHERE workspace_id = ?1 AND file_device = ?2 AND file_inode = ?3",
                 params![
                     workspace_id,
                     file_identity.device.to_string(),
                     file_identity.inode.to_string()
                 ],
-                inbox_item_from_row,
+                recents_item_from_row,
             )
             .optional()?)
     }
 
-    pub fn inbox_items(&self, workspace_id: &str) -> Result<Vec<InboxItem>, Error> {
+    pub fn recents_items(&self, workspace_id: &str) -> Result<Vec<RecentsItem>, Error> {
         let mut statement = self.connection.prepare(
             "SELECT workspace_id, file_device, file_inode, relative_path,
                     content_sha256, size_bytes, first_seen_unix_ms,
                     stable_since_unix_ms, eligible_unix_ms, state, last_run_id
-             FROM inbox_items WHERE workspace_id = ?1
+             FROM recents_items WHERE workspace_id = ?1
              ORDER BY first_seen_unix_ms, relative_path",
         )?;
-        let rows = statement.query_map([workspace_id], inbox_item_from_row)?;
+        let rows = statement.query_map([workspace_id], recents_item_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -995,27 +995,28 @@ impl StateStore {
         &self,
         workspace_id: &str,
         now_unix_ms: i64,
-    ) -> Result<Vec<InboxItem>, Error> {
+    ) -> Result<Vec<RecentsItem>, Error> {
         let mut statement = self.connection.prepare(
             "SELECT workspace_id, file_device, file_inode, relative_path,
                     content_sha256, size_bytes, first_seen_unix_ms,
                     stable_since_unix_ms, eligible_unix_ms, state, last_run_id
-             FROM inbox_items
+             FROM recents_items
              WHERE workspace_id = ?1 AND state = 'pending' AND eligible_unix_ms <= ?2
              ORDER BY eligible_unix_ms, relative_path",
         )?;
-        let rows = statement.query_map(params![workspace_id, now_unix_ms], inbox_item_from_row)?;
+        let rows =
+            statement.query_map(params![workspace_id, now_unix_ms], recents_item_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    pub fn set_inbox_item_state(
+    pub fn set_recents_item_state(
         &mut self,
         workspace_id: &str,
         file_identity: FsIdentity,
-        state: InboxState,
+        state: RecentsState,
         last_run_id: Option<&str>,
     ) -> Result<(), Error> {
-        validate_inbox_state(state, last_run_id)?;
+        validate_recents_state(state, last_run_id)?;
         if let Some(run_id) = last_run_id {
             let belongs: bool = self.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM managed_runs WHERE id = ?1 AND workspace_id = ?2)",
@@ -1030,7 +1031,7 @@ impl StateStore {
         }
         require_changed(
             self.connection.execute(
-                "UPDATE inbox_items SET state = ?4, last_run_id = ?5
+                "UPDATE recents_items SET state = ?4, last_run_id = ?5
                  WHERE workspace_id = ?1 AND file_device = ?2 AND file_inode = ?3",
                 params![
                     workspace_id,
@@ -1040,7 +1041,7 @@ impl StateStore {
                     last_run_id,
                 ],
             )?,
-            "inbox item",
+            "recents item",
             &format!(
                 "{workspace_id}:{}:{}",
                 file_identity.device, file_identity.inode
@@ -1048,14 +1049,14 @@ impl StateStore {
         )
     }
 
-    pub fn delete_inbox_item(
+    pub fn delete_recents_item(
         &mut self,
         workspace_id: &str,
         file_identity: FsIdentity,
     ) -> Result<(), Error> {
         require_changed(
             self.connection.execute(
-                "DELETE FROM inbox_items
+                "DELETE FROM recents_items
                  WHERE workspace_id = ?1 AND file_device = ?2 AND file_inode = ?3",
                 params![
                     workspace_id,
@@ -1063,7 +1064,7 @@ impl StateStore {
                     file_identity.inode.to_string()
                 ],
             )?,
-            "inbox item",
+            "recents item",
             &format!(
                 "{workspace_id}:{}:{}",
                 file_identity.device, file_identity.inode
@@ -1071,19 +1072,19 @@ impl StateStore {
         )
     }
 
-    pub fn reconcile_inbox_index(
+    pub fn reconcile_recents_index(
         &mut self,
         workspace_id: &str,
-        observed_inbox_identities: &[FsIdentity],
-    ) -> Result<InboxReconcileSummary, Error> {
+        observed_recents_identities: &[FsIdentity],
+    ) -> Result<RecentsReconcileSummary, Error> {
         validate_identifier("workspace ID", workspace_id)?;
-        let observed = observed_inbox_identities
+        let observed = observed_recents_identities
             .iter()
             .map(|identity| (identity.device, identity.inode))
             .collect::<HashSet<_>>();
-        if observed.len() != observed_inbox_identities.len() {
+        if observed.len() != observed_recents_identities.len() {
             return Err(Error::InvalidState(
-                "Inbox reconciliation contains duplicate filesystem identities".into(),
+                "Recents reconciliation contains duplicate filesystem identities".into(),
             ));
         }
         let transaction = self.connection.transaction()?;
@@ -1091,14 +1092,14 @@ impl StateStore {
         let indexed = {
             let mut statement = transaction.prepare(
                 "SELECT i.file_device, i.file_inode, i.state, r.state
-                 FROM inbox_items AS i
+                 FROM recents_items AS i
                  LEFT JOIN managed_runs AS r ON r.id = i.last_run_id
                  WHERE i.workspace_id = ?1 ORDER BY i.relative_path",
             )?;
             let rows = statement.query_map([workspace_id], |row| {
                 let device = parse_u64_column(row.get(0)?, 0)?;
                 let inode = parse_u64_column(row.get(1)?, 1)?;
-                let state = InboxState::parse(&row.get::<_, String>(2)?)
+                let state = RecentsState::parse(&row.get::<_, String>(2)?)
                     .map_err(|error| conversion_error(2, error))?;
                 let run_state = row
                     .get::<_, Option<String>>(3)?
@@ -1110,11 +1111,11 @@ impl StateStore {
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        let mut summary = InboxReconcileSummary::default();
+        let mut summary = RecentsReconcileSummary::default();
         for (device, inode, state, _) in &indexed {
-            if *state == InboxState::Pending && !observed.contains(&(*device, *inode)) {
+            if *state == RecentsState::Pending && !observed.contains(&(*device, *inode)) {
                 summary.deleted_stale_pending += transaction.execute(
-                    "DELETE FROM inbox_items
+                    "DELETE FROM recents_items
                      WHERE workspace_id = ?1 AND file_device = ?2 AND file_inode = ?3
                        AND state = 'pending'",
                     params![workspace_id, device.to_string(), inode.to_string()],
@@ -1123,9 +1124,9 @@ impl StateStore {
         }
         for (device, inode, state, run_state) in indexed {
             let returned = match state {
-                InboxState::Pending => false,
-                InboxState::Moved => true,
-                InboxState::Planned => !matches!(
+                RecentsState::Pending => false,
+                RecentsState::Moved => true,
+                RecentsState::Planned => !matches!(
                     run_state,
                     Some(
                         RunState::Planning
@@ -1137,7 +1138,7 @@ impl StateStore {
             };
             if returned && observed.contains(&(device, inode)) {
                 summary.reset_returned += transaction.execute(
-                    "UPDATE inbox_items SET state = 'pending', last_run_id = NULL
+                    "UPDATE recents_items SET state = 'pending', last_run_id = NULL
                      WHERE workspace_id = ?1 AND file_device = ?2 AND file_inode = ?3
                        AND state != 'pending'",
                     params![workspace_id, device.to_string(), inode.to_string()],
@@ -1241,13 +1242,13 @@ impl StateStore {
 
     pub fn delete_managed_run(&mut self, id: &str) -> Result<(), Error> {
         let referenced: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM inbox_items WHERE last_run_id = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM recents_items WHERE last_run_id = ?1)",
             [id],
             |row| row.get(0),
         )?;
         if referenced {
             return Err(Error::InvalidState(format!(
-                "managed run {id:?} is still referenced by inbox items"
+                "managed run {id:?} is still referenced by recents items"
             )));
         }
         require_changed(
@@ -1380,7 +1381,7 @@ impl StateStore {
             match kind {
                 ManagedRunKind::Stage => {
                     transaction.execute(
-                        "DELETE FROM inbox_items
+                        "DELETE FROM recents_items
                          WHERE workspace_id = ?1 AND file_device = ?2 AND file_inode = ?3",
                         params![
                             workspace_id,
@@ -1392,7 +1393,7 @@ impl StateStore {
                 ManagedRunKind::Classify => {
                     require_changed(
                         transaction.execute(
-                            "UPDATE inbox_items SET state = 'pending', last_run_id = NULL
+                            "UPDATE recents_items SET state = 'pending', last_run_id = NULL
                              WHERE workspace_id = ?1 AND file_device = ?2 AND file_inode = ?3",
                             params![
                                 workspace_id,
@@ -1400,7 +1401,7 @@ impl StateStore {
                                 identity.inode.to_string()
                             ],
                         )?,
-                        "inbox item",
+                        "recents item",
                         &format!("{workspace_id}:{}:{}", identity.device, identity.inode),
                     )?;
                     transaction.execute(
@@ -2046,7 +2047,7 @@ impl RunState {
     }
 }
 
-impl InboxState {
+impl RecentsState {
     fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -2060,7 +2061,7 @@ impl InboxState {
             "pending" => Ok(Self::Pending),
             "planned" => Ok(Self::Planned),
             "moved" => Ok(Self::Moved),
-            other => Err(format!("unknown inbox state {other:?}")),
+            other => Err(format!("unknown recents state {other:?}")),
         }
     }
 }
@@ -2132,12 +2133,49 @@ fn validate_database_target(path: &Path) -> Result<(), Error> {
     }
 }
 
-fn migrate(connection: &mut Connection) -> Result<(), Error> {
+fn initialize_schema(connection: &mut Connection) -> Result<(), Error> {
+    let has_metadata: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'schema_metadata'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_metadata {
+        let version = connection
+            .query_row(
+                "SELECT version FROM schema_metadata WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                Error::InvalidState("state database schema metadata is missing".into())
+            })?;
+        if version != SCHEMA_VERSION {
+            return Err(Error::InvalidState(format!(
+                "unsupported state database schema version {version}; expected {SCHEMA_VERSION}"
+            )));
+        }
+    } else {
+        let existing_tables: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )?;
+        if existing_tables != 0 {
+            return Err(Error::InvalidState(
+                "unsupported or malformed state database schema".into(),
+            ));
+        }
+    }
     let transaction = connection.transaction()?;
     transaction.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-            version INTEGER PRIMARY KEY,
-            applied_unix_ms INTEGER NOT NULL
+        "CREATE TABLE IF NOT EXISTS schema_metadata (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            version INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS monitors (
             id TEXT PRIMARY KEY,
@@ -2279,7 +2317,7 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
         );
         CREATE INDEX IF NOT EXISTS managed_undo_journals_by_run_time
             ON managed_undo_journals(run_id, id);
-        CREATE TABLE IF NOT EXISTS inbox_items (
+        CREATE TABLE IF NOT EXISTS recents_items (
             workspace_id TEXT NOT NULL REFERENCES managed_workspaces(id) ON DELETE CASCADE,
             file_device TEXT NOT NULL,
             file_inode TEXT NOT NULL,
@@ -2298,145 +2336,11 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
             CHECK((state = 'pending' AND last_run_id IS NULL) OR
                   (state != 'pending' AND last_run_id IS NOT NULL))
         );
-        CREATE INDEX IF NOT EXISTS inbox_items_by_eligibility
-            ON inbox_items(workspace_id, state, eligible_unix_ms, relative_path);",
-    )?;
-    let has_config_path: bool = transaction.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM pragma_table_info('managed_workspaces') WHERE name = 'config_path'
-         )",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_config_path {
-        transaction.execute(
-            "ALTER TABLE managed_workspaces
-             ADD COLUMN config_path TEXT NOT NULL DEFAULT ''",
-            [],
-        )?;
-    }
-    let managed_runs_support_adoption: bool = transaction.query_row(
-        "SELECT instr(COALESCE(sql, ''), '''adopt''') > 0
-         FROM sqlite_master WHERE type = 'table' AND name = 'managed_runs'",
-        [],
-        |row| row.get(0),
-    )?;
-    if !managed_runs_support_adoption {
-        transaction.execute_batch(
-            "DROP INDEX IF EXISTS managed_runs_by_workspace_time;
-             DROP INDEX IF EXISTS managed_undo_journals_by_run_time;
-             ALTER TABLE managed_undo_journals RENAME TO managed_undo_journals_v4;
-             ALTER TABLE managed_runs RENAME TO managed_runs_v4;
-             CREATE TABLE managed_runs (
-                 id TEXT PRIMARY KEY,
-                 workspace_id TEXT NOT NULL REFERENCES managed_workspaces(id) ON DELETE CASCADE,
-                 kind TEXT NOT NULL CHECK(kind IN ('setup', 'adopt', 'stage', 'classify', 'configure')),
-                 state TEXT NOT NULL CHECK(state IN (
-                     'planning', 'planned', 'applying', 'completed',
-                     'noop', 'failed', 'needs_resume'
-                 )),
-                 plan_path TEXT,
-                 apply_path TEXT,
-                 undo_path TEXT,
-                 started_unix_ms INTEGER NOT NULL,
-                 finished_unix_ms INTEGER,
-                 move_count INTEGER NOT NULL DEFAULT 0 CHECK(move_count >= 0),
-                 error TEXT,
-                 CHECK(finished_unix_ms IS NULL OR finished_unix_ms >= started_unix_ms)
-             );
-             INSERT INTO managed_runs
-             SELECT * FROM managed_runs_v4;
-             CREATE TABLE managed_undo_journals (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 run_id TEXT NOT NULL REFERENCES managed_runs(id) ON DELETE CASCADE,
-                 path TEXT NOT NULL UNIQUE,
-                 created_unix_ms INTEGER NOT NULL
-             );
-             INSERT INTO managed_undo_journals
-             SELECT * FROM managed_undo_journals_v4;
-             DROP TABLE managed_undo_journals_v4;
-             DROP TABLE managed_runs_v4;
-             CREATE INDEX managed_runs_by_workspace_time
-                 ON managed_runs(workspace_id, started_unix_ms DESC, id DESC);
-             CREATE INDEX managed_undo_journals_by_run_time
-                 ON managed_undo_journals(run_id, id);",
-        )?;
-    }
-    let managed_runs_support_configuration: bool = transaction.query_row(
-        "SELECT instr(COALESCE(sql, ''), '''configure''') > 0
-         FROM sqlite_master WHERE type = 'table' AND name = 'managed_runs'",
-        [],
-        |row| row.get(0),
-    )?;
-    if !managed_runs_support_configuration {
-        transaction.execute_batch(
-            "DROP INDEX IF EXISTS managed_runs_by_workspace_time;
-             DROP INDEX IF EXISTS managed_undo_journals_by_run_time;
-             ALTER TABLE managed_undo_journals RENAME TO managed_undo_journals_v5;
-             ALTER TABLE managed_runs RENAME TO managed_runs_v5;
-             CREATE TABLE managed_runs (
-                 id TEXT PRIMARY KEY,
-                 workspace_id TEXT NOT NULL REFERENCES managed_workspaces(id) ON DELETE CASCADE,
-                 kind TEXT NOT NULL CHECK(kind IN (
-                     'setup', 'adopt', 'stage', 'classify', 'configure'
-                 )),
-                 state TEXT NOT NULL CHECK(state IN (
-                     'planning', 'planned', 'applying', 'completed',
-                     'noop', 'failed', 'needs_resume'
-                 )),
-                 plan_path TEXT,
-                 apply_path TEXT,
-                 undo_path TEXT,
-                 started_unix_ms INTEGER NOT NULL,
-                 finished_unix_ms INTEGER,
-                 move_count INTEGER NOT NULL DEFAULT 0 CHECK(move_count >= 0),
-                 error TEXT,
-                 CHECK(finished_unix_ms IS NULL OR finished_unix_ms >= started_unix_ms)
-             );
-             INSERT INTO managed_runs SELECT * FROM managed_runs_v5;
-             CREATE TABLE managed_undo_journals (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 run_id TEXT NOT NULL REFERENCES managed_runs(id) ON DELETE CASCADE,
-                 path TEXT NOT NULL UNIQUE,
-                 created_unix_ms INTEGER NOT NULL
-             );
-             INSERT INTO managed_undo_journals SELECT * FROM managed_undo_journals_v5;
-             DROP TABLE managed_undo_journals_v5;
-             DROP TABLE managed_runs_v5;
-             CREATE INDEX managed_runs_by_workspace_time
-                 ON managed_runs(workspace_id, started_unix_ms DESC, id DESC);
-             CREATE INDEX managed_undo_journals_by_run_time
-                 ON managed_undo_journals(run_id, id);",
-        )?;
-    }
-    transaction.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
-         VALUES (1, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
-        [],
+        CREATE INDEX IF NOT EXISTS recents_items_by_eligibility
+            ON recents_items(workspace_id, state, eligible_unix_ms, relative_path);",
     )?;
     transaction.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
-         VALUES (2, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
-        [],
-    )?;
-    transaction.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
-         VALUES (3, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
-        [],
-    )?;
-    transaction.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
-         VALUES (4, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
-        [],
-    )?;
-    transaction.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
-         VALUES (5, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
-        [],
-    )?;
-    transaction.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version, applied_unix_ms)
-         VALUES (?1, CAST(strftime('%s', 'now') AS INTEGER) * 1000)",
+        "INSERT OR IGNORE INTO schema_metadata (id, version) VALUES (1, ?1)",
         [SCHEMA_VERSION],
     )?;
     transaction.commit()?;
@@ -2557,11 +2461,11 @@ fn validate_workspace_update_time(
     Ok(())
 }
 
-fn inbox_item_from_row(row: &Row<'_>) -> rusqlite::Result<InboxItem> {
+fn recents_item_from_row(row: &Row<'_>) -> rusqlite::Result<RecentsItem> {
     let device: String = row.get(1)?;
     let inode: String = row.get(2)?;
     let state: String = row.get(9)?;
-    Ok(InboxItem {
+    Ok(RecentsItem {
         workspace_id: row.get(0)?,
         file_identity: FsIdentity {
             device: parse_u64_column(device, 1)?,
@@ -2573,7 +2477,7 @@ fn inbox_item_from_row(row: &Row<'_>) -> rusqlite::Result<InboxItem> {
         first_seen_unix_ms: row.get(6)?,
         stable_since_unix_ms: row.get(7)?,
         eligible_unix_ms: row.get(8)?,
-        state: InboxState::parse(&state).map_err(|error| conversion_error(9, error))?,
+        state: RecentsState::parse(&state).map_err(|error| conversion_error(9, error))?,
         last_run_id: row.get(10)?,
     })
 }
@@ -2687,29 +2591,29 @@ fn validate_workspace_monitor(
     Ok(())
 }
 
-fn validate_inbox_item(item: &InboxItem) -> Result<(), Error> {
-    validate_identifier("inbox workspace ID", &item.workspace_id)?;
+fn validate_recents_item(item: &RecentsItem) -> Result<(), Error> {
+    validate_identifier("recents workspace ID", &item.workspace_id)?;
     normalize_relative_path(&item.relative_path)?;
-    validate_digest("inbox content digest", &item.content_sha256)?;
+    validate_digest("recents content digest", &item.content_sha256)?;
     if item.stable_since_unix_ms < item.first_seen_unix_ms
         || item.eligible_unix_ms < item.first_seen_unix_ms
     {
         return Err(Error::InvalidState(
-            "inbox stability and eligibility must not precede first observation".into(),
+            "recents stability and eligibility must not precede first observation".into(),
         ));
     }
-    validate_inbox_state(item.state, item.last_run_id.as_deref())
+    validate_recents_state(item.state, item.last_run_id.as_deref())
 }
 
-fn validate_inbox_state(state: InboxState, last_run_id: Option<&str>) -> Result<(), Error> {
+fn validate_recents_state(state: RecentsState, last_run_id: Option<&str>) -> Result<(), Error> {
     match (state, last_run_id) {
-        (InboxState::Pending, None) => Ok(()),
-        (InboxState::Pending, Some(_)) => Err(Error::InvalidState(
-            "a pending inbox item must not reference a run".into(),
+        (RecentsState::Pending, None) => Ok(()),
+        (RecentsState::Pending, Some(_)) => Err(Error::InvalidState(
+            "a pending recents item must not reference a run".into(),
         )),
-        (_, Some(run_id)) => validate_identifier("inbox run ID", run_id),
+        (_, Some(run_id)) => validate_identifier("recents run ID", run_id),
         (_, None) => Err(Error::InvalidState(
-            "a planned or moved inbox item must reference a run".into(),
+            "a planned or moved recents item must reference a run".into(),
         )),
     }
 }
@@ -3000,7 +2904,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_idempotently_and_enforces_foreign_keys() {
+    fn initializes_schema_idempotently_and_enforces_foreign_keys() {
         let root = tempdir().unwrap();
         let path = root.path().join("state/temari.sqlite3");
         let store = StateStore::open(&path).unwrap();
@@ -3019,195 +2923,47 @@ mod tests {
         assert_eq!(
             reopened
                 .connection()
-                .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row
+                .query_row("SELECT COUNT(*) FROM schema_metadata", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            SCHEMA_VERSION
-        );
-    }
-
-    #[test]
-    fn migrates_schema_v1_database_to_current_managed_schema() {
-        let mut connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE schema_migrations (
-                    version INTEGER PRIMARY KEY,
-                    applied_unix_ms INTEGER NOT NULL
-                 );
-                 INSERT INTO schema_migrations VALUES (1, 0);",
-            )
-            .unwrap();
-
-        migrate(&mut connection).unwrap();
-
-        assert_eq!(
-            connection
-                .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| row
-                    .get::<_, i64>(
-                    0
-                ),)
-                .unwrap(),
-            SCHEMA_VERSION
-        );
-        for table in [
-            "managed_workspaces",
-            "inbox_items",
-            "managed_runs",
-            "managed_undo_journals",
-        ] {
-            assert!(
-                connection
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
-                        [table],
-                        |row| row.get::<_, bool>(0),
-                    )
-                    .unwrap()
-            );
-        }
-    }
-
-    #[test]
-    fn migrates_schema_v2_database_to_undo_journal_index() {
-        let mut connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE schema_migrations (
-                    version INTEGER PRIMARY KEY,
-                    applied_unix_ms INTEGER NOT NULL
-                 );
-                 INSERT INTO schema_migrations VALUES (1, 0);
-                 INSERT INTO schema_migrations VALUES (2, 0);",
-            )
-            .unwrap();
-
-        migrate(&mut connection).unwrap();
-
-        assert_eq!(
-            connection
-                .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| row
-                    .get::<_, i64>(
-                    0
-                ))
-                .unwrap(),
-            SCHEMA_VERSION
-        );
-        assert!(
-            connection
-                .query_row(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM sqlite_schema
-                        WHERE type = 'table' AND name = 'managed_undo_journals'
-                    )",
-                    [],
-                    |row| row.get::<_, bool>(0),
-                )
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn migrates_v5_runs_to_configure_without_losing_adoption_undo_history() {
-        let root = tempdir().unwrap();
-        let mut store = StateStore::open_in_memory().unwrap();
-        setup_workspace(&mut store, root.path());
-        store
-            .insert_managed_run(&ManagedRun {
-                id: "adopt-1".into(),
-                workspace_id: "w1".into(),
-                kind: ManagedRunKind::Adopt,
-                state: RunState::Completed,
-                plan_path: Some(root.path().join("adopt-plan.json").display().to_string()),
-                apply_path: Some(root.path().join("adopt-apply.json").display().to_string()),
-                undo_path: Some(root.path().join("adopt-undo.json").display().to_string()),
-                started_unix_ms: 200,
-                finished_unix_ms: Some(300),
-                move_count: 1,
-                error: None,
-            })
-            .unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO managed_undo_journals (run_id, path, created_unix_ms)
-                 VALUES ('adopt-1', ?1, 300)",
-                [root.path().join("adopt-undo.json").display().to_string()],
-            )
-            .unwrap();
-        store
-            .connection
-            .pragma_update(None, "foreign_keys", "OFF")
-            .unwrap();
-        store
-            .connection
-            .execute_batch(
-                "DROP INDEX managed_runs_by_workspace_time;
-                 DROP INDEX managed_undo_journals_by_run_time;
-                 ALTER TABLE managed_undo_journals RENAME TO managed_undo_journals_v6;
-                 ALTER TABLE managed_runs RENAME TO managed_runs_v6;
-                 CREATE TABLE managed_runs (
-                     id TEXT PRIMARY KEY,
-                     workspace_id TEXT NOT NULL REFERENCES managed_workspaces(id) ON DELETE CASCADE,
-                     kind TEXT NOT NULL CHECK(kind IN ('setup', 'adopt', 'stage', 'classify')),
-                     state TEXT NOT NULL CHECK(state IN (
-                         'planning', 'planned', 'applying', 'completed',
-                         'noop', 'failed', 'needs_resume'
-                     )),
-                     plan_path TEXT, apply_path TEXT, undo_path TEXT,
-                     started_unix_ms INTEGER NOT NULL, finished_unix_ms INTEGER,
-                     move_count INTEGER NOT NULL DEFAULT 0 CHECK(move_count >= 0), error TEXT,
-                     CHECK(finished_unix_ms IS NULL OR finished_unix_ms >= started_unix_ms)
-                 );
-                 INSERT INTO managed_runs SELECT * FROM managed_runs_v6;
-                 CREATE TABLE managed_undo_journals (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     run_id TEXT NOT NULL REFERENCES managed_runs(id) ON DELETE CASCADE,
-                     path TEXT NOT NULL UNIQUE, created_unix_ms INTEGER NOT NULL
-                 );
-                 INSERT INTO managed_undo_journals SELECT * FROM managed_undo_journals_v6;
-                 DROP TABLE managed_undo_journals_v6;
-                 DROP TABLE managed_runs_v6;
-                 CREATE INDEX managed_runs_by_workspace_time
-                     ON managed_runs(workspace_id, started_unix_ms DESC, id DESC);
-                 CREATE INDEX managed_undo_journals_by_run_time
-                     ON managed_undo_journals(run_id, id);
-                 DELETE FROM schema_migrations WHERE version = 6;",
-            )
-            .unwrap();
-        store
-            .connection
-            .pragma_update(None, "foreign_keys", "ON")
-            .unwrap();
-
-        migrate(&mut store.connection).unwrap();
-
-        assert_eq!(
-            store.managed_run("adopt-1").unwrap().unwrap().kind,
-            ManagedRunKind::Adopt
-        );
-        assert_eq!(
-            store.managed_undo_journal_paths("adopt-1").unwrap().len(),
             1
         );
-        let configure = ManagedRun {
-            id: "configure-1".into(),
-            workspace_id: "w1".into(),
-            kind: ManagedRunKind::Configure,
-            state: RunState::Applying,
-            plan_path: Some(root.path().join("edit-plan.json").display().to_string()),
-            apply_path: Some(root.path().join("edit-session.json").display().to_string()),
-            undo_path: None,
-            started_unix_ms: 400,
-            finished_unix_ms: None,
-            move_count: 0,
-            error: None,
-        };
-        store.insert_managed_run(&configure).unwrap();
-        let mut invalid = configure;
-        invalid.id = "configure-invalid".into();
-        invalid.workspace_id = "missing".into();
-        assert!(store.insert_managed_run(&invalid).is_err());
+    }
+
+    #[test]
+    fn rejects_an_older_database_schema() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_unix_ms INTEGER NOT NULL
+             );
+             INSERT INTO schema_migrations VALUES (6, 0);",
+            )
+            .unwrap();
+
+        let error = initialize_schema(&mut connection).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported or malformed state database schema")
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_database_without_schema_metadata() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute("CREATE TABLE unrelated (id INTEGER)", [])
+            .unwrap();
+
+        let error = initialize_schema(&mut connection).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported or malformed state database schema")
+        );
     }
 
     #[test]
@@ -3549,8 +3305,8 @@ mod tests {
             inode: 2,
         };
         for (identity, path) in [
-            (pending_identity.clone(), "Inbox/pending.txt"),
-            (moved_identity.clone(), "Inbox/moved.txt"),
+            (pending_identity.clone(), "Recents/pending.txt"),
+            (moved_identity.clone(), "Recents/moved.txt"),
         ] {
             store
                 .upsert_observation(
@@ -3581,10 +3337,10 @@ mod tests {
             })
             .unwrap();
         store
-            .set_inbox_item_state(
+            .set_recents_item_state(
                 "w1",
                 moved_identity.clone(),
-                InboxState::Moved,
+                RecentsState::Moved,
                 Some("run1"),
             )
             .unwrap();
@@ -3595,7 +3351,7 @@ mod tests {
         assert_eq!((updated.retention_seconds, updated.settle_seconds), (10, 5));
         assert_eq!(
             store
-                .inbox_item("w1", pending_identity.clone())
+                .recents_item("w1", pending_identity.clone())
                 .unwrap()
                 .unwrap()
                 .eligible_unix_ms,
@@ -3603,7 +3359,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .inbox_item("w1", moved_identity)
+                .recents_item("w1", moved_identity)
                 .unwrap()
                 .unwrap()
                 .eligible_unix_ms,
@@ -3614,7 +3370,7 @@ mod tests {
             .connection()
             .execute_batch(
                 "CREATE TEMP TRIGGER fail_pending_deadline_update
-                 BEFORE UPDATE OF eligible_unix_ms ON inbox_items
+                 BEFORE UPDATE OF eligible_unix_ms ON recents_items
                  BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
             )
             .unwrap();
@@ -3630,7 +3386,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .inbox_item("w1", pending_identity)
+                .recents_item("w1", pending_identity)
                 .unwrap()
                 .unwrap()
                 .eligible_unix_ms,
@@ -3703,7 +3459,7 @@ mod tests {
     }
 
     #[test]
-    fn inbox_reconcile_deletes_stale_pending_and_resets_returned_items() {
+    fn recents_reconcile_deletes_stale_pending_and_resets_returned_items() {
         let root = tempdir().unwrap();
         let mut store = StateStore::open_in_memory().unwrap();
         setup_workspace(&mut store, root.path());
@@ -3711,11 +3467,11 @@ mod tests {
             .map(|inode| FsIdentity { device: 1, inode })
             .collect::<Vec<_>>();
         for (identity, path) in identities.iter().zip([
-            "Inbox/stale.txt",
-            "Inbox/pending.txt",
-            "Inbox/moved.txt",
-            "Inbox/planned.txt",
-            "Inbox/live-planned.txt",
+            "Recents/stale.txt",
+            "Recents/pending.txt",
+            "Recents/moved.txt",
+            "Recents/planned.txt",
+            "Recents/live-planned.txt",
         ]) {
             store
                 .upsert_observation(
@@ -3746,13 +3502,18 @@ mod tests {
             })
             .unwrap();
         store
-            .set_inbox_item_state("w1", identities[2].clone(), InboxState::Moved, Some("run1"))
+            .set_recents_item_state(
+                "w1",
+                identities[2].clone(),
+                RecentsState::Moved,
+                Some("run1"),
+            )
             .unwrap();
         store
-            .set_inbox_item_state(
+            .set_recents_item_state(
                 "w1",
                 identities[3].clone(),
-                InboxState::Planned,
+                RecentsState::Planned,
                 Some("run1"),
             )
             .unwrap();
@@ -3772,16 +3533,16 @@ mod tests {
             })
             .unwrap();
         store
-            .set_inbox_item_state(
+            .set_recents_item_state(
                 "w1",
                 identities[4].clone(),
-                InboxState::Planned,
+                RecentsState::Planned,
                 Some("run2"),
             )
             .unwrap();
 
         let summary = store
-            .reconcile_inbox_index(
+            .reconcile_recents_index(
                 "w1",
                 &[
                     identities[1].clone(),
@@ -3793,45 +3554,45 @@ mod tests {
             .unwrap();
         assert_eq!(
             summary,
-            InboxReconcileSummary {
+            RecentsReconcileSummary {
                 deleted_stale_pending: 1,
                 reset_returned: 2,
             }
         );
         assert!(
             store
-                .inbox_item("w1", identities[0].clone())
+                .recents_item("w1", identities[0].clone())
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
             store
-                .inbox_item("w1", identities[2].clone())
+                .recents_item("w1", identities[2].clone())
                 .unwrap()
                 .unwrap()
                 .state,
-            InboxState::Pending
+            RecentsState::Pending
         );
         assert_eq!(
             store
-                .inbox_item("w1", identities[3].clone())
+                .recents_item("w1", identities[3].clone())
                 .unwrap()
                 .unwrap()
                 .state,
-            InboxState::Pending
+            RecentsState::Pending
         );
         assert_eq!(
             store
-                .inbox_item("w1", identities[4].clone())
+                .recents_item("w1", identities[4].clone())
                 .unwrap()
                 .unwrap()
                 .state,
-            InboxState::Planned
+            RecentsState::Planned
         );
     }
 
     #[test]
-    fn inbox_reconcile_rolls_back_all_changes_on_failure() {
+    fn recents_reconcile_rolls_back_all_changes_on_failure() {
         let root = tempdir().unwrap();
         let mut store = StateStore::open_in_memory().unwrap();
         setup_workspace(&mut store, root.path());
@@ -3844,8 +3605,8 @@ mod tests {
             inode: 2,
         };
         for (identity, path) in [
-            (stale.clone(), "Inbox/stale.txt"),
-            (returned.clone(), "Inbox/returned.txt"),
+            (stale.clone(), "Recents/stale.txt"),
+            (returned.clone(), "Recents/returned.txt"),
         ] {
             store
                 .upsert_observation(
@@ -3876,13 +3637,13 @@ mod tests {
             })
             .unwrap();
         store
-            .set_inbox_item_state("w1", returned.clone(), InboxState::Moved, Some("run1"))
+            .set_recents_item_state("w1", returned.clone(), RecentsState::Moved, Some("run1"))
             .unwrap();
         store
             .connection()
             .execute_batch(
                 "CREATE TEMP TRIGGER fail_returned_reset
-                 BEFORE UPDATE OF state ON inbox_items
+                 BEFORE UPDATE OF state ON recents_items
                  WHEN OLD.state != 'pending'
                  BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
             )
@@ -3890,18 +3651,18 @@ mod tests {
 
         assert!(
             store
-                .reconcile_inbox_index("w1", std::slice::from_ref(&returned))
+                .reconcile_recents_index("w1", std::slice::from_ref(&returned))
                 .is_err()
         );
-        assert!(store.inbox_item("w1", stale).unwrap().is_some());
+        assert!(store.recents_item("w1", stale).unwrap().is_some());
         assert_eq!(
-            store.inbox_item("w1", returned).unwrap().unwrap().state,
-            InboxState::Moved
+            store.recents_item("w1", returned).unwrap().unwrap().state,
+            RecentsState::Moved
         );
     }
 
     #[test]
-    fn inbox_eligibility_requires_retention_and_a_stable_settle_window() {
+    fn recents_eligibility_requires_retention_and_a_stable_settle_window() {
         let root = tempdir().unwrap();
         let mut store = StateStore::open_in_memory().unwrap();
         setup_workspace(&mut store, root.path());
@@ -3916,7 +3677,7 @@ mod tests {
         };
 
         let first = store
-            .upsert_observation("w1", &initial, "Inbox/report.pdf", 1_000)
+            .upsert_observation("w1", &initial, "Recents/report.pdf", 1_000)
             .unwrap();
         assert_eq!(first.first_seen_unix_ms, 1_000);
         assert_eq!(first.stable_since_unix_ms, 1_000);
@@ -3924,7 +3685,7 @@ mod tests {
         assert!(store.eligible_items("w1", 100_999).unwrap().is_empty());
 
         let unchanged = store
-            .upsert_observation("w1", &initial, "Inbox/report.pdf", 50_000)
+            .upsert_observation("w1", &initial, "Recents/report.pdf", 50_000)
             .unwrap();
         assert_eq!(unchanged.stable_since_unix_ms, 1_000);
         assert_eq!(unchanged.eligible_unix_ms, 101_000);
@@ -3935,7 +3696,7 @@ mod tests {
             ..initial
         };
         let changed = store
-            .upsert_observation("w1", &changed, "Inbox/report.pdf", 80_000)
+            .upsert_observation("w1", &changed, "Recents/report.pdf", 80_000)
             .unwrap();
         assert_eq!(changed.first_seen_unix_ms, 1_000);
         assert_eq!(changed.stable_since_unix_ms, 80_000);
@@ -3959,7 +3720,7 @@ mod tests {
             sha256: DIGEST_A.into(),
         };
         store
-            .upsert_observation("w1", &initial, "Inbox/report.pdf", 1_000)
+            .upsert_observation("w1", &initial, "Recents/report.pdf", 1_000)
             .unwrap();
         store
             .insert_managed_run(&ManagedRun {
@@ -3977,7 +3738,7 @@ mod tests {
             })
             .unwrap();
         store
-            .set_inbox_item_state("w1", identity.clone(), InboxState::Planned, Some("run1"))
+            .set_recents_item_state("w1", identity.clone(), RecentsState::Planned, Some("run1"))
             .unwrap();
 
         let changed = FileFingerprint {
@@ -3986,11 +3747,11 @@ mod tests {
             ..initial
         };
         let item = store
-            .upsert_observation("w1", &changed, "Inbox/report.pdf", 5_000)
+            .upsert_observation("w1", &changed, "Recents/report.pdf", 5_000)
             .unwrap();
         assert_eq!(item.first_seen_unix_ms, 1_000);
         assert_eq!(item.stable_since_unix_ms, 5_000);
-        assert_eq!(item.state, InboxState::Pending);
+        assert_eq!(item.state, RecentsState::Pending);
         assert_eq!(item.last_run_id, None);
     }
 
@@ -4083,7 +3844,7 @@ mod tests {
                     size: 1,
                     sha256: DIGEST_A.into(),
                 },
-                "Inbox/report.txt",
+                "Recents/report.txt",
                 1_000,
             )
             .unwrap();
@@ -4118,7 +3879,12 @@ mod tests {
                 .is_err()
         );
         assert!(store.managed_undo_journal_paths("run1").unwrap().is_empty());
-        assert!(store.inbox_item("w1", identity.clone()).unwrap().is_some());
+        assert!(
+            store
+                .recents_item("w1", identity.clone())
+                .unwrap()
+                .is_some()
+        );
 
         store
             .connection()
@@ -4135,7 +3901,7 @@ mod tests {
             store.managed_run("run1").unwrap().unwrap().undo_path,
             Some(undo_path)
         );
-        assert!(store.inbox_item("w1", identity).unwrap().is_none());
+        assert!(store.recents_item("w1", identity).unwrap().is_none());
     }
 
     #[test]
