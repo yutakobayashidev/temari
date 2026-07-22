@@ -18,6 +18,7 @@
 - When the product's current experience has shifted from a one-shot wizard to protected, waiting, and classified areas, prioritize that filesystem state machine in Core and CLI before polishing GUI adapters. Keep directory initialization separate from regular-file Plans, and derive retention from first local observation rather than mtime.
 - Once a stateful product workflow becomes the primary experience, remove overlapping implementation-oriented public commands instead of asking users to choose between equivalent mechanisms. Keep reusable engines internal and move rules, history, and recovery under the product-facing workspace identity.
 - When the user narrows a parity phase, implement the named workflow gaps completely and keep explicitly deferred product areas out of the patch, documentation, and navigation.
+- After completing a roadmap item, re-audit both the implementation and current analysis evidence before reporting parity; update stale scope labels and distinguish organizer gaps from separate product epics.
 # Library structure editing
 
 - Treat post-setup AI Library edits as logical FolderSet CRUD only. Add, rename, description edit, delete, and Undo change immutable FolderSet revisions and bindings; they do not rename or delete physical directories or move existing files.
