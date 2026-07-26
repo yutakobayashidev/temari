@@ -53,7 +53,7 @@
           {
             imports = [
               (import ./nix/home-manager.nix {
-                temariPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.temari;
+                temariPackage = pkgs.callPackage ./nix/package.nix { };
               })
             ];
           };
