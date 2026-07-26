@@ -25,7 +25,7 @@
 
 - Keep `temari managed run` finite. Do not add a resident daemon or implicit background process.
 - Allow a managed run to allocate a private, unique artifact directory below the Temari state directory when `--out` is omitted. Preserve explicit `--out` for review, tests, and recovery tooling.
-- Integrate with systemd user timers on Linux and per-user launchd agents on macOS. Scheduler definitions invoke a stable absolute Temari launcher with absolute configuration and state paths; they never invoke a shell. Reject direct Nix store executables because garbage collection can invalidate a persistent definition.
+- Integrate with systemd user timers on Linux and per-user launchd agents on macOS. Imperatively installed scheduler definitions invoke a stable absolute Temari launcher with absolute configuration and state paths; they never invoke a shell. Reject direct Nix store executables for imperative installation because garbage collection can invalidate a persistent definition. A declarative Home Manager unit may use the Nix package directly because the active generation roots its store closure.
 - Require a separate explicit scheduler install action with mutation confirmation. Workspace setup, enable, and normal run commands never install scheduling implicitly.
 - Keep scheduler definitions free of secret values. Configuration may reference an environment variable only when the selected scheduler environment can provide it; otherwise installation must fail with an actionable error.
 - Preserve every failed or non-empty run directory for diagnosis and recovery. Automatic cleanup may remove only a newly allocated directory that produced no artifacts.

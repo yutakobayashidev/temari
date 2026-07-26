@@ -143,6 +143,38 @@ The portable monitoring engine, processed signatures, local rules, and run recon
 
 Schedule installation requires an owner-only configuration and state database. It rejects `model.api_key_env` because user schedulers do not reliably inherit an interactive shell environment; use an owner-only inline `model.api_key`, or print the definition and install a separately reviewed environment configuration yourself. A Nix store executable is also rejected because garbage collection can invalidate a persistent schedule; pass `--executable` pointing to a stable launcher such as `~/.local/bin/temari`. Uninstall verifies that the timer or agent stopped before removing its owned definition. Uninstall a workspace schedule before removing its registration.
 
+### Nix and Home Manager
+
+The flake exposes `packages.<system>.temari`, `overlays.default`, and `homeManagerModules.default`. On Linux, the Home Manager module installs Temari and can own systemd user timers declaratively:
+
+```nix
+{
+  inputs.temari.url = "github:yutakobayashidev/temari";
+
+  outputs = { home-manager, temari, ... }: {
+    homeConfigurations.yuta = home-manager.lib.homeManagerConfiguration {
+      modules = [
+        temari.homeManagerModules.default
+        {
+          services.temari = {
+            enable = true;
+            workspaces.downloads = {
+              workspaceId = "<WORKSPACE_ID>";
+              configFile = "/home/yuta/.config/temari/config.toml";
+              stateFile = "/home/yuta/.local/state/temari/managed.sqlite3";
+              source = "/home/yuta/Downloads";
+              interval = "5m";
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Keep configuration, state, source, and optional `environmentFile` paths absolute. Do not construct a credential-bearing configuration with `builtins.toFile`: that would copy the secret into the Nix store. The declarative unit may safely execute Temari from `/nix/store` because the active Home Manager generation keeps that package closure alive. The imperative `temari managed schedule install` command still rejects store paths because unmanaged unit files do not provide the same lifecycle guarantee.
+
 The approval command previews every destination and asks for confirmation when stdin and stderr are terminals. For a proposal that has already been reviewed by an agent or script, make acceptance explicit:
 
 ```console

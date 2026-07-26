@@ -1,5 +1,5 @@
 {
-  description = "Temari development environment";
+  description = "Privacy-conscious file organization with declarative Nix integration";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
@@ -10,7 +10,8 @@
     };
   };
 
-  outputs = inputs@{ self, nixpkgs, ... }:
+  outputs =
+    inputs@{ self, nixpkgs, ... }:
     let
       systems = [
         "aarch64-darwin"
@@ -19,36 +20,65 @@
         "x86_64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      pkgsFor = system: import nixpkgs { inherit system; };
     in
     {
       packages = forAllSystems (
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor system;
+          temari = pkgs.callPackage ./nix/package.nix { };
         in
         {
-          default = pkgs.rustPlatform.buildRustPackage {
-            pname = "temari";
-            version = "0.1.0";
-            src = pkgs.lib.cleanSource ./.;
-            cargoLock.lockFile = ./Cargo.lock;
-            cargoBuildFlags = [ "-p" "temari-cli" ];
-            cargoTestFlags = [ "--workspace" ];
-          };
+          inherit temari;
+          default = temari;
         }
       );
 
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/temari";
+          program = nixpkgs.lib.getExe self.packages.${system}.temari;
+          meta.description = "Run the Temari CLI";
         };
       });
+
+      overlays.default = final: _: {
+        temari = final.callPackage ./nix/package.nix { };
+      };
+
+      homeManagerModules = {
+        temari =
+          { pkgs, ... }:
+          {
+            imports = [
+              (import ./nix/home-manager.nix {
+                temariPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.temari;
+              })
+            ];
+          };
+        default = self.homeManagerModules.temari;
+      };
+
+      checks = forAllSystems (
+        system:
+        let
+          pkgs = pkgsFor system;
+        in
+        {
+          home-manager-module = pkgs.callPackage ./nix/tests/home-manager-module.nix {
+            module = import ./nix/home-manager.nix { };
+          };
+          inherit (self.packages.${system}) temari;
+        }
+      );
+
+      formatter = forAllSystems (system: (pkgsFor system).nixfmt-tree);
 
       devShells = forAllSystems (
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = pkgsFor system;
           linuxPackages = with pkgs; [
             atk
             cairo
@@ -63,16 +93,19 @@
         in
         {
           default = pkgs.mkShell {
-            packages = with pkgs; [
-              cargo
-              clippy
-              nodejs
-              openssl
-              pkg-config
-              pnpm
-              rustc
-              rustfmt
-            ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux linuxPackages;
+            packages =
+              with pkgs;
+              [
+                cargo
+                clippy
+                nodejs
+                openssl
+                pkg-config
+                pnpm
+                rustc
+                rustfmt
+              ]
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux linuxPackages;
 
             shellHook =
               let
